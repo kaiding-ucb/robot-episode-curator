@@ -287,17 +287,20 @@ export function useFrames(
       return;
     }
 
+    // Capture episodeId for use in async function (TypeScript narrowing)
+    const currentEpisodeId = episodeId;
+
     async function fetchFrames() {
       // Check if we have prefetched data for this range
       if (prefetchedDataRef.current?.range.start === start &&
           prefetchedDataRef.current?.range.end === end &&
-          prefetchedDataRef.current?.episodeId === episodeId) {
+          prefetchedDataRef.current?.episodeId === currentEpisodeId) {
         // Store current batch as previous before switching
-        if (frames.length > 0 && loadedRange && episodeId) {
+        if (frames.length > 0 && loadedRange) {
           setPreviousBatch({
             frames: [...frames],
             range: { ...loadedRange },
-            episodeId,
+            episodeId: currentEpisodeId,
           });
         }
 
@@ -313,16 +316,16 @@ export function useFrames(
       setError(null);
 
       // Store current batch as previous before fetching new batch
-      if (frames.length > 0 && loadedRange && episodeId) {
+      if (frames.length > 0 && loadedRange) {
         setPreviousBatch({
           frames: [...frames],
           range: { ...loadedRange },
-          episodeId,
+          episodeId: currentEpisodeId,
         });
       }
 
       try {
-        const { frames: newFrames, total } = await fetchFramesData(episodeId, start, end, datasetId);
+        const { frames: newFrames, total } = await fetchFramesData(currentEpisodeId, start, end, datasetId);
         setFrames(newFrames);
         if (total !== undefined && total !== null) {
           setTotalFrames(total);
