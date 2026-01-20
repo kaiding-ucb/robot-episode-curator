@@ -4,12 +4,15 @@ Downloader for LIBERO and LIBERO-PRO datasets.
 LIBERO is available on HuggingFace:
 - https://huggingface.co/datasets/libero-project/LIBERO
 
-The dataset contains multiple task suites:
-- libero_spatial
-- libero_object
-- libero_goal
-- libero_10 (10 long-horizon tasks)
-- libero_90 (90 short tasks)
+The dataset contains 130 tasks across 4 benchmark suites:
+- libero_spatial: 10 tasks (spatial relationship reasoning)
+- libero_object: 10 tasks (object recognition transfer)
+- libero_goal: 10 tasks (goal specification transfer)
+- libero_100: 100 tasks split into:
+  - libero_90: 90 tasks (pretraining)
+  - libero_10: 10 tasks (downstream lifelong learning evaluation)
+
+Total: 10 + 10 + 10 + 100 = 130 tasks
 """
 import logging
 from pathlib import Path
@@ -19,14 +22,17 @@ from .base import Downloader, DownloadProgress, DownloadResult, DownloadStatus
 
 logger = logging.getLogger(__name__)
 
-# Available LIBERO task suites
+# Available LIBERO task suites and their task counts
 LIBERO_SUITES = [
-    "libero_spatial",
-    "libero_object",
-    "libero_goal",
-    "libero_10",
-    "libero_90",
+    "libero_spatial",  # 10 tasks
+    "libero_object",   # 10 tasks
+    "libero_goal",     # 10 tasks
+    "libero_10",       # 10 tasks (part of libero_100)
+    "libero_90",       # 90 tasks (part of libero_100)
 ]
+
+# Expected total task count for validation
+LIBERO_TOTAL_TASKS = 130  # 10 + 10 + 10 + 10 + 90 = 130
 
 # HuggingFace repo for LIBERO (yifengzhu-hf has HDF5 files)
 # Source: https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets
