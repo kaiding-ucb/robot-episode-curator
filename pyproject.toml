@@ -1,0 +1,21 @@
+[project]
+name = "data-viewer"
+version = "0.1.0"
+description = "Robotics Dataset Viewer for quality assessment"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "network: marks tests that require network access",
+]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100

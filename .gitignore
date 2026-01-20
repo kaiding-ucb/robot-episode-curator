@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Build outputs
+.next/
+dist/
+build/
+
+# Data and cache
+data/
+.cache/
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Testing
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Environment
+.env
+.env.local
+*.log
