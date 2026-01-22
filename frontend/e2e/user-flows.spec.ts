@@ -197,100 +197,110 @@ test.describe("Quality Panel", () => {
     await expect(page.getByRole("heading", { name: /quality analysis/i })).toBeVisible();
   });
 
-  test("quality panel shows metrics when episode loaded", async ({ page }) => {
+  test("quality panel shows task quality section", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
     });
 
     // Wait for quality to compute
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(8000);
 
-    // Should show "Overall Quality" text
-    await expect(page.getByText(/overall quality/i)).toBeVisible();
+    // Should show Task Quality heading
+    await expect(page.getByText(/task quality/i).first()).toBeVisible();
 
-    // Should show percentage (not "select episode")
-    const qualityPanel = page.locator('aside').last();
-    await expect(qualityPanel.getByText(/select.*episode/i)).not.toBeVisible();
+    // Should show Expertise Test and Physics Test
+    await expect(page.getByText(/expertise test/i)).toBeVisible();
+    await expect(page.getByText(/physics test/i)).toBeVisible();
+  });
+
+  test("quality panel shows episode comparison section", async ({ page }) => {
+    await page.goto("/");
+
+    // Navigate to dataset -> task -> episode
+    await page.getByTestId("dataset-item-libero").click();
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
+      btn?.click();
+    });
+
+    // Wait for quality to compute
+    await page.waitForTimeout(8000);
+
+    // Should show "This Episode vs Task" section
+    await expect(page.getByText(/this episode vs task/i)).toBeVisible();
+
+    // Should show Episode Divergence with percentage
+    await expect(page.getByText(/episode divergence/i)).toBeVisible();
+
+    // Should show Recovery Behaviors heading
+    await expect(page.getByRole("heading", { name: /recovery behaviors/i })).toBeVisible();
+  });
+
+  test("quality panel shows dimension breakdown", async ({ page }) => {
+    await page.goto("/");
+
+    // Navigate to dataset -> task -> episode
+    await page.getByTestId("dataset-item-libero").click();
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
+      btn?.click();
+    });
+
+    // Wait for quality to compute
+    await page.waitForTimeout(8000);
+
+    // Should show at least one dimension (Position X, Y, Z, etc.)
+    const hasPositionDim = await page.getByText(/position (x|y|z)/i).first().isVisible().catch(() => false);
+    const hasRollPitchYaw = await page.getByText(/(roll|pitch|yaw)/i).first().isVisible().catch(() => false);
+
+    expect(hasPositionDim || hasRollPitchYaw).toBe(true);
   });
 
   test("quality metrics are numbers (not NaN)", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
     });
 
     // Wait for quality to compute
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(8000);
 
     // Check that percentage displays don't contain NaN
     const pageContent = await page.content();
     expect(pageContent).not.toContain("NaN%");
-  });
-
-  test("quality panel shows temporal metrics", async ({ page }) => {
-    await page.goto("/");
-
-    // Navigate to episode
-    await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
-    await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
-      btn?.click();
-    });
-
-    // Wait for quality to compute
-    await page.waitForTimeout(3000);
-
-    // Should show temporal quality section
-    await expect(page.getByText(/temporal quality/i)).toBeVisible();
-    await expect(page.getByText(/motion smoothness/i)).toBeVisible();
-  });
-
-  test("quality panel shows diversity metrics", async ({ page }) => {
-    await page.goto("/");
-
-    // Navigate to episode
-    await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
-    await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
-      btn?.click();
-    });
-
-    // Wait for quality to compute
-    await page.waitForTimeout(3000);
-
-    // Should show diversity quality section
-    await expect(page.getByText(/diversity quality/i)).toBeVisible();
-  });
-
-  test("quality panel shows visual metrics", async ({ page }) => {
-    await page.goto("/");
-
-    // Navigate to episode
-    await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
-    await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
-      btn?.click();
-    });
-
-    // Wait for quality to compute
-    await page.waitForTimeout(3000);
-
-    // Should show visual quality section
-    await expect(page.getByText(/visual quality/i)).toBeVisible();
   });
 });
 
@@ -458,5 +468,77 @@ test.describe("Layout Structure", () => {
 
     // Right sidebar (quality panel)
     await expect(sidebars.last()).toBeVisible();
+  });
+});
+
+// =============================================================================
+// FLOW 10: Task-Level Quality Metrics (New Feature)
+// =============================================================================
+test.describe("Task-Level Quality", () => {
+  test("task quality API returns valid data", async ({ request }) => {
+    // Test the task quality API directly with a known LIBERO task
+    const response = await request.get(
+      "http://localhost:8002/api/quality/task/libero/Pick%20Up%20The%20Bbq%20Sauce%20And%20Place%20It%20In%20The%20Basket%20Demo?limit=5"
+    );
+
+    expect(response.status()).toBe(200);
+
+    const data = await response.json();
+
+    // Verify task-level metrics structure
+    expect(data).toHaveProperty("task_name");
+    expect(data).toHaveProperty("expertise_score");
+    expect(data).toHaveProperty("physics_coverage_score");
+    expect(data).toHaveProperty("divergence_distribution");
+    expect(data).toHaveProperty("quality_assessment");
+
+    // Verify scores are valid numbers (0-1 range)
+    expect(data.expertise_score).toBeGreaterThanOrEqual(0);
+    expect(data.expertise_score).toBeLessThanOrEqual(1);
+    expect(data.physics_coverage_score).toBeGreaterThanOrEqual(0);
+    expect(data.physics_coverage_score).toBeLessThanOrEqual(1);
+  });
+
+  test("episode divergence API returns frame-level data", async ({ request }) => {
+    // Test the episode divergence API
+    const response = await request.get(
+      "http://localhost:8002/api/quality/task/libero/Pick%20Up%20The%20Bbq%20Sauce%20And%20Place%20It%20In%20The%20Basket%20Demo/divergence/libero_object%2Fpick_up_the_bbq_sauce_and_place_it_in_the_basket_demo%2Fdemo_0?limit=5"
+    );
+
+    expect(response.status()).toBe(200);
+
+    const data = await response.json();
+
+    // Verify divergence response structure
+    expect(data).toHaveProperty("episode_id");
+    expect(data).toHaveProperty("overall_divergence_score");
+    expect(data).toHaveProperty("frame_divergences");
+    expect(data).toHaveProperty("high_divergence_frames");
+
+    // Verify frame_divergences is an array with values
+    expect(Array.isArray(data.frame_divergences)).toBe(true);
+    expect(data.frame_divergences.length).toBeGreaterThan(0);
+  });
+
+  test("quality events include metric_category field", async ({ request }) => {
+    // Test that quality events have the new metric_category field
+    const response = await request.get(
+      "http://localhost:8002/api/quality/events/libero_object%2Fpick_up_the_bbq_sauce_and_place_it_in_the_basket_demo%2Fdemo_0?dataset_id=libero"
+    );
+
+    expect(response.status()).toBe(200);
+
+    const data = await response.json();
+
+    // Verify events structure
+    expect(data).toHaveProperty("events");
+    expect(Array.isArray(data.events)).toBe(true);
+
+    // If there are events, check they have metric_category
+    if (data.events.length > 0) {
+      const event = data.events[0];
+      expect(event).toHaveProperty("metric_category");
+      expect(["transition", "divergence"]).toContain(event.metric_category);
+    }
   });
 });

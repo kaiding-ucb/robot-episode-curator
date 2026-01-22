@@ -5,6 +5,7 @@ import QualityPanel from "@/components/QualityPanel";
 interface RightSidebarProps {
   datasetId: string | null;
   episodeId: string | null;
+  taskName: string | null;
   onJumpToFrame: (frame: number) => void;
   selectedMetric: string | null;
   onSelectMetric: (metric: string | null) => void;
@@ -13,6 +14,7 @@ interface RightSidebarProps {
 export default function RightSidebar({
   datasetId,
   episodeId,
+  taskName,
   onJumpToFrame,
   selectedMetric,
   onSelectMetric,
@@ -27,6 +29,7 @@ export default function RightSidebar({
       <QualityPanel
         datasetId={datasetId}
         episodeId={episodeId}
+        taskName={taskName}
         onJumpToFrame={onJumpToFrame}
         selectedMetric={selectedMetric}
         onSelectMetric={onSelectMetric}

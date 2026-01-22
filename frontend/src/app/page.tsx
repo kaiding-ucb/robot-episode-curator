@@ -6,6 +6,23 @@ import MainContent from "./layout/MainContent";
 import RightSidebar from "./layout/RightSidebar";
 import Modals from "./layout/Modals";
 
+// Extract task name from LIBERO episode ID and convert to title case
+// Format: libero_90/KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo/demo_0
+// Backend stores as: "Kitchen Scene1 Open The Bottom Drawer Of The Cabinet Demo"
+function extractTaskName(episodeId: string | null): string | null {
+  if (!episodeId) return null;
+  const parts = episodeId.split("/");
+  if (parts.length >= 2) {
+    const taskFolder = parts[1];
+    // Match Python's str.title(): lowercase then capitalize first letter of each word
+    return taskFolder
+      .replace(/_/g, " ")
+      .toLowerCase()
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return null;
+}
+
 export default function Home() {
   // Shared state - both sidebars receive via props
   const [selectedDataset, setSelectedDataset] = useState<string | null>(null);
@@ -13,6 +30,9 @@ export default function Home() {
   const [selectedEpisodeFrameCount, setSelectedEpisodeFrameCount] = useState<number>(0);
   const [targetFrame, setTargetFrame] = useState<number | null>(null);
   const [selectedMetric, setSelectedMetric] = useState<string | null>(null);
+
+  // Derive task name from episode ID
+  const selectedTask = extractTaskName(selectedEpisode);
 
   // Modal state
   const [showDataManager, setShowDataManager] = useState(false);
@@ -47,6 +67,7 @@ export default function Home() {
       <RightSidebar
         datasetId={selectedDataset}
         episodeId={selectedEpisode}
+        taskName={selectedTask}
         onJumpToFrame={setTargetFrame}
         selectedMetric={selectedMetric}
         onSelectMetric={setSelectedMetric}

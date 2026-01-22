@@ -1,164 +1,253 @@
 "use client";
 
-import { useEpisodeQuality, useQualityEvents } from "@/hooks/useQuality";
-import type { QualityScore, QualityEvent } from "@/types/quality";
+import { useEpisodeQuality, useQualityEvents, useTaskQuality, useEpisodeDivergence } from "@/hooks/useQuality";
+import type { QualityEvent, TaskQualityMetrics, EpisodeDivergence } from "@/types/quality";
+import { READABLE_DIMENSION_NAMES } from "@/types/quality";
 
 interface QualityPanelProps {
   datasetId: string | null;
   episodeId: string | null;
+  taskName?: string | null;
   onJumpToFrame?: (frame: number) => void;
   selectedMetric?: string | null;
   onSelectMetric?: (metric: string | null) => void;
+  /** Callback to provide divergence scores to parent for timeline heat */
+  onDivergenceScores?: (scores: number[]) => void;
 }
 
 interface MetricBarProps {
   label: string;
   value: number;
   colorClass?: string;
-  metricKey?: string;
-  isSelected?: boolean;
-  onClick?: (metricKey: string) => void;
+  isHighlighted?: boolean;
 }
 
-function MetricBar({ label, value, colorClass = "bg-blue-500", metricKey, isSelected, onClick }: MetricBarProps) {
+function MetricBar({ label, value, colorClass = "bg-orange-500", isHighlighted = false }: MetricBarProps) {
   const percentage = Math.round(value * 100);
-  const isClickable = !!onClick && !!metricKey;
 
   return (
-    <div
-      className={`mb-2 ${isClickable ? 'cursor-pointer' : ''} ${isSelected ? 'ring-2 ring-blue-400 ring-offset-1 rounded-lg p-1 -m-1' : ''}`}
-      onClick={() => isClickable && onClick(metricKey)}
-      data-testid={metricKey ? `metric-bar-${metricKey}` : undefined}
-    >
-      <div className="flex justify-between text-xs mb-1">
-        <span className={`${isSelected ? 'text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400'}`}>{label}</span>
+    <div className={`mb-1 ${isHighlighted ? 'bg-orange-100 dark:bg-orange-900/30 -mx-1 px-1 rounded' : ''}`}>
+      <div className="flex justify-between text-xs mb-0.5">
+        <span className={`${isHighlighted ? 'text-orange-700 dark:text-orange-300 font-medium' : 'text-gray-600 dark:text-gray-400'}`}>
+          {label}
+          {isHighlighted && <span className="ml-1 text-orange-500">← highest</span>}
+        </span>
         <span className="font-medium">{percentage}%</span>
       </div>
-      <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+      <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
         <div
           className={`h-full ${colorClass} transition-all duration-300`}
-          style={{ width: `${percentage}%` }}
+          style={{ width: `${Math.min(100, percentage)}%` }}
         />
       </div>
     </div>
   );
 }
 
-function QualityBadge({ quality }: { quality: QualityScore }) {
-  const gradeColors: Record<string, string> = {
-    A: "bg-green-500",
-    B: "bg-blue-500",
-    C: "bg-yellow-500",
-    D: "bg-orange-500",
-    F: "bg-red-500",
-  };
+// ============== Task-Level Quality Components ==============
 
+function TaskQualitySection({ metrics }: { metrics: TaskQualityMetrics }) {
   return (
-    <div className="flex items-center gap-3 mb-4">
-      <div
-        className={`w-12 h-12 rounded-lg ${gradeColors[quality.quality_grade]} flex items-center justify-center text-white text-xl font-bold`}
-      >
-        {quality.quality_grade}
-      </div>
-      <div>
-        <div className="text-lg font-semibold">
-          {Math.round(quality.overall_score * 100)}%
+    <div className="space-y-4" data-testid="task-quality-section">
+      {/* Expertise Test (Divergence) */}
+      <div className="bg-orange-50 dark:bg-orange-900/20 rounded-lg p-3">
+        <h4 className="text-sm font-semibold text-orange-800 dark:text-orange-300 mb-2 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-orange-500" />
+          Expertise Test
+        </h4>
+        <MetricBar
+          label="Consistency"
+          value={metrics.expertise_score}
+          colorClass="bg-orange-500"
+        />
+        <p className="text-xs text-gray-600 dark:text-gray-400 mt-2">
+          {metrics.expertise_score > 0.7
+            ? "Experts demonstrate consistent technique across episodes"
+            : metrics.expertise_score > 0.4
+            ? "Moderate variance in demonstration paths"
+            : "High variance suggests crowdsourced without style guide"}
+        </p>
+        <div className="text-xs text-gray-500 dark:text-gray-500 mt-2 flex gap-3">
+          <span>Low: {metrics.divergence_distribution.low}</span>
+          <span>Med: {metrics.divergence_distribution.medium}</span>
+          <span className="text-orange-600 dark:text-orange-400">High: {metrics.divergence_distribution.high}</span>
         </div>
-        <div className="text-sm text-gray-500">Overall Quality</div>
+      </div>
+
+      {/* Physics Test (Recovery) */}
+      <div className="bg-purple-50 dark:bg-purple-900/20 rounded-lg p-3">
+        <h4 className="text-sm font-semibold text-purple-800 dark:text-purple-300 mb-2 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-purple-500" />
+          Physics Test
+        </h4>
+        <MetricBar
+          label="Recovery Coverage"
+          value={metrics.physics_coverage_score}
+          colorClass="bg-purple-500"
+        />
+        <p className="text-xs text-gray-600 dark:text-gray-400 mt-2">
+          {metrics.has_any_recovery_episodes
+            ? "Dataset includes recovery behaviors - good for robust learning"
+            : "All perfect executions - may miss edge cases"}
+        </p>
+        <div className="text-xs text-gray-500 dark:text-gray-500 mt-2">
+          {Math.round(metrics.pct_with_recovery * 100)}% of episodes have recovery behaviors
+          {metrics.mean_recovery_count > 0 && (
+            <span className="ml-2">({metrics.mean_recovery_count.toFixed(1)} avg/episode)</span>
+          )}
+        </div>
+      </div>
+
+      {/* Quality Assessment */}
+      <div className="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-3">
+        <div className="text-sm font-medium text-gray-700 dark:text-gray-300">
+          {metrics.quality_assessment}
+        </div>
+        <div className="text-xs text-gray-500 dark:text-gray-500 mt-1">
+          Based on {metrics.num_episodes} episodes
+        </div>
       </div>
     </div>
   );
 }
 
-function QualityFlags({ quality }: { quality: QualityScore }) {
-  return (
-    <div className="flex flex-wrap gap-2 mb-4">
-      {quality.has_recovery_behaviors && (
-        <span className="px-2 py-1 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300">
-          Has Recovery
-        </span>
-      )}
-      {quality.is_diverse && (
-        <span className="px-2 py-1 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300">
-          Diverse
-        </span>
-      )}
-      {quality.is_smooth && (
-        <span className="px-2 py-1 text-xs rounded-full bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
-          Smooth
-        </span>
-      )}
-      {quality.is_well_synced && (
-        <span className="px-2 py-1 text-xs rounded-full bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300">
-          Well Synced
-        </span>
-      )}
-      {!quality.has_recovery_behaviors && !quality.is_diverse && (
-        <span className="px-2 py-1 text-xs rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
-          Too Perfect
-        </span>
-      )}
-    </div>
-  );
-}
+// ============== Episode Comparison Components ==============
 
-interface EventBadgesProps {
-  events: QualityEvent[];
+interface EpisodeComparisonSectionProps {
+  taskMetrics: TaskQualityMetrics;
+  divergence: EpisodeDivergence;
+  recoveryEvents: QualityEvent[];
   onJumpToFrame?: (frame: number) => void;
-  filterType?: string;
-  maxShow?: number;
 }
 
-const EVENT_BADGE_COLORS: Record<string, string> = {
-  gripper: "bg-green-100 hover:bg-green-200 text-green-800 dark:bg-green-900/30 dark:text-green-300 dark:hover:bg-green-900/50",
-  pause: "bg-yellow-100 hover:bg-yellow-200 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300 dark:hover:bg-yellow-900/50",
-  direction_change: "bg-cyan-100 hover:bg-cyan-200 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300 dark:hover:bg-cyan-900/50",
-  speed_change: "bg-orange-100 hover:bg-orange-200 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300 dark:hover:bg-orange-900/50",
-  high_jerk: "bg-red-100 hover:bg-red-200 text-red-800 dark:bg-red-900/30 dark:text-red-300 dark:hover:bg-red-900/50",
-  correction: "bg-purple-100 hover:bg-purple-200 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 dark:hover:bg-purple-900/50",
-};
+function EpisodeComparisonSection({ taskMetrics, divergence, recoveryEvents, onJumpToFrame }: EpisodeComparisonSectionProps) {
+  // Find highest divergence dimension
+  const maxDivIdx = divergence.dimension_means.indexOf(Math.max(...divergence.dimension_means));
 
-function EventBadges({ events, onJumpToFrame, filterType, maxShow = 8 }: EventBadgesProps) {
-  const filteredEvents = filterType
-    ? events.filter(e => e.event_type === filterType)
-    : events;
+  // Compare episode recovery to task average
+  const episodeRecoveryCount = recoveryEvents.length;
+  const taskAvgRecovery = taskMetrics.mean_recovery_count;
+  const recoveryDiff = episodeRecoveryCount - taskAvgRecovery;
+  const isAboveAverage = recoveryDiff >= 0;
 
-  if (filteredEvents.length === 0 || !onJumpToFrame) return null;
-
-  const displayEvents = filteredEvents.slice(0, maxShow);
-  const remaining = filteredEvents.length - maxShow;
+  // Recovery bar width (normalized to 2x task average as max)
+  const maxRecovery = Math.max(taskAvgRecovery * 2, 1);
+  const recoveryBarWidth = Math.min(100, (episodeRecoveryCount / maxRecovery) * 100);
 
   return (
-    <div className="mt-1 flex flex-wrap gap-1">
-      {displayEvents.map((event, i) => (
-        <button
-          key={`${event.frame}-${i}`}
-          onClick={() => onJumpToFrame(event.frame)}
-          className={`text-xs px-1.5 py-0.5 rounded transition-colors ${EVENT_BADGE_COLORS[event.event_type] || EVENT_BADGE_COLORS.correction}`}
-          title={event.description}
-          data-testid={`jump-to-frame-${event.frame}`}
-        >
-          @{event.frame}
-        </button>
-      ))}
-      {remaining > 0 && (
-        <span className="text-xs text-gray-400 self-center">+{remaining} more</span>
-      )}
+    <div className="space-y-4" data-testid="episode-comparison-section">
+      {/* Divergence Dimension Breakdown */}
+      <div className="bg-orange-50 dark:bg-orange-900/20 rounded-lg p-3">
+        <h4 className="text-sm font-semibold text-orange-800 dark:text-orange-300 mb-2">
+          Episode Divergence: {Math.round(divergence.overall_divergence_score * 100)}%
+        </h4>
+        <div className="space-y-1">
+          {divergence.dimension_names.map((dimName, idx) => {
+            const readableName = READABLE_DIMENSION_NAMES[dimName] || dimName;
+            const value = divergence.dimension_means[idx] || 0;
+            // Normalize to 0-1 range (assuming z-scores, cap at 3)
+            const normalizedValue = Math.min(1, value / 3);
+            const isHighest = idx === maxDivIdx;
+
+            return (
+              <MetricBar
+                key={dimName}
+                label={readableName}
+                value={normalizedValue}
+                colorClass="bg-orange-500"
+                isHighlighted={isHighest}
+              />
+            );
+          })}
+        </div>
+        <p className="text-xs text-gray-500 dark:text-gray-500 mt-2">
+          Hover timeline for frame-by-frame details
+        </p>
+      </div>
+
+      {/* Recovery Comparison */}
+      <div className="bg-purple-50 dark:bg-purple-900/20 rounded-lg p-3">
+        <h4 className="text-sm font-semibold text-purple-800 dark:text-purple-300 mb-2">
+          Recovery Behaviors
+        </h4>
+
+        <div className="text-sm mb-2">
+          <div className="flex justify-between">
+            <span className="text-gray-700 dark:text-gray-300">This episode:</span>
+            <span className="font-semibold text-purple-700 dark:text-purple-300">{episodeRecoveryCount} recoveries</span>
+          </div>
+          <div className="flex justify-between text-xs text-gray-500">
+            <span>Task average:</span>
+            <span>{taskAvgRecovery.toFixed(1)} per episode</span>
+          </div>
+        </div>
+
+        {/* Comparison bar */}
+        <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-1">
+          <div
+            className={`h-full transition-all duration-300 ${isAboveAverage ? 'bg-green-500' : 'bg-orange-500'}`}
+            style={{ width: `${recoveryBarWidth}%` }}
+          />
+        </div>
+        <div className={`text-xs ${isAboveAverage ? 'text-green-600 dark:text-green-400' : 'text-orange-600 dark:text-orange-400'}`}>
+          {isAboveAverage ? 'Above average' : 'Below average'} ({recoveryDiff >= 0 ? '+' : ''}{recoveryDiff.toFixed(1)})
+        </div>
+
+        {/* Recovery event badges */}
+        {recoveryEvents.length > 0 && onJumpToFrame && (
+          <div className="mt-3">
+            <div className="text-xs text-gray-500 mb-1">Jump to recovery:</div>
+            <div className="flex flex-wrap gap-1">
+              {recoveryEvents.slice(0, 8).map((event, i) => (
+                <button
+                  key={`${event.frame}-${i}`}
+                  onClick={() => onJumpToFrame(event.frame)}
+                  className="text-xs px-1.5 py-0.5 rounded transition-colors bg-purple-100 hover:bg-purple-200 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 dark:hover:bg-purple-900/50"
+                  title={event.description}
+                  data-testid={`jump-to-frame-${event.frame}`}
+                >
+                  @{event.frame}
+                </button>
+              ))}
+              {recoveryEvents.length > 8 && (
+                <span className="text-xs text-gray-400 self-center">+{recoveryEvents.length - 8} more</span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-export default function QualityPanel({ datasetId, episodeId, onJumpToFrame, selectedMetric, onSelectMetric }: QualityPanelProps) {
-  const { quality, loading, error } = useEpisodeQuality(datasetId, episodeId);
+export default function QualityPanel({
+  datasetId,
+  episodeId,
+  taskName,
+  onJumpToFrame,
+  selectedMetric,
+  onSelectMetric,
+  onDivergenceScores,
+}: QualityPanelProps) {
+  // We still need episode quality for backward compatibility, but won't display most of it
+  const { loading, error } = useEpisodeQuality(datasetId, episodeId);
   const { events: qualityEventsData } = useQualityEvents(datasetId, episodeId);
   const events = qualityEventsData?.events || [];
 
-  const handleMetricClick = (metricKey: string) => {
-    if (onSelectMetric) {
-      // Toggle: if already selected, deselect; otherwise select
-      onSelectMetric(selectedMetric === metricKey ? null : metricKey);
-    }
-  };
+  // Task-level quality metrics
+  const { metrics: taskMetrics, loading: taskLoading } = useTaskQuality(datasetId, taskName);
+
+  // Episode divergence for timeline heat map
+  const { divergence, loading: divLoading } = useEpisodeDivergence(datasetId, taskName, episodeId);
+
+  // Pass divergence scores to parent for timeline heat
+  const divergenceScores = divergence?.frame_divergences;
+  if (onDivergenceScores && divergenceScores && divergenceScores.length > 0) {
+    setTimeout(() => onDivergenceScores(divergenceScores), 0);
+  }
+
+  // Filter to recovery events only
+  const recoveryEvents = events.filter(e => e.event_type === 'recovery');
 
   if (!episodeId) {
     return (
@@ -168,7 +257,7 @@ export default function QualityPanel({ datasetId, episodeId, onJumpToFrame, sele
     );
   }
 
-  if (loading) {
+  if (loading || taskLoading || divLoading) {
     return (
       <div className="p-4 text-center text-gray-500" data-testid="loading-quality">
         Analyzing quality...
@@ -184,114 +273,49 @@ export default function QualityPanel({ datasetId, episodeId, onJumpToFrame, sele
     );
   }
 
-  if (!quality) {
-    return (
-      <div className="p-4 text-center text-gray-500">
-        No quality data available
-      </div>
-    );
-  }
-
   return (
     <div className="p-4" data-testid="quality-panel">
-      {/* Grade Badge */}
-      <QualityBadge quality={quality} />
+      {/* Task-Level Quality (if available) */}
+      {taskMetrics && (
+        <div className="mb-6">
+          <h3 className="text-sm font-bold text-gray-800 dark:text-gray-200 mb-3 flex items-center gap-2">
+            Task Quality
+            <span className="text-xs font-normal text-gray-500">
+              ({taskMetrics.num_episodes} episodes)
+            </span>
+          </h3>
+          <TaskQualitySection metrics={taskMetrics} />
+        </div>
+      )}
 
-      {/* Quality Flags */}
-      <QualityFlags quality={quality} />
-
-      {/* Temporal Metrics */}
-      <div className="mb-4">
-        <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-          Temporal Quality ({Math.round(quality.temporal.overall_temporal_score * 100)}%)
-        </h4>
-        <MetricBar
-          label="Motion Smoothness"
-          value={quality.temporal.motion_smoothness}
-          colorClass="bg-green-500"
-          metricKey="motion_smoothness"
-          isSelected={selectedMetric === 'motion_smoothness'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Action-Obs Sync"
-          value={quality.temporal.sync_score}
-          colorClass="bg-cyan-500"
-          metricKey="sync_score"
-          isSelected={selectedMetric === 'sync_score'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Action Consistency"
-          value={quality.temporal.action_consistency}
-          colorClass="bg-green-500"
-          metricKey="action_consistency"
-          isSelected={selectedMetric === 'action_consistency'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Completeness"
-          value={quality.temporal.trajectory_completeness}
-          colorClass="bg-green-500"
-          metricKey="trajectory_completeness"
-          isSelected={selectedMetric === 'trajectory_completeness'}
-          onClick={handleMetricClick}
-        />
-      </div>
-
-      {/* Diversity Metrics */}
-      <div>
-        <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-          Diversity Quality ({Math.round(quality.diversity.overall_diversity_score * 100)}%)
-        </h4>
-        <MetricBar
-          label="Recovery Behaviors"
-          value={quality.diversity.recovery_behavior_score}
-          colorClass="bg-purple-500"
-          metricKey="recovery_behavior_score"
-          isSelected={selectedMetric === 'recovery_behavior_score'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Transition Diversity"
-          value={quality.diversity.transition_diversity}
-          colorClass="bg-purple-500"
-          metricKey="transition_diversity"
-          isSelected={selectedMetric === 'transition_diversity'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Near-Miss Handling"
-          value={quality.diversity.near_miss_ratio}
-          colorClass="bg-purple-500"
-          metricKey="near_miss_ratio"
-          isSelected={selectedMetric === 'near_miss_ratio'}
-          onClick={handleMetricClick}
-        />
-        <MetricBar
-          label="Action Coverage"
-          value={quality.diversity.action_space_coverage}
-          colorClass="bg-purple-500"
-          metricKey="action_space_coverage"
-          isSelected={selectedMetric === 'action_space_coverage'}
-          onClick={handleMetricClick}
-        />
-      </div>
-
-      {/* Quality Events */}
-      {events.length > 0 && (
-        <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-          <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
-            Detected Events ({events.length})
-          </h4>
-          <EventBadges
-            events={events}
+      {/* Episode Comparison Section */}
+      {taskMetrics && divergence && divergence.dimension_names.length > 0 && (
+        <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
+          <h3 className="text-sm font-bold text-gray-800 dark:text-gray-200 mb-3">
+            This Episode vs Task
+          </h3>
+          <EpisodeComparisonSection
+            taskMetrics={taskMetrics}
+            divergence={divergence}
+            recoveryEvents={recoveryEvents}
             onJumpToFrame={onJumpToFrame}
-            maxShow={12}
           />
-          <div className="mt-2 text-xs text-gray-500">
-            Click to jump to frame
-          </div>
+        </div>
+      )}
+
+      {/* Fallback if no task metrics but have divergence events */}
+      {!taskMetrics && divergence && (
+        <div className="p-2 bg-orange-50 dark:bg-orange-900/10 rounded text-xs">
+          <span className="text-orange-700 dark:text-orange-300">
+            Episode divergence: {Math.round(divergence.overall_divergence_score * 100)}%
+          </span>
+        </div>
+      )}
+
+      {/* Show loading placeholder if waiting for task data */}
+      {!taskMetrics && !divergence && (
+        <div className="p-4 text-center text-gray-400 text-sm">
+          Task-level analysis requires 2+ episodes
         </div>
       )}
     </div>

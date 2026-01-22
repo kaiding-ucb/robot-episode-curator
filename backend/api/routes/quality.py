@@ -18,6 +18,12 @@ from quality import (
     compute_quality_score,
     compute_dataset_quality_stats,
     QualityScore,
+    # Task-level metrics
+    compute_task_statistics,
+    compute_episode_divergence,
+    compute_task_quality_metrics,
+    compute_simplified_transition_metrics,
+    QualityEvent as QualityEventDataclass,
 )
 from loaders import HDF5Loader, LeRobotLoader, RLDSLoader
 from loaders.streaming_extractor import StreamingFrameExtractor
@@ -89,11 +95,12 @@ class DatasetQualityResponse(BaseModel):
 class QualityEvent(BaseModel):
     """A quality event tied to a specific frame."""
     frame: int
-    event_type: str  # "gripper", "pause", "direction_change", "speed_change", "high_jerk", "correction"
+    event_type: str  # "gripper", "pause", "direction_change", "high_jerk", "recovery", "near_miss", "high_divergence"
     severity: str  # "info", "warning", "significant"
     score: float
     description: str
     affected_metrics: List[str]  # Which metrics this event affects
+    metric_category: Optional[str] = "transition"  # "transition" or "divergence" for UI color coding
 
 
 class QualityEventsResponse(BaseModel):
@@ -101,6 +108,45 @@ class QualityEventsResponse(BaseModel):
     episode_id: str
     total_frames: int
     events: List[QualityEvent]
+
+
+# ============== Task-Level Quality Models ==============
+
+class TaskQualityResponse(BaseModel):
+    """Task-level quality metrics aggregated across episodes."""
+    task_name: str
+    dataset_id: str
+    num_episodes: int
+
+    # Action Divergence (Expertise Test)
+    mean_divergence: float
+    expertise_score: float  # 1 - mean_divergence (higher = better)
+    divergence_distribution: Dict[str, int]  # 'low', 'medium', 'high' counts
+    most_divergent_episodes: List[str]
+    high_divergence_frame_density: float
+
+    # Transition Diversity (Physics Test)
+    pct_with_recovery: float
+    mean_recovery_count: float
+    mean_near_miss_count: float
+    has_any_recovery_episodes: bool
+    physics_coverage_score: float
+
+    # Quality assessment
+    quality_assessment: str
+
+
+class EpisodeDivergenceResponse(BaseModel):
+    """Per-frame divergence for timeline heat visualization."""
+    episode_id: str
+    task_name: str
+    overall_divergence_score: float
+    frame_divergences: List[float]  # Divergence at each frame (original length)
+    high_divergence_frames: List[int]
+    events: List[QualityEvent]
+    # Per-dimension breakdown
+    dimension_names: List[str] = []  # e.g. ["pos_x", "pos_y", ...]
+    dimension_means: List[float] = []  # Mean divergence per dimension
 
 
 def get_data_root(request: Request) -> Path:
@@ -242,7 +288,8 @@ async def get_quality_events(
             severity=quality_event.severity,
             score=quality_event.score,
             description=quality_event.description,
-            affected_metrics=quality_event.affected_metrics or []
+            affected_metrics=quality_event.affected_metrics or [],
+            metric_category=getattr(quality_event, 'metric_category', 'transition') or 'transition'
         ))
 
     # Cache the results
@@ -260,6 +307,201 @@ async def get_quality_events(
         episode_id=episode_id,
         total_frames=total_frames,
         events=events
+    )
+
+
+# ============== Task-Level Quality Endpoints ==============
+
+@router.get("/task/{dataset_id}/{task_name}", response_model=TaskQualityResponse)
+async def get_task_quality(
+    dataset_id: str,
+    task_name: str,
+    request: Request,
+    limit: int = Query(50, description="Maximum episodes per task to analyze")
+):
+    """
+    Get quality metrics aggregated at the task level.
+
+    Computes two key metrics:
+    1. Action Divergence (Expertise Test) - consistency across episodes
+    2. Transition Diversity (Physics Test) - presence of recovery behaviors
+
+    Results are more meaningful than per-episode metrics for comparing datasets.
+    """
+    data_root = get_data_root(request)
+
+    try:
+        loader = get_loader(dataset_id, data_root)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # List all episodes and filter by task name
+    all_episodes = loader.list_episodes()
+    task_episodes = [
+        ep for ep in all_episodes
+        if ep.task_name and ep.task_name == task_name
+    ][:limit]
+
+    if len(task_episodes) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task '{task_name}' needs at least 2 episodes for divergence analysis, found {len(task_episodes)}"
+        )
+
+    # Load actions for all episodes
+    episode_actions = []
+    for ep_meta in task_episodes:
+        try:
+            episode = loader.load_episode(ep_meta.id)
+            if episode.actions is not None and len(episode.actions) >= 5:
+                episode_actions.append((ep_meta.id, episode.actions))
+        except Exception as e:
+            logger.warning(f"Failed to load episode {ep_meta.id}: {e}")
+            continue
+
+    if len(episode_actions) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not load enough valid episodes for task '{task_name}'"
+        )
+
+    # Compute task statistics
+    try:
+        task_stats = compute_task_statistics(task_name, episode_actions)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Compute divergence for each episode
+    divergence_results = []
+    for ep_id, actions in episode_actions:
+        div_result = compute_episode_divergence(ep_id, actions, task_stats)
+        divergence_results.append(div_result)
+
+    # Compute transition diversity for each episode
+    transition_results = []
+    for ep_id, actions in episode_actions:
+        trans_result = compute_simplified_transition_metrics(ep_id, actions)
+        transition_results.append({
+            "has_recovery": trans_result.has_recovery,
+            "recovery_count": trans_result.recovery_count,
+            "near_miss_count": trans_result.near_miss_count,
+        })
+
+    # Aggregate to task level
+    task_metrics = compute_task_quality_metrics(
+        task_name, dataset_id, divergence_results, transition_results
+    )
+
+    return TaskQualityResponse(
+        task_name=task_metrics.task_name,
+        dataset_id=task_metrics.dataset_id,
+        num_episodes=task_metrics.num_episodes,
+        mean_divergence=task_metrics.mean_divergence,
+        expertise_score=task_metrics.expertise_score,
+        divergence_distribution=task_metrics.divergence_distribution,
+        most_divergent_episodes=task_metrics.most_divergent_episodes,
+        high_divergence_frame_density=task_metrics.high_divergence_frame_density,
+        pct_with_recovery=task_metrics.pct_with_recovery,
+        mean_recovery_count=task_metrics.mean_recovery_count,
+        mean_near_miss_count=task_metrics.mean_near_miss_count,
+        has_any_recovery_episodes=task_metrics.has_any_recovery_episodes,
+        physics_coverage_score=task_metrics.physics_coverage_score,
+        quality_assessment=task_metrics.quality_assessment,
+    )
+
+
+@router.get("/task/{dataset_id}/{task_name}/divergence/{episode_id:path}", response_model=EpisodeDivergenceResponse)
+async def get_episode_divergence(
+    dataset_id: str,
+    task_name: str,
+    episode_id: str,
+    request: Request,
+    limit: int = Query(50, description="Maximum episodes for task statistics")
+):
+    """
+    Get per-frame divergence data for a specific episode.
+
+    Used by the frontend to render a divergence heat map on the timeline,
+    showing where this episode diverges from the task median.
+    """
+    data_root = get_data_root(request)
+
+    try:
+        loader = get_loader(dataset_id, data_root)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Load the target episode
+    try:
+        target_episode = loader.load_episode(episode_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
+
+    if target_episode.actions is None or len(target_episode.actions) < 5:
+        raise HTTPException(status_code=400, detail="Episode has insufficient action data")
+
+    # Get all episodes for this task to compute statistics
+    all_episodes = loader.list_episodes()
+    task_episodes = [
+        ep for ep in all_episodes
+        if ep.task_name and ep.task_name == task_name
+    ][:limit]
+
+    if len(task_episodes) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task '{task_name}' needs at least 2 episodes for divergence analysis"
+        )
+
+    # Load actions for task statistics
+    episode_actions = []
+    for ep_meta in task_episodes:
+        try:
+            episode = loader.load_episode(ep_meta.id)
+            if episode.actions is not None and len(episode.actions) >= 5:
+                episode_actions.append((ep_meta.id, episode.actions))
+        except Exception:
+            continue
+
+    if len(episode_actions) < 2:
+        raise HTTPException(status_code=400, detail="Could not load enough episodes for task statistics")
+
+    # Compute task statistics
+    try:
+        task_stats = compute_task_statistics(task_name, episode_actions)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Compute divergence for the target episode
+    div_result = compute_episode_divergence(episode_id, target_episode.actions, task_stats)
+
+    # Convert events to API format
+    events = [
+        QualityEvent(
+            frame=e.frame,
+            event_type=e.event_type,
+            severity=e.severity,
+            score=e.score,
+            description=e.description,
+            affected_metrics=e.affected_metrics or [],
+            metric_category=e.metric_category or "divergence"
+        )
+        for e in div_result.divergence_events
+    ]
+
+    return EpisodeDivergenceResponse(
+        episode_id=episode_id,
+        task_name=task_name,
+        overall_divergence_score=div_result.overall_divergence_score,
+        frame_divergences=div_result.original_frame_divergences.tolist(),
+        high_divergence_frames=div_result.high_divergence_frames,
+        events=events,
+        dimension_names=div_result.dimension_names,
+        dimension_means=div_result.dimension_means
     )
 
 

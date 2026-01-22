@@ -21,26 +21,45 @@ from scipy.spatial.distance import pdist, squareform
 class QualityEvent:
     """A quality event detected in the trajectory."""
     frame: int
-    event_type: str  # 'gripper', 'pause', 'direction_change', 'speed_change', 'high_jerk', 'correction'
+    event_type: str  # 'gripper', 'pause', 'direction_change', 'high_jerk', 'recovery', 'near_miss', 'high_divergence'
     severity: str  # 'info', 'warning', 'significant'
     score: float  # Event magnitude/importance (0-1)
     description: str
     affected_metrics: List[str] = None  # Which metrics this event affects
+    metric_category: str = None  # 'transition' or 'divergence' for UI color coding
 
     def __post_init__(self):
-        """Populate affected_metrics from static mapping if not provided."""
+        """Populate affected_metrics and metric_category from static mappings if not provided."""
         if self.affected_metrics is None:
             self.affected_metrics = EVENT_METRIC_MAP.get(self.event_type, [])
+        if self.metric_category is None:
+            self.metric_category = EVENT_CATEGORY_MAP.get(self.event_type, "transition")
 
 
 # Static mapping of event types to the metrics they affect
 EVENT_METRIC_MAP: Dict[str, List[str]] = {
-    'gripper': ['recovery_behavior_score'],
+    'gripper': ['recovery_behavior_score', 'transition_diversity'],
     'pause': ['recovery_behavior_score'],
     'direction_change': ['transition_diversity', 'recovery_behavior_score'],
     'speed_change': ['motion_smoothness', 'action_consistency'],
     'high_jerk': ['motion_smoothness'],
     'correction': ['recovery_behavior_score', 'near_miss_ratio'],
+    'recovery': ['recovery_behavior_score', 'transition_diversity'],
+    'near_miss': ['near_miss_ratio', 'recovery_behavior_score'],
+    'high_divergence': ['action_divergence'],
+}
+
+# Static mapping of event types to metric categories (for UI color coding)
+EVENT_CATEGORY_MAP: Dict[str, str] = {
+    'gripper': 'transition',
+    'pause': 'transition',
+    'direction_change': 'transition',
+    'speed_change': 'transition',
+    'high_jerk': 'transition',
+    'correction': 'transition',
+    'recovery': 'transition',
+    'near_miss': 'transition',
+    'high_divergence': 'divergence',
 }
 
 
@@ -611,4 +630,204 @@ def compute_diversity_metrics(actions: np.ndarray,
         action_space_coverage=action_coverage,
         overall_diversity_score=overall,
         quality_events=quality_events
+    )
+
+
+def detect_recovery_events(actions: np.ndarray) -> List[QualityEvent]:
+    """
+    Detect recovery behavior events: high acceleration followed by controlled motion.
+
+    Pattern: Error → Correction → Return to normal path
+
+    Args:
+        actions: Array of shape (T, action_dim)
+
+    Returns:
+        List of QualityEvent for recovery behaviors
+    """
+    if actions is None or len(actions) < 10:
+        return []
+
+    events = []
+
+    # Compute acceleration magnitude
+    velocity = np.diff(actions[:, :-1], axis=0)  # Exclude gripper
+    acceleration = np.diff(velocity, axis=0)
+    accel_magnitude = np.linalg.norm(acceleration, axis=1)
+
+    if len(accel_magnitude) < 5:
+        return []
+
+    # Find high-acceleration moments
+    threshold = np.percentile(accel_magnitude, 90)
+    mean_accel = np.mean(accel_magnitude)
+
+    if mean_accel < 1e-8:
+        return []
+
+    min_gap = 5  # Minimum frames between recovery events
+    last_event_frame = -min_gap
+
+    for frame in range(len(accel_magnitude) - 5):
+        if accel_magnitude[frame] > threshold:
+            # Check if followed by controlled motion (recovery pattern)
+            post_accel = accel_magnitude[frame + 1:frame + 5]
+            if np.mean(post_accel) < threshold * 0.3:  # Significant slowdown
+                if frame - last_event_frame >= min_gap:
+                    recovery_strength = accel_magnitude[frame] / mean_accel
+                    events.append(QualityEvent(
+                        frame=frame + 2,  # Offset for derivatives
+                        event_type='recovery',
+                        severity='significant' if recovery_strength > 3 else 'warning',
+                        score=float(min(1.0, recovery_strength / 5.0)),
+                        description=f"Recovery behavior ({recovery_strength:.1f}x avg acceleration)",
+                        affected_metrics=['recovery_behavior_score', 'transition_diversity'],
+                        metric_category='transition'
+                    ))
+                    last_event_frame = frame
+
+    return events
+
+
+def detect_near_miss_events(actions: np.ndarray) -> List[QualityEvent]:
+    """
+    Detect near-miss events: approaching failure boundary then correcting.
+
+    Patterns:
+    - Gripper closes partially then re-opens (slip recovery)
+    - Rapid direction reversal (collision avoidance)
+
+    Args:
+        actions: Array of shape (T, action_dim)
+
+    Returns:
+        List of QualityEvent for near-miss situations
+    """
+    if actions is None or len(actions) < 10:
+        return []
+
+    events = []
+    gripper_idx = actions.shape[1] - 1
+    gripper = actions[:, gripper_idx]
+
+    min_gap = 5
+    last_event_frame = -min_gap
+
+    # Detect partial gripper operations (slip recovery)
+    for i in range(2, len(gripper) - 3):
+        # Pattern: open → closing → re-open (or vice versa)
+        # Indicates a slip or failed grasp attempt
+        prev_change = gripper[i] - gripper[i - 2]
+        next_change = gripper[i + 2] - gripper[i]
+
+        # Direction reversal in gripper
+        if prev_change * next_change < -0.1:  # Significant reversal
+            if i - last_event_frame >= min_gap:
+                events.append(QualityEvent(
+                    frame=i,
+                    event_type='near_miss',
+                    severity='warning',
+                    score=0.8,
+                    description="Gripper correction (potential slip recovery)",
+                    affected_metrics=['near_miss_ratio', 'recovery_behavior_score'],
+                    metric_category='transition'
+                ))
+                last_event_frame = i
+
+    return events
+
+
+@dataclass
+class TransitionDiversityResult:
+    """Simplified transition diversity result for task-level aggregation."""
+    episode_id: str
+    has_recovery: bool
+    recovery_count: int
+    near_miss_count: int
+    correction_count: int
+    transition_events: List[QualityEvent]
+    overall_transition_score: float
+
+
+def compute_simplified_transition_metrics(
+    episode_id: str,
+    actions: np.ndarray
+) -> TransitionDiversityResult:
+    """
+    Compute simplified transition diversity metrics for task-level aggregation.
+
+    Focuses on two key signals:
+    1. Recovery behaviors (error → correction)
+    2. Near-miss handling (slip recovery, collision avoidance)
+
+    Args:
+        episode_id: ID of the episode
+        actions: Array of shape (T, action_dim)
+
+    Returns:
+        TransitionDiversityResult with simplified metrics
+    """
+    if actions is None or len(actions) < 10:
+        return TransitionDiversityResult(
+            episode_id=episode_id,
+            has_recovery=False,
+            recovery_count=0,
+            near_miss_count=0,
+            correction_count=0,
+            transition_events=[],
+            overall_transition_score=0.2
+        )
+
+    # Detect recovery events
+    recovery_events = detect_recovery_events(actions)
+
+    # Detect near-miss events
+    near_miss_events = detect_near_miss_events(actions)
+
+    # Get direction changes that indicate corrections (>90 deg)
+    direction_events = [
+        e for e in detect_direction_changes(actions, angle_threshold=90)
+        if e.severity in ['warning', 'significant']
+    ]
+    # Re-label as corrections with proper category
+    correction_events = []
+    for e in direction_events:
+        correction_events.append(QualityEvent(
+            frame=e.frame,
+            event_type='correction',
+            severity=e.severity,
+            score=e.score,
+            description=e.description.replace("Direction", "Correction"),
+            affected_metrics=['recovery_behavior_score', 'near_miss_ratio'],
+            metric_category='transition'
+        ))
+
+    # Merge all events
+    all_events = recovery_events + near_miss_events + correction_events
+    all_events.sort(key=lambda e: e.frame)
+
+    # Counts
+    recovery_count = len(recovery_events)
+    near_miss_count = len(near_miss_events)
+    correction_count = len(correction_events)
+
+    has_recovery = recovery_count > 0 or near_miss_count > 0
+
+    # Score: presence of recovery behaviors is HIGH quality
+    # Base score + bonus for having events
+    event_density = (recovery_count + near_miss_count * 0.5 + correction_count * 0.3) / max(1, len(actions) / 30.0)
+    overall_score = min(1.0, 0.3 + event_density * 0.35)
+
+    # Boost if we have actual recovery events
+    if recovery_count > 0:
+        overall_score = min(1.0, overall_score + 0.2)
+
+    return TransitionDiversityResult(
+        episode_id=episode_id,
+        has_recovery=has_recovery,
+        recovery_count=recovery_count,
+        near_miss_count=near_miss_count,
+        correction_count=correction_count,
+        transition_events=all_events,
+        overall_transition_score=overall_score
     )
