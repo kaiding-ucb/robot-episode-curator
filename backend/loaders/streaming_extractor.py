@@ -186,17 +186,29 @@ class StreamingFrameExtractor:
             if len(cached_frames) >= end:
                 logger.info(f"Using in-memory cached frames for {file_path} (range {start}-{end})")
                 return cached_frames[start:end]
+            # If cache has frames covering the requested start, return what we have
+            # This handles partial decode scenarios where decode stops early
+            if len(cached_frames) > start:
+                actual_end = min(end, len(cached_frames))
+                logger.info(f"Cache partial hit: returning frames {start}-{actual_end} of {len(cached_frames)} cached for {file_path}")
+                return cached_frames[start:actual_end]
             # If cache doesn't have enough frames, we need to decode more
             logger.info(f"In-memory cache has {len(cached_frames)} frames, need up to {end}")
 
         # Check persistent cache
         if episode_path:
             persistent_frames = _load_persistent_frame_cache(self.repo_id, episode_path)
-            if persistent_frames and len(persistent_frames) >= end:
+            if persistent_frames:
                 # Load into in-memory cache for faster subsequent access
                 _FRAME_CACHE[cache_key] = persistent_frames
-                logger.info(f"Loaded from persistent cache for {file_path} (range {start}-{end})")
-                return persistent_frames[start:end]
+                if len(persistent_frames) >= end:
+                    logger.info(f"Loaded from persistent cache for {file_path} (range {start}-{end})")
+                    return persistent_frames[start:end]
+                # Return partial frames if they cover the requested start
+                if len(persistent_frames) > start:
+                    actual_end = min(end, len(persistent_frames))
+                    logger.info(f"Persistent cache partial hit: returning frames {start}-{actual_end} of {len(persistent_frames)} cached")
+                    return persistent_frames[start:actual_end]
 
         try:
             from mcap.reader import make_reader
@@ -237,6 +249,11 @@ class StreamingFrameExtractor:
                 logger.info(f"Decoding {len(h264_data)} H.264 NAL units from MCAP")
                 # Decode all frames (start=0) and cache them
                 frames = self._decode_h264_frames(h264_data, timestamps, 0, len(h264_data))
+
+                # Log decode completion status
+                logger.info(f"H.264 decode complete: {len(frames)} frames from {len(h264_data)} NAL units")
+                if len(frames) < len(h264_data):
+                    logger.warning(f"Incomplete decode: expected ~{len(h264_data)} frames, got {len(frames)} frames")
 
                 # Cache the decoded frames for future requests (both in-memory and persistent)
                 if frames:
@@ -289,18 +306,29 @@ class StreamingFrameExtractor:
                 container = av.open(tmp_path)
                 stream = container.streams.video[0]
                 frame_idx = 0
+                decode_errors = 0
 
-                for frame in container.decode(stream):
-                    if frame_idx >= end:
-                        break
+                try:
+                    for frame in container.decode(stream):
+                        if frame_idx >= end:
+                            break
 
-                    if frame_idx >= start:
-                        # Convert to numpy array (RGB)
-                        img = frame.to_ndarray(format='rgb24')
-                        timestamp = timestamps[frame_idx] if frame_idx < len(timestamps) else frame_idx / 30.0
-                        frames.append((frame_idx, timestamp, img))
+                        if frame_idx >= start:
+                            # Convert to numpy array (RGB)
+                            img = frame.to_ndarray(format='rgb24')
+                            timestamp = timestamps[frame_idx] if frame_idx < len(timestamps) else frame_idx / 30.0
+                            frames.append((frame_idx, timestamp, img))
 
-                    frame_idx += 1
+                        frame_idx += 1
+                except av.AVError as e:
+                    decode_errors += 1
+                    logger.warning(f"H.264 decode stopped at frame {frame_idx}: {e}")
+                except Exception as e:
+                    decode_errors += 1
+                    logger.warning(f"H.264 decode error at frame {frame_idx}: {e}")
+
+                if decode_errors > 0:
+                    logger.info(f"Decode completed with errors: {len(frames)} frames decoded before error")
 
                 container.close()
 

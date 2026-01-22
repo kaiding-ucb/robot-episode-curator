@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useFrames } from "@/hooks/useApi";
+import type { StreamingOptions } from "@/types/api";
 import { useQualityEvents } from "@/hooks/useQuality";
 import EnhancedTimeline from "./EnhancedTimeline";
 
@@ -26,8 +27,15 @@ export default function EpisodeViewer({
   const [playing, setPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
 
+  // Always use lowest resolution for fast loading
+  const streamingOptions: StreamingOptions = useMemo(() => ({
+    resolution: "low",  // 320x240
+    quality: 30,        // Low quality for speed
+  }), []);
+
   // Fetch frames around the current position
-  const batchSize = 30;
+  // Larger batches = fewer boundary transitions = smoother playback
+  const batchSize = 750; // ~25 seconds at 30fps - covers most episodes in 1-2 batches
   const batchStart = Math.floor(currentFrame / batchSize) * batchSize;
   const {
     frames,
@@ -42,7 +50,8 @@ export default function EpisodeViewer({
     episodeId,
     batchStart,
     batchStart + batchSize,
-    datasetId
+    datasetId,
+    streamingOptions
   );
 
   // Use API-provided total frames if prop is 0 or unknown
@@ -62,34 +71,68 @@ export default function EpisodeViewer({
   }, [targetFrame, clearPreviousBatch]);
 
   // Pre-fetch next batch when approaching boundary
+  // Trigger earlier to ensure prefetch completes before boundary
   useEffect(() => {
     if (!playing || !episodeId) return;
     const positionInBatch = currentFrame - batchStart;
-    if (positionInBatch >= batchSize - 5) { // 5 frames before boundary
+    if (positionInBatch >= batchSize - 500) { // 500 frames before boundary (~17s at 30fps)
       prefetch(batchStart + batchSize, batchStart + batchSize * 2);
     }
   }, [currentFrame, playing, batchStart, batchSize, prefetch, episodeId]);
 
   // Get the frame to display from the loaded batch
-  // Only display if the loaded range matches the requested batch to prevent stale frame display
+  // Priority: 1) Current batch if ready, 2) Current frames if they cover the frame, 3) Previous batch fallback
   const isBatchReady = loadedRange && loadedRange.start === batchStart;
   let displayFrame = null;
   let isShowingFallback = false;
 
   if (isBatchReady) {
-    displayFrame = frames[currentFrame - batchStart];
-  } else if (previousBatch?.episodeId === episodeId &&
-             previousBatch.range.end === batchStart) {
-    // Same episode, sequential transition - show last frame from previous batch
-    displayFrame = previousBatch.frames[previousBatch.frames.length - 1];
-    isShowingFallback = true;
+    // Add bounds check to prevent accessing out-of-bounds frame index
+    const frameIndex = currentFrame - batchStart;
+    displayFrame = frameIndex >= 0 && frameIndex < frames.length ? frames[frameIndex] : null;
+  } else if (loadedRange && frames.length > 0) {
+    // During loading/transition: use current frames if they cover the requested frame
+    // This handles resolution changes (play/pause) where the batch range is same but quality differs
+    const frameIndex = currentFrame - loadedRange.start;
+    if (frameIndex >= 0 && frameIndex < frames.length) {
+      displayFrame = frames[frameIndex];
+      isShowingFallback = true;
+    }
   }
 
-  // Playback logic - continue during fallback (isShowingFallback) while new batch loads
+  // If still no frame, try previous batch - but only if currentFrame is within its range
+  if (!displayFrame && previousBatch?.episodeId === episodeId &&
+             currentFrame >= previousBatch.range.start &&
+             currentFrame < previousBatch.range.end) {
+    // Find the correct frame from previousBatch by index
+    const prevFrameIndex = currentFrame - previousBatch.range.start;
+    if (prevFrameIndex >= 0 && prevFrameIndex < previousBatch.frames.length) {
+      displayFrame = previousBatch.frames[prevFrameIndex];
+      isShowingFallback = true;
+    }
+  }
+
+  // Track frame availability and loading state in refs so the interval callback can check them
+  const hasFrameRef = useRef(false);
+  const isLoadingRef = useRef(false);
+  hasFrameRef.current = displayFrame !== null || isShowingFallback;
+  isLoadingRef.current = loading;
+
+  // Playback logic - continues during loading, uses fallback frames
   useEffect(() => {
-    if (!playing || (!displayFrame && !isShowingFallback)) return;
+    if (!playing) return;
+
+    // Don't start playback if we don't have any frame to display
+    if (!hasFrameRef.current) {
+      return;
+    }
 
     const interval = setInterval(() => {
+      // Skip tick if no frame available (fallback will show last known frame)
+      if (!hasFrameRef.current) {
+        return;
+      }
+
       setCurrentFrame((prev) => {
         if (prev >= effectiveTotalFrames - 1) {
           setPlaying(false);
@@ -100,7 +143,7 @@ export default function EpisodeViewer({
     }, 1000 / (30 * playbackSpeed)); // Assume 30fps base
 
     return () => clearInterval(interval);
-  }, [playing, displayFrame, isShowingFallback, effectiveTotalFrames, playbackSpeed]);
+  }, [playing, effectiveTotalFrames, playbackSpeed]); // Removed 'loading' dependency
 
   // Reset when episode changes
   useEffect(() => {
@@ -111,9 +154,9 @@ export default function EpisodeViewer({
   const handleFrameChange = useCallback((frame: number) => {
     setCurrentFrame(frame);
     setPlaying(false);
-    clearPreviousBatch(); // Clear fallback on manual seek
+    // Don't clear previous batch - we need it for display during batch transitions
     onFrameChange?.(frame);
-  }, [onFrameChange, clearPreviousBatch]);
+  }, [onFrameChange]);
 
   const togglePlayback = useCallback(() => {
     setPlaying((prev) => !prev);
@@ -173,7 +216,8 @@ export default function EpisodeViewer({
       <div className="flex-1 min-h-0 bg-black flex items-center justify-center relative overflow-hidden">
         {displayFrame ? (
           <img
-            src={`data:image/jpeg;base64,${displayFrame.image}`}
+            key={`frame-${currentFrame}`}
+            src={`data:image/webp;base64,${displayFrame.image}`}
             alt={`Frame ${currentFrame}`}
             className="max-w-full max-h-full object-contain"
             data-testid="frame-image"

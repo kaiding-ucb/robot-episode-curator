@@ -10,6 +10,8 @@ import type {
   DiskSpace,
   Task,
   TaskListResponse,
+  ImageResolution,
+  StreamingOptions,
 } from "@/types/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
@@ -121,7 +123,7 @@ export function useTasks(datasetId: string | null) {
 export function useTaskEpisodes(
   datasetId: string | null,
   taskName: string | null,
-  limit: number = 10,
+  limit: number = 5,
   offset: number = 0
 ) {
   const [episodes, setEpisodes] = useState<EpisodeMetadata[]>([]);
@@ -187,7 +189,8 @@ export function useFrames(
   episodeId: string | null,
   start: number = 0,
   end: number = 10,
-  datasetId: string | null = null
+  datasetId: string | null = null,
+  streamingOptions?: StreamingOptions
 ) {
   const [frames, setFrames] = useState<Frame[]>([]);
   const [totalFrames, setTotalFrames] = useState<number | null>(null);
@@ -209,16 +212,22 @@ export function useFrames(
   // Track previous episode to detect changes
   const prevEpisodeIdRef = useRef<string | null>(null);
 
+  // Track in-flight prefetch to prevent duplicate requests
+  const prefetchInFlightRef = useRef<string | null>(null);
+
   // Helper function to fetch frames
   const fetchFramesData = useCallback(async (
     epId: string,
     rangeStart: number,
     rangeEnd: number,
-    dsId: string | null
+    dsId: string | null,
+    options?: StreamingOptions
   ): Promise<{ frames: Frame[]; total: number | null }> => {
     const datasetParam = dsId ? `&dataset_id=${dsId}` : '';
+    const resolutionParam = options?.resolution ? `&resolution=${options.resolution}` : '';
+    const qualityParam = options?.quality ? `&quality=${options.quality}` : '';
     const res = await fetch(
-      `${API_BASE}/episodes/${epId}/frames?start=${rangeStart}&end=${rangeEnd}${datasetParam}`
+      `${API_BASE}/episodes/${epId}/frames?start=${rangeStart}&end=${rangeEnd}${datasetParam}${resolutionParam}${qualityParam}`
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -245,6 +254,9 @@ export function useFrames(
   const prefetch = useCallback(async (prefetchStart: number, prefetchEnd: number) => {
     if (!episodeId || !datasetId) return;
 
+    // Create a unique key for this prefetch request
+    const prefetchKey = `${episodeId}:${prefetchStart}-${prefetchEnd}`;
+
     // Don't prefetch if we already have this range
     if (prefetchedDataRef.current?.range.start === prefetchStart &&
         prefetchedDataRef.current?.range.end === prefetchEnd &&
@@ -252,12 +264,21 @@ export function useFrames(
       return;
     }
 
+    // Don't prefetch if this exact request is already in flight
+    if (prefetchInFlightRef.current === prefetchKey) {
+      return;
+    }
+
+    // Mark as in-flight
+    prefetchInFlightRef.current = prefetchKey;
+
     try {
       const { frames: prefetchedFrames, total } = await fetchFramesData(
         episodeId,
         prefetchStart,
         prefetchEnd,
-        datasetId
+        datasetId,
+        streamingOptions
       );
 
       prefetchedDataRef.current = {
@@ -268,16 +289,25 @@ export function useFrames(
       setPrefetchedRange({ start: prefetchStart, end: prefetchEnd });
     } catch {
       // Silently fail prefetch - it's just an optimization
+    } finally {
+      // Clear in-flight marker
+      if (prefetchInFlightRef.current === prefetchKey) {
+        prefetchInFlightRef.current = null;
+      }
     }
-  }, [episodeId, datasetId, fetchFramesData]);
+  }, [episodeId, datasetId, streamingOptions, fetchFramesData]);
 
   useEffect(() => {
-    // Detect episode change and clear fallback
+    // Detect episode change and clear ALL state including frames
     if (prevEpisodeIdRef.current !== episodeId) {
       setPreviousBatch(null);
       prefetchedDataRef.current = null;
       setPrefetchedRange(null);
+      prefetchInFlightRef.current = null;
       prevEpisodeIdRef.current = episodeId;
+      // Clear frames immediately when episode changes to avoid showing old episode
+      setFrames([]);
+      setLoadedRange(null);
     }
 
     if (!episodeId) {
@@ -325,7 +355,7 @@ export function useFrames(
       }
 
       try {
-        const { frames: newFrames, total } = await fetchFramesData(currentEpisodeId, start, end, datasetId);
+        const { frames: newFrames, total } = await fetchFramesData(currentEpisodeId, start, end, datasetId, streamingOptions);
         setFrames(newFrames);
         if (total !== undefined && total !== null) {
           setTotalFrames(total);
@@ -338,7 +368,7 @@ export function useFrames(
       }
     }
     fetchFrames();
-  }, [episodeId, start, end, datasetId, fetchFramesData]);
+  }, [episodeId, start, end, datasetId, streamingOptions, fetchFramesData]);
 
   // Function to clear previous batch (for manual seeks)
   const clearPreviousBatch = useCallback(() => {

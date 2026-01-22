@@ -17,7 +17,7 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
   const { episodes, loading: loadingEpisodes, error: episodesError, hasMore, loadMore } = useTaskEpisodes(
     selectedDataset,
     selectedTask,
-    10 // Default limit
+    5 // Reduced limit for faster loading
   );
 
   const handleSelectDataset = (datasetId: string) => {

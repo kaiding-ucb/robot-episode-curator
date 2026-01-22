@@ -197,27 +197,51 @@ def get_loader_for_episode(episode_id: str, data_root: Path, dataset_id: str = N
     return None, None
 
 
-def encode_image_base64(image: np.ndarray) -> str:
-    """Encode numpy image array to base64 JPEG."""
+RESOLUTION_MAP = {
+    "low": (320, 240),
+    "medium": (640, 480),
+    "high": (960, 720),
+    "original": None,
+}
+
+
+def encode_image_with_options(
+    image: np.ndarray,
+    resolution: str = "medium",
+    quality: int = 70,
+) -> str:
+    """Encode numpy image array to base64 WebP with resolution and quality options."""
     try:
         from PIL import Image
+        import cv2
 
         # Ensure correct format
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
 
+        # Resize if needed
+        target_size = RESOLUTION_MAP.get(resolution)
+        if target_size and (image.shape[1] > target_size[0] or image.shape[0] > target_size[1]):
+            # Use cv2.resize with INTER_AREA for quality downsampling
+            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+
         # Convert to PIL Image
         pil_image = Image.fromarray(image)
 
-        # Encode to JPEG
+        # Encode to WebP with specified quality (40-50% smaller than JPEG)
         buffer = BytesIO()
-        pil_image.save(buffer, format="JPEG", quality=85)
+        pil_image.save(buffer, format="WEBP", quality=quality)
         buffer.seek(0)
 
         return base64.b64encode(buffer.read()).decode("utf-8")
     except ImportError:
         # Fallback without PIL - return raw base64
         return base64.b64encode(image.tobytes()).decode("utf-8")
+
+
+def encode_image_base64(image: np.ndarray) -> str:
+    """Encode numpy image array to base64 JPEG (legacy compatibility)."""
+    return encode_image_with_options(image, resolution="original", quality=85)
 
 
 def is_streaming_episode(episode_id: str, dataset_id: Optional[str]) -> tuple:
@@ -253,9 +277,19 @@ async def get_streaming_frames(
     file_path: str,
     start: int,
     end: int,
+    resolution: str = "medium",
+    quality: int = 70,
 ) -> FramesResponse:
     """
     Get frames from a streaming HuggingFace episode.
+
+    Args:
+        repo_id: HuggingFace repository ID
+        file_path: Path to the episode file within the repo
+        start: Start frame index
+        end: End frame index
+        resolution: Image resolution (low/medium/high/original)
+        quality: JPEG quality (10-100)
     """
     extractor = StreamingFrameExtractor(repo_id)
 
@@ -263,13 +297,26 @@ async def get_streaming_frames(
         # Extract frames and get total count
         raw_frames, total_frames = extractor.extract_frames_with_count(file_path, start, end)
 
-        # Convert to FrameData
+        # Check if we got fewer frames than requested (partial extraction)
+        requested_count = end - start
+        actual_count = len(raw_frames)
+        if actual_count < requested_count:
+            logger.warning(f"Partial frame extraction: got {actual_count}/{requested_count} frames for range {start}-{end}")
+            # If we got frames but fewer than expected, the actual total might be lower
+            # This helps the frontend know the real available range
+            if actual_count > 0 and raw_frames:
+                # Use the highest frame index we actually got as a hint
+                highest_frame = raw_frames[-1][0] if raw_frames else start
+                if highest_frame + 1 < total_frames:
+                    logger.info(f"Actual available frames may be ~{highest_frame + 1} vs reported {total_frames}")
+
+        # Convert to FrameData with resolution/quality options
         frames = []
         for frame_idx, timestamp, image in raw_frames:
             frame_data = FrameData(
                 frame_idx=frame_idx,
                 timestamp=timestamp,
-                image_base64=encode_image_base64(image),
+                image_base64=encode_image_with_options(image, resolution, quality),
                 action=None,  # Streaming datasets typically don't have action data
             )
             frames.append(frame_data)
@@ -291,6 +338,8 @@ async def get_frames(
     end: int = Query(10, ge=1),
     include_actions: bool = True,
     dataset_id: Optional[str] = Query(None, description="Dataset ID to load episode from"),
+    resolution: str = Query("medium", description="Image resolution: low (320x240), medium (640x480), high (960x720), original"),
+    quality: int = Query(70, ge=10, le=100, description="WebP quality (10-100)"),
 ):
     """
     Get frames from an episode.
@@ -301,14 +350,16 @@ async def get_frames(
         end: End frame index (exclusive)
         include_actions: Include action data with frames
         dataset_id: Optional dataset ID (used to directly select the loader)
+        resolution: Image resolution for streaming optimization
+        quality: WebP encoding quality (lower = faster, smaller)
     """
     # Check if this is a streaming episode
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
 
     if is_streaming:
-        logger.info(f"Loading streaming episode from {repo_id}: {file_path}")
+        logger.info(f"Loading streaming episode from {repo_id}: {file_path} (res={resolution}, q={quality})")
         try:
-            return await get_streaming_frames(repo_id, file_path, start, end)
+            return await get_streaming_frames(repo_id, file_path, start, end, resolution, quality)
         except Exception as e:
             logger.error(f"Streaming frame extraction failed: {e}")
             raise HTTPException(
@@ -351,7 +402,7 @@ async def get_frames(
         # Get image
         if episode.observations is not None and idx < len(episode.observations):
             image = episode.observations[idx]
-            frame_data.image_base64 = encode_image_base64(image)
+            frame_data.image_base64 = encode_image_with_options(image, resolution, quality)
 
         # Get action
         if include_actions and episode.actions is not None and idx < len(episode.actions):

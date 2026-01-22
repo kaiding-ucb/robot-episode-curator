@@ -58,3 +58,11 @@ export interface DiskSpace {
   used_gb: number;
   available_gb: number;
 }
+
+// === STREAMING OPTIMIZATION TYPES ===
+export type ImageResolution = "low" | "medium" | "high" | "original";
+
+export interface StreamingOptions {
+  resolution?: ImageResolution;
+  quality?: number; // 10-100
+}
