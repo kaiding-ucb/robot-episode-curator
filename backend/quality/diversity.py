@@ -370,6 +370,9 @@ def detect_all_quality_events(actions: np.ndarray) -> List[QualityEvent]:
     all_events.extend(detect_direction_changes(actions))
     # Removed: speed_change events (too noisy for timeline)
     all_events.extend(detect_high_jerk(actions))
+    # Recovery and near-miss events (important for physics test)
+    all_events.extend(detect_recovery_events(actions))
+    all_events.extend(detect_near_miss_events(actions))
 
     # Sort by frame
     all_events.sort(key=lambda e: e.frame)
