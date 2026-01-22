@@ -1,8 +1,20 @@
 /**
  * React hooks for quality metrics API
+ *
+ * Includes:
+ * - Episode-level quality metrics
+ * - Dataset-level quality stats
+ * - Task-level quality metrics (Expertise + Physics tests)
+ * - Episode divergence for timeline heat
  */
 import { useState, useEffect } from "react";
-import type { QualityScore, DatasetQualityStats, QualityEventsResponse } from "@/types/quality";
+import type {
+  QualityScore,
+  DatasetQualityStats,
+  QualityEventsResponse,
+  TaskQualityMetrics,
+  EpisodeDivergence,
+} from "@/types/quality";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
@@ -121,4 +133,105 @@ export function useQualityEvents(datasetId: string | null, episodeId: string | n
   }, [datasetId, episodeId]);
 
   return { events, loading, error };
+}
+
+// ============== Task-Level Quality Hooks ==============
+
+/**
+ * Fetch task-level quality metrics
+ *
+ * Computes two key metrics:
+ * 1. Action Divergence (Expertise Test) - consistency across episodes
+ * 2. Transition Diversity (Physics Test) - presence of recovery behaviors
+ */
+export function useTaskQuality(
+  datasetId: string | null,
+  taskName: string | null,
+  limit: number = 50
+) {
+  const [metrics, setMetrics] = useState<TaskQualityMetrics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!datasetId || !taskName) {
+      setMetrics(null);
+      return;
+    }
+
+    async function fetchTaskQuality() {
+      setLoading(true);
+      setError(null);
+      try {
+        const encodedTaskName = encodeURIComponent(taskName);
+        const res = await fetch(
+          `${API_BASE}/quality/task/${datasetId}/${encodedTaskName}?limit=${limit}`
+        );
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.detail || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        setMetrics(data);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to fetch task quality");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchTaskQuality();
+  }, [datasetId, taskName, limit]);
+
+  return { metrics, loading, error };
+}
+
+/**
+ * Fetch per-frame divergence data for an episode
+ *
+ * Used to render the divergence heat map on the timeline,
+ * showing where this episode diverges from the task median.
+ */
+export function useEpisodeDivergence(
+  datasetId: string | null,
+  taskName: string | null,
+  episodeId: string | null,
+  limit: number = 50
+) {
+  const [divergence, setDivergence] = useState<EpisodeDivergence | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!datasetId || !taskName || !episodeId) {
+      setDivergence(null);
+      return;
+    }
+
+    async function fetchDivergence() {
+      setLoading(true);
+      setError(null);
+      try {
+        const encodedTaskName = encodeURIComponent(taskName);
+        const encodedEpisodeId = encodeURIComponent(episodeId);
+        const res = await fetch(
+          `${API_BASE}/quality/task/${datasetId}/${encodedTaskName}/divergence/${encodedEpisodeId}?limit=${limit}`
+        );
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.detail || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        setDivergence(data);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to fetch episode divergence");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchDivergence();
+  }, [datasetId, taskName, episodeId, limit]);
+
+  return { divergence, loading, error };
 }
