@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from downloaders.manager import DATASET_REGISTRY
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.streaming_extractor import StreamingFrameExtractor
+from cache import get_encoded_frame_cache
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class FramesResponse(BaseModel):
 
     frames: List[FrameData]
     total_frames: Optional[int] = None
+    from_cache: bool = False
 
 
 def get_data_root(request: Request) -> Path:
@@ -279,9 +281,12 @@ async def get_streaming_frames(
     end: int,
     resolution: str = "medium",
     quality: int = 70,
+    dataset_id: str = None,
 ) -> FramesResponse:
     """
     Get frames from a streaming HuggingFace episode.
+
+    Uses full-episode caching to survive browser refresh regardless of batch boundaries.
 
     Args:
         repo_id: HuggingFace repository ID
@@ -290,38 +295,87 @@ async def get_streaming_frames(
         end: End frame index
         resolution: Image resolution (low/medium/high/original)
         quality: JPEG quality (10-100)
+        dataset_id: Dataset identifier for caching
     """
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+
+    # Use full-episode cache key (no start/end) to survive browser refresh
+    episode_key = cache.get_episode_cache_key(effective_dataset_id, file_path, resolution, quality)
+
+    # Check if full episode is cached
+    cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+    if cached_episode:
+        # Return requested slice from cached full episode
+        all_frames = cached_episode["frames"]
+        total_frames = cached_episode["total"]
+
+        # Clamp range to available frames
+        actual_end = min(end, len(all_frames))
+        slice_frames = all_frames[start:actual_end]
+
+        frames = [
+            FrameData(
+                frame_idx=f["frame_idx"],
+                timestamp=f.get("timestamp"),
+                image_base64=f.get("image_base64"),
+                action=f.get("action"),
+            )
+            for f in slice_frames
+        ]
+        logger.info(f"Serving frames {start}-{actual_end} from full episode cache ({total_frames} total)")
+        return FramesResponse(frames=frames, total_frames=total_frames, from_cache=True)
+
+    # Not cached: decode ALL frames for the episode, then cache
     extractor = StreamingFrameExtractor(repo_id)
 
     try:
-        # Extract frames and get total count
-        raw_frames, total_frames = extractor.extract_frames_with_count(file_path, start, end)
+        # Extract ALL frames (from 0 to a large number to get everything)
+        logger.info(f"Decoding full episode for caching: {file_path}")
+        raw_frames, total_frames = extractor.extract_frames_with_count(file_path, 0, 999999)
 
-        # Check if we got fewer frames than requested (partial extraction)
-        requested_count = end - start
-        actual_count = len(raw_frames)
-        if actual_count < requested_count:
-            logger.warning(f"Partial frame extraction: got {actual_count}/{requested_count} frames for range {start}-{end}")
-            # If we got frames but fewer than expected, the actual total might be lower
-            # This helps the frontend know the real available range
-            if actual_count > 0 and raw_frames:
-                # Use the highest frame index we actually got as a hint
-                highest_frame = raw_frames[-1][0] if raw_frames else start
-                if highest_frame + 1 < total_frames:
-                    logger.info(f"Actual available frames may be ~{highest_frame + 1} vs reported {total_frames}")
+        # Log decode result
+        logger.info(f"Decoded {len(raw_frames)} frames for episode {file_path}")
 
-        # Convert to FrameData with resolution/quality options
-        frames = []
+        # Convert ALL frames to FrameData with resolution/quality options
+        all_frames_for_cache = []
         for frame_idx, timestamp, image in raw_frames:
-            frame_data = FrameData(
-                frame_idx=frame_idx,
-                timestamp=timestamp,
-                image_base64=encode_image_with_options(image, resolution, quality),
-                action=None,  # Streaming datasets typically don't have action data
-            )
-            frames.append(frame_data)
+            image_base64 = encode_image_with_options(image, resolution, quality)
+            all_frames_for_cache.append({
+                "frame_idx": frame_idx,
+                "timestamp": timestamp,
+                "image_base64": image_base64,
+                "action": None,  # Streaming datasets typically don't have action data
+            })
 
-        return FramesResponse(frames=frames, total_frames=total_frames)
+        # Store FULL episode in cache
+        cache.store_episode_frames(
+            episode_key,
+            all_frames_for_cache,
+            len(all_frames_for_cache),  # Use actual decoded count as total
+            {
+                "dataset_id": effective_dataset_id,
+                "episode_id": file_path,
+                "resolution": resolution,
+                "quality": quality,
+            },
+        )
+
+        # Return only the requested slice
+        actual_end = min(end, len(all_frames_for_cache))
+        slice_frames = all_frames_for_cache[start:actual_end]
+
+        frames = [
+            FrameData(
+                frame_idx=f["frame_idx"],
+                timestamp=f.get("timestamp"),
+                image_base64=f.get("image_base64"),
+                action=f.get("action"),
+            )
+            for f in slice_frames
+        ]
+
+        return FramesResponse(frames=frames, total_frames=len(all_frames_for_cache), from_cache=False)
 
     except Exception as e:
         logger.error(f"Failed to extract streaming frames: {e}")
@@ -338,7 +392,7 @@ async def get_frames(
     end: int = Query(10, ge=1),
     include_actions: bool = True,
     dataset_id: Optional[str] = Query(None, description="Dataset ID to load episode from"),
-    resolution: str = Query("medium", description="Image resolution: low (320x240), medium (640x480), high (960x720), original"),
+    resolution: str = Query("low", description="Image resolution: low (320x240), medium (640x480), high (960x720), original"),
     quality: int = Query(70, ge=10, le=100, description="WebP quality (10-100)"),
 ):
     """
@@ -359,7 +413,7 @@ async def get_frames(
     if is_streaming:
         logger.info(f"Loading streaming episode from {repo_id}: {file_path} (res={resolution}, q={quality})")
         try:
-            return await get_streaming_frames(repo_id, file_path, start, end, resolution, quality)
+            return await get_streaming_frames(repo_id, file_path, start, end, resolution, quality, dataset_id)
         except Exception as e:
             logger.error(f"Streaming frame extraction failed: {e}")
             raise HTTPException(
@@ -374,43 +428,107 @@ async def get_frames(
     if loader is None:
         raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
 
+    # Determine effective dataset_id for caching
+    effective_dataset_id = dataset_id
+    if not effective_dataset_id:
+        # Try to extract from episode_id
+        parts = episode_id.split("/", 1)
+        if parts[0] in DATASET_REGISTRY:
+            effective_dataset_id = parts[0]
+        else:
+            effective_dataset_id = "local"
+
+    # Use full-episode cache key (no start/end) to survive browser refresh
+    cache = get_encoded_frame_cache()
+    episode_key = cache.get_episode_cache_key(effective_dataset_id, episode_id, resolution, quality)
+
+    # Check if full episode is cached
+    cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+    if cached_episode:
+        # Return requested slice from cached full episode
+        all_frames = cached_episode["frames"]
+        total_frames = cached_episode["total"]
+
+        # Clamp range to available frames
+        actual_end = min(end, len(all_frames))
+        slice_frames = all_frames[start:actual_end]
+
+        frames = [
+            FrameData(
+                frame_idx=f["frame_idx"],
+                timestamp=f.get("timestamp"),
+                image_base64=f.get("image_base64"),
+                action=f.get("action"),
+            )
+            for f in slice_frames
+        ]
+        logger.info(f"Serving frames {start}-{actual_end} from full episode cache ({total_frames} total)")
+        return FramesResponse(frames=frames, total_frames=total_frames, from_cache=True)
+
+    # Not cached: load episode and cache ALL frames
     try:
         episode = loader.load_episode(resolved_id)
     except Exception as e:
         logger.error(f"Failed to load episode: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to load episode: {str(e)}")
 
-    # Validate range
     max_frames = episode.num_frames
     if start >= max_frames:
-        return FramesResponse(frames=[], total_frames=max_frames)
+        return FramesResponse(frames=[], total_frames=max_frames, from_cache=False)
 
-    end = min(end, max_frames)
-
-    frames = []
-    for idx in range(start, end):
-        frame_data = FrameData(frame_idx=idx)
+    # Encode ALL frames for the episode (not just requested range)
+    logger.info(f"Encoding full episode for caching: {episode_id} ({max_frames} frames)")
+    all_frames_for_cache = []
+    for idx in range(max_frames):
+        cache_frame = {"frame_idx": idx}
 
         # Get timestamp
         if episode.timestamps is not None and idx < len(episode.timestamps):
-            frame_data.timestamp = float(episode.timestamps[idx])
+            cache_frame["timestamp"] = float(episode.timestamps[idx])
         else:
             # Estimate from frame rate
             fps = episode.metadata.get("fps", 30)
-            frame_data.timestamp = idx / fps
+            cache_frame["timestamp"] = idx / fps
 
         # Get image
         if episode.observations is not None and idx < len(episode.observations):
             image = episode.observations[idx]
-            frame_data.image_base64 = encode_image_with_options(image, resolution, quality)
+            cache_frame["image_base64"] = encode_image_with_options(image, resolution, quality)
 
         # Get action
         if include_actions and episode.actions is not None and idx < len(episode.actions):
-            frame_data.action = episode.actions[idx].tolist()
+            cache_frame["action"] = episode.actions[idx].tolist()
 
-        frames.append(frame_data)
+        all_frames_for_cache.append(cache_frame)
 
-    return FramesResponse(frames=frames, total_frames=max_frames)
+    # Store FULL episode in cache
+    cache.store_episode_frames(
+        episode_key,
+        all_frames_for_cache,
+        max_frames,
+        {
+            "dataset_id": effective_dataset_id,
+            "episode_id": episode_id,
+            "resolution": resolution,
+            "quality": quality,
+        },
+    )
+
+    # Return only the requested slice
+    actual_end = min(end, max_frames)
+    slice_frames = all_frames_for_cache[start:actual_end]
+
+    frames = [
+        FrameData(
+            frame_idx=f["frame_idx"],
+            timestamp=f.get("timestamp"),
+            image_base64=f.get("image_base64"),
+            action=f.get("action"),
+        )
+        for f in slice_frames
+    ]
+
+    return FramesResponse(frames=frames, total_frames=max_frames, from_cache=False)
 
 
 @router.get("/{episode_id:path}", response_model=EpisodeDetail)

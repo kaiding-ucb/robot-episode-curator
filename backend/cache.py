@@ -333,3 +333,423 @@ def get_cache_stats() -> dict:
         "frames_entries": count_entries(FRAMES_CACHE_DIR),
         "frames_size_mb": get_size(FRAMES_CACHE_DIR) / (1024 * 1024),
     }
+
+
+# Encoded frames cache directory
+ENCODED_FRAMES_CACHE_DIR = CACHE_DIR / "frames" / "encoded"
+
+
+class CachedEpisodeInfo:
+    """Information about a cached episode."""
+
+    def __init__(
+        self,
+        dataset_id: str,
+        episode_id: str,
+        size_bytes: int,
+        cached_at: float,
+        batch_count: int,
+    ):
+        self.dataset_id = dataset_id
+        self.episode_id = episode_id
+        self.size_bytes = size_bytes
+        self.size_mb = size_bytes / (1024 * 1024)
+        self.cached_at = cached_at
+        self.batch_count = batch_count
+
+
+class EncodedFrameCache:
+    """
+    Caches encoded WebP frames to disk.
+
+    Stores pre-encoded base64 WebP frames to avoid re-encoding on subsequent requests.
+    Frames are stored per-batch (e.g., frames 0-30, 30-60) for each episode.
+    """
+
+    def __init__(self, cache_dir: Path = None):
+        """
+        Initialize the encoded frame cache.
+
+        Args:
+            cache_dir: Directory to store cache files. Defaults to ~/.cache/data_viewer/frames/encoded
+        """
+        self.cache_dir = cache_dir or ENCODED_FRAMES_CACHE_DIR
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_cache_key(
+        self,
+        dataset_id: str,
+        episode_id: str,
+        resolution: str,
+        quality: int,
+        start: int,
+        end: int,
+    ) -> str:
+        """
+        Generate unique key for a frame batch (DEPRECATED - use get_episode_cache_key).
+
+        Args:
+            dataset_id: Dataset identifier
+            episode_id: Episode identifier
+            resolution: Image resolution (low/medium/high/original)
+            quality: WebP quality (10-100)
+            start: Start frame index
+            end: End frame index
+
+        Returns:
+            Unique cache key string
+        """
+        key_str = f"{dataset_id}|{episode_id}|{resolution}|{quality}|{start}|{end}"
+        return hashlib.sha256(key_str.encode()).hexdigest()[:32]
+
+    def get_episode_cache_key(
+        self,
+        dataset_id: str,
+        episode_id: str,
+        resolution: str,
+        quality: int,
+    ) -> str:
+        """
+        Generate unique key for a full episode (no start/end).
+
+        This key is used for full-episode caching, which survives browser refresh
+        regardless of what batch range the frontend requests.
+
+        Args:
+            dataset_id: Dataset identifier
+            episode_id: Episode identifier
+            resolution: Image resolution (low/medium/high/original)
+            quality: WebP quality (10-100)
+
+        Returns:
+            Unique cache key string
+        """
+        key_str = f"{dataset_id}|{episode_id}|{resolution}|{quality}|full"
+        return hashlib.sha256(key_str.encode()).hexdigest()[:32]
+
+    def _get_episode_dir(self, dataset_id: str, episode_id: str) -> Path:
+        """Get the directory for a specific episode's cache files."""
+        # Sanitize episode_id for filesystem use
+        safe_episode_id = episode_id.replace("/", "__").replace("\\", "__")
+        return self.cache_dir / dataset_id / safe_episode_id
+
+    def _get_cache_path(self, key: str, dataset_id: str, episode_id: str) -> Path:
+        """Get the file path for a cache key."""
+        episode_dir = self._get_episode_dir(dataset_id, episode_id)
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        return episode_dir / f"{key}.json"
+
+    def get_frames(self, key: str, dataset_id: str, episode_id: str) -> Optional[dict]:
+        """
+        Return cached frames or None (DEPRECATED - use get_episode_frames).
+
+        Args:
+            key: Cache key from get_cache_key()
+            dataset_id: Dataset identifier
+            episode_id: Episode identifier
+
+        Returns:
+            Cached data dict with 'frames' and 'total' keys, or None if not found
+        """
+        cache_path = self._get_cache_path(key, dataset_id, episode_id)
+
+        if not cache_path.exists():
+            return None
+
+        try:
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+                logger.debug(f"Cache hit for key: {key}")
+                return data
+        except Exception as e:
+            logger.warning(f"Failed to load cached frames for key {key}: {e}")
+            return None
+
+    def get_episode_frames(self, key: str, dataset_id: str, episode_id: str) -> Optional[dict]:
+        """
+        Return all cached frames for an episode, or None if not found.
+
+        Args:
+            key: Cache key from get_episode_cache_key()
+            dataset_id: Dataset identifier
+            episode_id: Episode identifier
+
+        Returns:
+            Cached data dict with 'frames' (all frames) and 'total' keys, or None
+        """
+        cache_path = self._get_cache_path(key, dataset_id, episode_id)
+
+        if not cache_path.exists():
+            logger.debug(f"Episode cache miss for {dataset_id}/{episode_id}")
+            return None
+
+        try:
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+                logger.info(f"Episode cache hit: {dataset_id}/{episode_id} ({len(data.get('frames', []))} frames)")
+                return data
+        except Exception as e:
+            logger.warning(f"Failed to load episode cache for key {key}: {e}")
+            return None
+
+    def store_frames(
+        self,
+        key: str,
+        frames: list,
+        total_frames: int,
+        metadata: dict,
+    ) -> bool:
+        """
+        Store frames with metadata (DEPRECATED - use store_episode_frames).
+
+        Args:
+            key: Cache key from get_cache_key()
+            frames: List of frame data dicts
+            total_frames: Total frames in episode
+            metadata: Metadata dict with dataset_id, episode_id, resolution, quality, etc.
+
+        Returns:
+            True if stored successfully
+        """
+        dataset_id = metadata.get("dataset_id", "unknown")
+        episode_id = metadata.get("episode_id", "unknown")
+        cache_path = self._get_cache_path(key, dataset_id, episode_id)
+
+        try:
+            data = {
+                "frames": frames,
+                "total": total_frames,
+                "metadata": metadata,
+                "cached_at": time.time(),
+            }
+
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+
+            logger.debug(f"Cached {len(frames)} frames for key: {key}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to cache frames for key {key}: {e}")
+            return False
+
+    def store_episode_frames(
+        self,
+        key: str,
+        all_frames: list,
+        total_frames: int,
+        metadata: dict,
+    ) -> bool:
+        """
+        Store ALL frames for an episode.
+
+        This stores the complete episode so that any subsequent requests
+        (regardless of batch boundaries) can be served from cache.
+
+        Args:
+            key: Cache key from get_episode_cache_key()
+            all_frames: List of ALL frame data dicts for the episode
+            total_frames: Total frames in episode
+            metadata: Metadata dict with dataset_id, episode_id, resolution, quality
+
+        Returns:
+            True if stored successfully
+        """
+        dataset_id = metadata.get("dataset_id", "unknown")
+        episode_id = metadata.get("episode_id", "unknown")
+        cache_path = self._get_cache_path(key, dataset_id, episode_id)
+
+        try:
+            data = {
+                "frames": all_frames,
+                "total": total_frames,
+                "metadata": metadata,
+                "cached_at": time.time(),
+                "full_episode": True,
+            }
+
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+
+            size_mb = cache_path.stat().st_size / (1024 * 1024)
+            logger.info(f"Cached full episode: {dataset_id}/{episode_id} ({total_frames} frames, {size_mb:.2f} MB)")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to cache full episode for key {key}: {e}")
+            return False
+
+    def list_cached_episodes(self) -> list:
+        """
+        Return all cached episodes with size and timestamp.
+
+        Returns:
+            List of CachedEpisodeInfo objects
+        """
+        episodes = []
+
+        if not self.cache_dir.exists():
+            return episodes
+
+        # Iterate through dataset directories
+        for dataset_dir in self.cache_dir.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+
+            dataset_id = dataset_dir.name
+
+            # Iterate through episode directories
+            for episode_dir in dataset_dir.iterdir():
+                if not episode_dir.is_dir():
+                    continue
+
+                # Restore original episode_id from safe name
+                episode_id = episode_dir.name.replace("__", "/")
+
+                # Calculate total size and get latest timestamp
+                total_size = 0
+                latest_timestamp = 0
+                batch_count = 0
+
+                for cache_file in episode_dir.glob("*.json"):
+                    try:
+                        stat = cache_file.stat()
+                        total_size += stat.st_size
+                        latest_timestamp = max(latest_timestamp, stat.st_mtime)
+                        batch_count += 1
+                    except Exception:
+                        continue
+
+                if batch_count > 0:
+                    episodes.append(
+                        CachedEpisodeInfo(
+                            dataset_id=dataset_id,
+                            episode_id=episode_id,
+                            size_bytes=total_size,
+                            cached_at=latest_timestamp,
+                            batch_count=batch_count,
+                        )
+                    )
+
+        # Sort by most recently cached
+        episodes.sort(key=lambda e: e.cached_at, reverse=True)
+        return episodes
+
+    def delete_episode_cache(self, dataset_id: str, episode_id: str) -> int:
+        """
+        Delete all cached batches for an episode.
+
+        Args:
+            dataset_id: Dataset identifier
+            episode_id: Episode identifier
+
+        Returns:
+            Bytes freed
+        """
+        episode_dir = self._get_episode_dir(dataset_id, episode_id)
+
+        if not episode_dir.exists():
+            return 0
+
+        bytes_freed = 0
+        try:
+            for cache_file in episode_dir.glob("*.json"):
+                try:
+                    bytes_freed += cache_file.stat().st_size
+                    cache_file.unlink()
+                except Exception:
+                    pass
+
+            # Try to remove the episode directory if empty
+            try:
+                episode_dir.rmdir()
+            except Exception:
+                pass
+
+            # Try to remove the dataset directory if empty
+            try:
+                dataset_dir = self.cache_dir / dataset_id
+                dataset_dir.rmdir()
+            except Exception:
+                pass
+
+            logger.info(f"Deleted cache for episode: {dataset_id}/{episode_id}, freed {bytes_freed} bytes")
+
+        except Exception as e:
+            logger.warning(f"Error deleting episode cache: {e}")
+
+        return bytes_freed
+
+    def clear_all(self) -> int:
+        """
+        Clear entire encoded frames cache.
+
+        Returns:
+            Bytes freed
+        """
+        bytes_freed = 0
+
+        if not self.cache_dir.exists():
+            return 0
+
+        try:
+            for dataset_dir in list(self.cache_dir.iterdir()):
+                if not dataset_dir.is_dir():
+                    continue
+
+                for episode_dir in list(dataset_dir.iterdir()):
+                    if not episode_dir.is_dir():
+                        continue
+
+                    for cache_file in list(episode_dir.glob("*.json")):
+                        try:
+                            bytes_freed += cache_file.stat().st_size
+                            cache_file.unlink()
+                        except Exception:
+                            pass
+
+                    try:
+                        episode_dir.rmdir()
+                    except Exception:
+                        pass
+
+                try:
+                    dataset_dir.rmdir()
+                except Exception:
+                    pass
+
+            logger.info(f"Cleared all encoded frame cache, freed {bytes_freed} bytes")
+
+        except Exception as e:
+            logger.warning(f"Error clearing encoded frame cache: {e}")
+
+        return bytes_freed
+
+    def get_cache_stats(self) -> dict:
+        """
+        Return cache statistics.
+
+        Returns:
+            Dict with total_size_mb, episode_count, batch_count
+        """
+        episodes = self.list_cached_episodes()
+        total_size = sum(e.size_bytes for e in episodes)
+        total_batches = sum(e.batch_count for e in episodes)
+
+        return {
+            "total_size_mb": total_size / (1024 * 1024),
+            "episode_count": len(episodes),
+            "batch_count": total_batches,
+        }
+
+
+# Global encoded frame cache instance
+_encoded_frame_cache: Optional[EncodedFrameCache] = None
+
+
+def get_encoded_frame_cache() -> EncodedFrameCache:
+    """Get the global encoded frame cache instance."""
+    global _encoded_frame_cache
+    if _encoded_frame_cache is None:
+        _encoded_frame_cache = EncodedFrameCache()
+    return _encoded_frame_cache
