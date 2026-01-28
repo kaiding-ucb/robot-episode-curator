@@ -4,14 +4,6 @@ import { useState } from "react";
 import type { Dataset, EpisodeMetadata, Task, DatasetOverview } from "@/types/api";
 import { useDatasets, useTasks, useTaskEpisodes, useDatasetOverview } from "@/hooks/useApi";
 
-// Helper to format bytes
-function formatBytes(bytes: number): string {
-  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  return `${bytes} bytes`;
-}
-
 // Badge component for metadata display
 function OverviewBadge({
   children,
@@ -184,13 +176,10 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                 </div>
               ) : overview ? (
                 <>
-                  {/* Format + Size + Gated row */}
+                  {/* Format + Gated + License row */}
                   <div className="flex flex-wrap gap-1.5" data-testid="overview-badges">
                     {overview.format_detected && (
                       <OverviewBadge color="blue">{overview.format_detected}</OverviewBadge>
-                    )}
-                    {overview.size_bytes && (
-                      <OverviewBadge color="gray">{formatBytes(overview.size_bytes)}</OverviewBadge>
                     )}
                     {overview.gated && (
                       <OverviewBadge color="red">Gated</OverviewBadge>
