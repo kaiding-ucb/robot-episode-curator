@@ -4,13 +4,17 @@ API routes for dataset operations.
 Endpoints:
 - GET /api/datasets - List all datasets
 - GET /api/datasets/{id} - Get dataset info
+- GET /api/datasets/{id}/overview - Get rich metadata overview
 - GET /api/datasets/{id}/episodes - List episodes in dataset
 - GET /api/datasets/{id}/tasks - List tasks in dataset
 - GET /api/datasets/{id}/tasks/{task_name}/episodes - List episodes for a task
 """
 import logging
+import os
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import httpx
@@ -61,6 +65,41 @@ class TaskListResponse(BaseModel):
     tasks: List[TaskInfo]
     total_tasks: int
     source: str  # "huggingface_api", "episode_scan", "config"
+
+
+class DatasetOverview(BaseModel):
+    """Rich metadata for dataset overview display."""
+
+    repo_id: str
+    name: str
+    description: Optional[str] = None
+    readme_summary: Optional[str] = None
+    license: Optional[str] = None
+    dataset_tags: List[str] = []
+
+    # From HF repo info
+    size_bytes: Optional[int] = None
+    gated: bool = False
+    downloads_last_month: Optional[int] = None
+
+    # Parsed from README or detected
+    environment: Optional[str] = None
+    perspective: Optional[str] = None
+    format_detected: Optional[str] = None
+
+    # Scale and modalities
+    modalities: List[str] = []
+    estimated_hours: Optional[float] = None
+    estimated_clips: Optional[int] = None
+    task_count: Optional[int] = None
+
+    # Cache metadata
+    cached_at: Optional[str] = None
+
+
+# Overview cache with TTL
+_OVERVIEW_CACHE: Dict[str, Tuple[DatasetOverview, datetime]] = {}
+OVERVIEW_CACHE_TTL_HOURS = 24
 
 
 def get_data_root(request: Request) -> Path:
@@ -474,3 +513,312 @@ async def list_task_episodes(
             status_code=500,
             detail=f"Failed to list episodes: {str(e)}",
         )
+
+
+# === Dataset Overview Functions ===
+
+
+async def fetch_repo_readme(repo_id: str) -> Optional[str]:
+    """Fetch README.md content from HuggingFace."""
+    url = f"https://huggingface.co/datasets/{repo_id}/raw/main/README.md"
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=headers, timeout=30.0)
+            if response.status_code == 200:
+                return response.text
+        except Exception as e:
+            logger.warning(f"Failed to fetch README for {repo_id}: {e}")
+    return None
+
+
+async def fetch_repo_info(repo_id: str) -> Dict[str, Any]:
+    """Fetch dataset info from HuggingFace API."""
+    url = f"https://huggingface.co/api/datasets/{repo_id}"
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=headers, timeout=30.0)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Failed to fetch repo info for {repo_id}: {e}")
+    return {}
+
+
+async def fetch_repo_files_size(repo_id: str) -> Optional[int]:
+    """Calculate total size from file listing."""
+    url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=headers, timeout=30.0)
+            if response.status_code == 200:
+                items = response.json()
+                total_size = sum(item.get("size", 0) for item in items if item.get("type") == "file")
+                return total_size if total_size > 0 else None
+        except Exception as e:
+            logger.warning(f"Failed to fetch file sizes for {repo_id}: {e}")
+    return None
+
+
+def parse_readme_metadata(content: str) -> Dict[str, Any]:
+    """Extract structured metadata from README text."""
+    result: Dict[str, Any] = {}
+
+    # Extract summary (first paragraph after any YAML front matter)
+    lines = content.split("\n")
+    in_yaml = False
+    summary_lines = []
+    for line in lines:
+        if line.strip() == "---":
+            in_yaml = not in_yaml
+            continue
+        if in_yaml:
+            continue
+        # Skip headers and empty lines for summary
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("|"):
+            summary_lines.append(stripped)
+            if len(" ".join(summary_lines)) > 500:
+                break
+    if summary_lines:
+        result["readme_summary"] = " ".join(summary_lines)[:500]
+
+    # Extract environment
+    content_lower = content.lower()
+    if any(word in content_lower for word in ["household", "home", "kitchen", "domestic"]):
+        result["environment"] = "Household"
+    elif any(word in content_lower for word in ["factory", "industrial", "manufacturing", "assembly"]):
+        result["environment"] = "Factory"
+    elif any(word in content_lower for word in ["laboratory", "lab", "research"]):
+        result["environment"] = "Laboratory"
+    elif any(word in content_lower for word in ["outdoor", "field", "nature"]):
+        result["environment"] = "Outdoor"
+
+    # Extract perspective
+    if any(word in content_lower for word in ["egocentric", "first-person", "first person", "ego-view"]):
+        result["perspective"] = "Egocentric"
+    elif any(word in content_lower for word in ["third-person", "third person", "external view"]):
+        result["perspective"] = "Third-person"
+    elif any(word in content_lower for word in ["robotic", "robot arm", "manipulator"]):
+        result["perspective"] = "Robotic"
+
+    # Extract hours
+    hours_match = re.search(r"(\d+(?:,\d+)?(?:\.\d+)?)\s*(?:k|K)?\s*(?:hours?|hrs?|h)\b", content)
+    if hours_match:
+        hours_str = hours_match.group(1).replace(",", "")
+        hours = float(hours_str)
+        if "k" in hours_match.group(0).lower():
+            hours *= 1000
+        result["estimated_hours"] = hours
+
+    # Extract clips/episodes count
+    clips_match = re.search(r"(\d+(?:,\d+)?(?:\.\d+)?)\s*(?:million|M|k|K)?\s*(?:clips?|episodes?|videos?|samples?)\b", content)
+    if clips_match:
+        clips_str = clips_match.group(1).replace(",", "")
+        clips = float(clips_str)
+        match_text = clips_match.group(0).lower()
+        if "million" in match_text or match_text.endswith("m"):
+            clips *= 1_000_000
+        elif "k" in match_text:
+            clips *= 1000
+        result["estimated_clips"] = int(clips)
+
+    # Extract modalities
+    modalities = []
+    if any(word in content_lower for word in ["rgb", "color image", "video"]):
+        modalities.append("rgb")
+    if any(word in content_lower for word in ["depth", "16-bit depth", "depth map"]):
+        modalities.append("depth")
+    if any(word in content_lower for word in ["imu", "inertial", "accelerometer", "gyroscope"]):
+        modalities.append("imu")
+    if any(word in content_lower for word in ["tactile", "touch sensor", "force sensor"]):
+        modalities.append("tactile")
+    if any(word in content_lower for word in ["action", "trajectory", "end-effector"]):
+        modalities.append("actions")
+    if modalities:
+        result["modalities"] = modalities
+
+    return result
+
+
+def parse_yaml_front_matter(content: str) -> Dict[str, Any]:
+    """Extract YAML front matter from README."""
+    result: Dict[str, Any] = {}
+    if not content.startswith("---"):
+        return result
+
+    try:
+        end_idx = content.find("---", 3)
+        if end_idx == -1:
+            return result
+        yaml_content = content[3:end_idx].strip()
+
+        # Simple YAML parsing for common fields
+        for line in yaml_content.split("\n"):
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().lower()
+                value = value.strip().strip('"').strip("'")
+
+                if key == "license":
+                    result["license"] = value
+                elif key == "tags":
+                    # Handle list format
+                    pass  # Tags usually span multiple lines
+    except Exception as e:
+        logger.warning(f"Failed to parse YAML front matter: {e}")
+
+    return result
+
+
+def detect_format_from_files(files: List[str]) -> Optional[str]:
+    """Detect dataset format from file extensions."""
+    extensions = set()
+    for f in files:
+        ext = Path(f).suffix.lower()
+        if ext:
+            extensions.add(ext)
+
+    if ".mcap" in extensions:
+        return "MCAP"
+    elif ".tar" in extensions:
+        return "WebDataset"
+    elif ".parquet" in extensions:
+        return "LeRobot"
+    elif ".hdf5" in extensions or ".h5" in extensions:
+        return "HDF5"
+    elif ".tfrecord" in extensions:
+        return "RLDS"
+    elif ".mp4" in extensions or ".webm" in extensions:
+        return "Video"
+    return None
+
+
+@router.get("/{dataset_id}/overview", response_model=DatasetOverview)
+async def get_dataset_overview(
+    dataset_id: str,
+    request: Request,
+    refresh: bool = False,
+):
+    """
+    Get rich metadata overview for a dataset.
+
+    Fetches and caches metadata from HuggingFace including:
+    - README content and summary
+    - Repository info (size, gated status, downloads)
+    - Parsed metadata (environment, perspective, scale)
+    - Detected format and modalities
+
+    Args:
+        dataset_id: Dataset identifier
+        refresh: Force refresh cached metadata
+    """
+    # Check cache first
+    if not refresh and dataset_id in _OVERVIEW_CACHE:
+        cached_overview, cached_at = _OVERVIEW_CACHE[dataset_id]
+        if datetime.utcnow() - cached_at < timedelta(hours=OVERVIEW_CACHE_TTL_HOURS):
+            return cached_overview
+
+    # Get dataset config
+    if dataset_id not in DATASET_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
+
+    config = DATASET_REGISTRY[dataset_id]
+    repo_id = config.get("repo_id")
+
+    # Start building overview with registry data
+    overview = DatasetOverview(
+        repo_id=repo_id or dataset_id,
+        name=config.get("name", dataset_id),
+        description=config.get("description"),
+        modalities=config.get("modalities", ["rgb"]),
+    )
+
+    # If no repo_id, return basic info from registry
+    if not repo_id:
+        overview.cached_at = datetime.utcnow().isoformat()
+        _OVERVIEW_CACHE[dataset_id] = (overview, datetime.utcnow())
+        return overview
+
+    # Fetch HuggingFace metadata
+    readme_content = await fetch_repo_readme(repo_id)
+    repo_info = await fetch_repo_info(repo_id)
+
+    # Parse repo info
+    if repo_info:
+        # Handle gated field - can be bool, "auto", "manual", etc.
+        gated_value = repo_info.get("gated", False)
+        overview.gated = gated_value not in (False, None, "")
+        overview.downloads_last_month = repo_info.get("downloads", 0)
+
+        # Extract license from cardData
+        card_data = repo_info.get("cardData", {})
+        if isinstance(card_data, dict):
+            overview.license = card_data.get("license")
+            tags = card_data.get("tags", [])
+            if isinstance(tags, list):
+                overview.dataset_tags = tags[:10]
+
+    # Parse README content
+    if readme_content:
+        yaml_data = parse_yaml_front_matter(readme_content)
+        if yaml_data.get("license"):
+            overview.license = yaml_data["license"]
+
+        parsed = parse_readme_metadata(readme_content)
+        if parsed.get("readme_summary"):
+            overview.readme_summary = parsed["readme_summary"]
+        if parsed.get("environment"):
+            overview.environment = parsed["environment"]
+        if parsed.get("perspective"):
+            overview.perspective = parsed["perspective"]
+        if parsed.get("estimated_hours"):
+            overview.estimated_hours = parsed["estimated_hours"]
+        if parsed.get("estimated_clips"):
+            overview.estimated_clips = parsed["estimated_clips"]
+        if parsed.get("modalities"):
+            overview.modalities = parsed["modalities"]
+
+    # Get file size
+    size_bytes = await fetch_repo_files_size(repo_id)
+    if size_bytes:
+        overview.size_bytes = size_bytes
+
+    # Detect format from registry or file listing
+    if config.get("format"):
+        overview.format_detected = config["format"].upper()
+    else:
+        # Try to get from file listing
+        url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, headers=headers, timeout=15.0)
+                if response.status_code == 200:
+                    files = [item.get("path", "") for item in response.json()]
+                    detected = detect_format_from_files(files)
+                    if detected:
+                        overview.format_detected = detected
+            except Exception:
+                pass
+
+    # Get task count
+    try:
+        tasks = await get_tasks_from_huggingface(repo_id)
+        overview.task_count = len(tasks)
+    except Exception:
+        pass
+
+    # Cache and return
+    overview.cached_at = datetime.utcnow().isoformat()
+    _OVERVIEW_CACHE[dataset_id] = (overview, datetime.utcnow())
+    return overview

@@ -12,6 +12,9 @@ import type {
   TaskListResponse,
   ImageResolution,
   StreamingOptions,
+  CachedEpisode,
+  CacheStats,
+  DatasetOverview,
 } from "@/types/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
@@ -450,4 +453,129 @@ export function useDownloads() {
   );
 
   return { statuses, diskSpace, loading, error, startDownload, refresh: fetchStatus };
+}
+
+/**
+ * Episode cache management
+ */
+export function useEpisodeCache() {
+  const [cachedEpisodes, setCachedEpisodes] = useState<CachedEpisode[]>([]);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchCachedEpisodes = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [episodesRes, statsRes] = await Promise.all([
+        fetch(`${API_BASE}/downloads/cache/episodes`),
+        fetch(`${API_BASE}/downloads/cache/stats`),
+      ]);
+
+      if (!episodesRes.ok) throw new Error(`HTTP ${episodesRes.status}`);
+      if (!statsRes.ok) throw new Error(`HTTP ${statsRes.status}`);
+
+      const episodesData = await episodesRes.json();
+      const statsData = await statsRes.json();
+
+      setCachedEpisodes(episodesData);
+      setCacheStats(statsData);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch cached episodes");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const deleteEpisodeCache = useCallback(
+    async (datasetId: string, episodeId: string) => {
+      try {
+        const encodedEpisodeId = encodeURIComponent(episodeId);
+        const res = await fetch(
+          `${API_BASE}/downloads/cache/episodes/${datasetId}/${encodedEpisodeId}`,
+          { method: "DELETE" }
+        );
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+        // Refresh the list
+        await fetchCachedEpisodes();
+        return true;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to delete cache");
+        return false;
+      }
+    },
+    [fetchCachedEpisodes]
+  );
+
+  const clearAllCache = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/downloads/cache/episodes`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      // Refresh the list
+      await fetchCachedEpisodes();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to clear cache");
+      return false;
+    }
+  }, [fetchCachedEpisodes]);
+
+  return {
+    cachedEpisodes,
+    cacheStats,
+    loading,
+    error,
+    fetchCachedEpisodes,
+    deleteEpisodeCache,
+    clearAllCache,
+  };
+}
+
+/**
+ * Fetch dataset overview metadata
+ */
+export function useDatasetOverview(datasetId: string | null) {
+  const [overview, setOverview] = useState<DatasetOverview | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchOverview = useCallback(async (refresh: boolean = false) => {
+    if (!datasetId) {
+      setOverview(null);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      const refreshParam = refresh ? "?refresh=true" : "";
+      const res = await fetch(`${API_BASE}/datasets/${datasetId}/overview${refreshParam}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setOverview(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch overview");
+    } finally {
+      setLoading(false);
+    }
+  }, [datasetId]);
+
+  useEffect(() => {
+    fetchOverview(false);
+  }, [fetchOverview]);
+
+  const refresh = useCallback(() => {
+    fetchOverview(true);
+  }, [fetchOverview]);
+
+  return { overview, loading, error, refresh };
 }

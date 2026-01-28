@@ -63,6 +63,16 @@ DATASET_REGISTRY = {
         "requires_auth": True,
         "requires_license": True,
     },
+    "microagi00": {
+        "name": "MicroAGI00",
+        "type": "teleop",
+        "description": "Egocentric RGB+D manipulation data with hand landmarks",
+        "size_estimate_gb": 500,
+        "downloader_class": HuggingFaceDownloader,
+        "repo_id": "MicroAGI-Labs/MicroAGI00",
+        "requires_auth": False,
+        "streaming_recommended": True,
+    },
 }
 
 

@@ -66,3 +66,56 @@ export interface StreamingOptions {
   resolution?: ImageResolution;
   quality?: number; // 10-100
 }
+
+// === CACHE MANAGEMENT TYPES ===
+export interface CachedEpisode {
+  dataset_id: string;
+  episode_id: string;
+  size_mb: number;
+  cached_at: string; // ISO timestamp
+  batch_count: number;
+}
+
+export interface CacheStats {
+  total_size_mb: number;
+  episode_count: number;
+  frame_cache_size_mb: number;
+  quality_cache_size_mb: number;
+}
+
+export interface DeleteCacheResponse {
+  bytes_freed: number;
+  success: boolean;
+}
+
+// === MODALITY TYPES ===
+export type Modality = "rgb" | "depth" | "imu" | "tactile" | "actions" | "states";
+
+// === DATASET OVERVIEW TYPES ===
+export interface DatasetOverview {
+  repo_id: string;
+  name: string;
+  description?: string;
+  readme_summary?: string;
+  license?: string;
+  dataset_tags: string[];
+
+  // From HF repo info
+  size_bytes?: number;
+  gated: boolean;
+  downloads_last_month?: number;
+
+  // Parsed from README or detected
+  environment?: string;
+  perspective?: string;
+  format_detected?: string;
+
+  // Scale and modalities
+  modalities: string[];
+  estimated_hours?: number;
+  estimated_clips?: number;
+  task_count?: number;
+
+  // Cache metadata
+  cached_at?: string;
+}
