@@ -8,10 +8,14 @@ Endpoints:
 - GET /api/datasets/{id}/episodes - List episodes in dataset
 - GET /api/datasets/{id}/tasks - List tasks in dataset
 - GET /api/datasets/{id}/tasks/{task_name}/episodes - List episodes for a task
+- POST /api/datasets/probe - Probe a HuggingFace URL to detect format and modalities
+- POST /api/datasets - Add a new dataset from HuggingFace URL
+- DELETE /api/datasets/{id} - Remove a dynamically added dataset
 """
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,8 +25,16 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from downloaders.manager import DownloadManager, DATASET_REGISTRY
+from downloaders.manager import (
+    DownloadManager,
+    DATASET_REGISTRY,
+    add_dynamic_dataset,
+    remove_dynamic_dataset,
+    get_all_datasets,
+)
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
+from loaders.base import Modality
+from loaders.mcap_utils import detect_mcap_modalities, list_mcap_channels
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +121,11 @@ def get_data_root(request: Request) -> Path:
 
 def get_loader(dataset_id: str, data_root: Path):
     """Get appropriate loader for a dataset."""
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         return None
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     data_dir = data_root / dataset_id
 
     # Check format first
@@ -161,14 +174,15 @@ async def get_dataset(dataset_id: str, request: Request):
     """
     Get information about a specific dataset.
     """
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
     data_root = get_data_root(request)
     manager = DownloadManager(data_root)
     status = manager.get_status(dataset_id)
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
 
     # Try to count episodes if data is available
     num_episodes = None
@@ -207,10 +221,11 @@ async def list_episodes(
         limit: Maximum number of episodes to return
         offset: Number of episodes to skip
     """
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
 
     data_root = get_data_root(request)
     loader = get_loader(dataset_id, data_root)
@@ -391,10 +406,11 @@ async def list_tasks(dataset_id: str, request: Request):
     For HuggingFace streaming datasets, uses HF API to get folder structure.
     For downloaded datasets, scans episodes and extracts unique task names.
     """
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     data_root = get_data_root(request)
 
     # Try HuggingFace API first for streaming datasets
@@ -455,10 +471,11 @@ async def list_task_episodes(
         limit: Maximum episodes to return (default 10)
         offset: Number of episodes to skip
     """
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     data_root = get_data_root(request)
 
     # For streaming HuggingFace datasets, use API to list files in task folder
@@ -728,10 +745,11 @@ async def get_dataset_overview(
             return cached_overview
 
     # Get dataset config
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     repo_id = config.get("repo_id")
 
     # Start building overview with registry data
@@ -822,3 +840,374 @@ async def get_dataset_overview(
     overview.cached_at = datetime.utcnow().isoformat()
     _OVERVIEW_CACHE[dataset_id] = (overview, datetime.utcnow())
     return overview
+
+
+# === Probe and Add Dataset Endpoints ===
+
+
+class ProbeRequest(BaseModel):
+    """Request to probe a HuggingFace dataset URL."""
+    url: str  # HuggingFace URL like https://huggingface.co/datasets/user/repo
+
+
+class ProbeResponse(BaseModel):
+    """Response from probing a HuggingFace dataset."""
+    repo_id: str
+    name: str
+    format_detected: Optional[str] = None  # "mcap", "webdataset", "lerobot", "rlds", "hdf5"
+    has_tasks: bool = True  # True if has subdirectories, False if flat
+    modalities: List[str] = ["rgb"]  # Detected modalities
+    modality_config: Optional[Dict[str, Any]] = None
+    sample_files: List[str] = []
+    error: Optional[str] = None
+
+
+class AddDatasetRequest(BaseModel):
+    """Request to add a new dataset."""
+    url: str
+    name: Optional[str] = None  # Override detected name
+    dataset_id: Optional[str] = None  # Override generated ID
+
+
+class AddDatasetResponse(BaseModel):
+    """Response after adding a dataset."""
+    dataset_id: str
+    name: str
+    success: bool
+    error: Optional[str] = None
+
+
+def parse_huggingface_url(url: str) -> Optional[str]:
+    """
+    Parse a HuggingFace URL to extract the repo_id.
+
+    Accepts formats:
+    - https://huggingface.co/datasets/user/repo
+    - huggingface.co/datasets/user/repo
+    - user/repo (assumed to be HF repo)
+
+    Returns:
+        repo_id string (e.g., "user/repo") or None if invalid
+    """
+    url = url.strip()
+
+    # Full HuggingFace URL
+    hf_match = re.match(
+        r"(?:https?://)?(?:www\.)?huggingface\.co/datasets/([^/]+/[^/\s]+)",
+        url
+    )
+    if hf_match:
+        return hf_match.group(1).rstrip("/")
+
+    # Direct repo_id format (user/repo)
+    if "/" in url and not url.startswith("http"):
+        parts = url.split("/")
+        if len(parts) == 2:
+            return url
+
+    return None
+
+
+def generate_dataset_id(repo_id: str) -> str:
+    """Generate a dataset ID from repo_id."""
+    # Take the repo name, lowercase, replace special chars
+    name = repo_id.split("/")[-1].lower()
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    return name.strip("_")
+
+
+async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
+    """
+    Probe a HuggingFace dataset to detect its format and modalities.
+
+    This function:
+    1. Lists files in the repo
+    2. Detects format from file extensions
+    3. For MCAP: Downloads a sample file and scans channels for modalities
+    4. Determines if the dataset has task subdirectories or is flat
+
+    Args:
+        repo_id: HuggingFace repository ID (e.g., "user/repo")
+
+    Returns:
+        ProbeResponse with detected information
+    """
+    name = repo_id.split("/")[-1]
+    url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, timeout=30.0)
+            response.raise_for_status()
+            items = response.json()
+        except httpx.HTTPStatusError as e:
+            return ProbeResponse(
+                repo_id=repo_id,
+                name=name,
+                error=f"HuggingFace API error: {e.response.status_code}",
+            )
+        except Exception as e:
+            return ProbeResponse(
+                repo_id=repo_id,
+                name=name,
+                error=f"Failed to access HuggingFace: {str(e)}",
+            )
+
+    # Analyze the file structure
+    directories = []
+    files = []
+    sample_files = []
+
+    for item in items:
+        item_type = item.get("type", "")
+        item_path = item.get("path", "")
+
+        if item_type == "directory":
+            if not item_path.startswith("."):
+                directories.append(item_path)
+        elif item_type == "file":
+            files.append(item_path)
+            if len(sample_files) < 5:
+                sample_files.append(item_path)
+
+    # Determine if flat or hierarchical
+    has_tasks = len(directories) > 0
+
+    # Detect format from file extensions
+    format_detected = None
+    modalities = [Modality.RGB.value]  # Default to RGB
+    modality_config = None
+
+    # Check top-level files first
+    all_files = files.copy()
+
+    # If hierarchical, also check first subdirectory for files
+    if has_tasks and directories:
+        try:
+            first_dir = directories[0]
+            import urllib.parse
+            encoded = urllib.parse.quote(first_dir, safe="")
+            sub_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{encoded}"
+
+            async with httpx.AsyncClient() as client:
+                sub_response = await client.get(sub_url, timeout=15.0)
+                if sub_response.status_code == 200:
+                    sub_items = sub_response.json()
+                    for item in sub_items:
+                        if item.get("type") == "file":
+                            all_files.append(item.get("path", ""))
+        except Exception as e:
+            logger.warning(f"Failed to probe subdirectory: {e}")
+
+    # Detect format from file extensions
+    extensions = set()
+    for f in all_files:
+        ext = Path(f).suffix.lower()
+        if ext:
+            extensions.add(ext)
+
+    if ".mcap" in extensions:
+        format_detected = "mcap"
+        # For MCAP, we need to download a sample to detect modalities
+        modalities, modality_config = await _probe_mcap_modalities(repo_id, all_files)
+    elif ".tar" in extensions or ".tar.gz" in extensions:
+        format_detected = "webdataset"
+    elif ".parquet" in extensions:
+        format_detected = "lerobot"
+    elif ".hdf5" in extensions or ".h5" in extensions:
+        format_detected = "hdf5"
+    elif ".tfrecord" in extensions:
+        format_detected = "rlds"
+    elif ".mp4" in extensions or ".webm" in extensions or ".avi" in extensions:
+        format_detected = "video"
+
+    return ProbeResponse(
+        repo_id=repo_id,
+        name=name,
+        format_detected=format_detected,
+        has_tasks=has_tasks,
+        modalities=modalities,
+        modality_config=modality_config,
+        sample_files=sample_files[:5],
+    )
+
+
+async def _probe_mcap_modalities(
+    repo_id: str, files: List[str]
+) -> tuple[List[str], Optional[Dict[str, Any]]]:
+    """
+    Download a sample MCAP file and detect its modalities.
+
+    Returns:
+        Tuple of (modality_list, modality_config_dict)
+    """
+    # Find a .mcap file to probe
+    mcap_files = [f for f in files if f.endswith(".mcap")]
+    if not mcap_files:
+        return [Modality.RGB.value], None
+
+    # Download the first MCAP file (or a small one)
+    mcap_path = mcap_files[0]
+    download_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{mcap_path}"
+
+    try:
+        # Get HuggingFace token from environment
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        headers = {}
+        if hf_token:
+            headers["Authorization"] = f"Bearer {hf_token}"
+
+        async with httpx.AsyncClient() as client:
+            # Stream download to temp file
+            async with client.stream("GET", download_url, headers=headers, timeout=60.0) as response:
+                if response.status_code != 200:
+                    logger.warning(f"Failed to download MCAP sample: {response.status_code}")
+                    return [Modality.RGB.value], None
+
+                with tempfile.NamedTemporaryFile(suffix=".mcap", delete=False) as tmp:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        tmp.write(chunk)
+                        # Limit download to 50MB for probing
+                        if tmp.tell() > 50 * 1024 * 1024:
+                            break
+                    tmp_path = tmp.name
+
+        # Detect modalities from MCAP
+        modality_configs = detect_mcap_modalities(Path(tmp_path))
+
+        # Cleanup temp file
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        if modality_configs:
+            modalities = list(modality_configs.keys())
+            config_dict = {k: v.to_dict() for k, v in modality_configs.items()}
+            return modalities, config_dict
+
+    except Exception as e:
+        logger.error(f"Failed to probe MCAP modalities: {e}")
+
+    return [Modality.RGB.value], None
+
+
+@router.post("/probe", response_model=ProbeResponse)
+async def probe_dataset(request_body: ProbeRequest):
+    """
+    Probe a HuggingFace dataset URL to detect format and modalities.
+
+    This endpoint:
+    1. Parses the URL to extract the repo_id
+    2. Queries HuggingFace API to list files
+    3. Detects the data format from file extensions
+    4. For MCAP files, downloads a sample to detect available modalities
+    5. Determines if the dataset has task subdirectories or is flat
+
+    Returns format, modalities, and structure information for UI display.
+    """
+    repo_id = parse_huggingface_url(request_body.url)
+    if not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid HuggingFace URL. Expected format: https://huggingface.co/datasets/user/repo",
+        )
+
+    result = await probe_huggingface_dataset(repo_id)
+    return result
+
+
+@router.post("", response_model=AddDatasetResponse)
+async def add_dataset(request_body: AddDatasetRequest):
+    """
+    Add a new dataset from a HuggingFace URL.
+
+    This endpoint:
+    1. Probes the URL to detect format and modalities
+    2. Creates a dataset configuration
+    3. Adds the dataset to the dynamic registry
+
+    The dataset will appear in the list and can be browsed/streamed.
+    """
+    repo_id = parse_huggingface_url(request_body.url)
+    if not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid HuggingFace URL",
+        )
+
+    # Check if already exists
+    dataset_id = request_body.dataset_id or generate_dataset_id(repo_id)
+    all_datasets = get_all_datasets()
+    if dataset_id in all_datasets:
+        return AddDatasetResponse(
+            dataset_id=dataset_id,
+            name=all_datasets[dataset_id]["name"],
+            success=False,
+            error=f"Dataset '{dataset_id}' already exists",
+        )
+
+    # Probe to get details
+    probe_result = await probe_huggingface_dataset(repo_id)
+
+    if probe_result.error:
+        return AddDatasetResponse(
+            dataset_id=dataset_id,
+            name=repo_id.split("/")[-1],
+            success=False,
+            error=probe_result.error,
+        )
+
+    # Determine dataset type
+    dataset_type = "video"
+    if probe_result.format_detected in ["mcap", "lerobot", "rlds", "hdf5"]:
+        dataset_type = "teleop"
+    if Modality.ACTIONS.value in probe_result.modalities:
+        dataset_type = "teleop"
+
+    # Create config
+    name = request_body.name or probe_result.name
+    config = {
+        "name": name,
+        "type": dataset_type,
+        "description": f"HuggingFace dataset: {repo_id}",
+        "repo_id": repo_id,
+        "format": probe_result.format_detected,
+        "modalities": probe_result.modalities,
+        "modality_config": probe_result.modality_config,
+        "has_tasks": probe_result.has_tasks,
+        "streaming_recommended": True,
+        "requires_auth": False,
+        "downloader_class": None,  # Use HuggingFace streaming
+    }
+
+    add_dynamic_dataset(dataset_id, config)
+
+    return AddDatasetResponse(
+        dataset_id=dataset_id,
+        name=name,
+        success=True,
+    )
+
+
+@router.delete("/{dataset_id}")
+async def delete_dataset(dataset_id: str):
+    """
+    Remove a dynamically added dataset.
+
+    Note: Only datasets added via the /api/datasets POST endpoint can be removed.
+    Built-in datasets cannot be removed.
+    """
+    if dataset_id in DATASET_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot remove built-in dataset: {dataset_id}",
+        )
+
+    if remove_dynamic_dataset(dataset_id):
+        return {"success": True, "message": f"Removed dataset: {dataset_id}"}
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Dataset not found: {dataset_id}",
+    )

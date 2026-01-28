@@ -4,18 +4,23 @@ API routes for episode operations.
 Endpoints:
 - GET /api/episodes/{id} - Get episode metadata
 - GET /api/episodes/{id}/frames - Get frames from episode
+- GET /api/episodes/{id}/frames/stream - Stream frames via SSE (Server-Sent Events)
+- GET /api/episodes/{id}/imu - Get IMU data from episode
 """
+import asyncio
 import base64
+import json
 import logging
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from downloaders.manager import DATASET_REGISTRY
+from downloaders.manager import DATASET_REGISTRY, get_all_datasets
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.streaming_extractor import StreamingFrameExtractor
 from cache import get_encoded_frame_cache
@@ -68,17 +73,18 @@ def parse_episode_id(episode_id: str) -> tuple:
 
     Episode IDs are typically: dataset_id/path/to/episode
     """
+    all_datasets = get_all_datasets()
     parts = episode_id.split("/", 1)
     if len(parts) == 1:
         # Assume it's just the episode ID, try to find dataset
         return None, episode_id
 
     # First part might be dataset ID
-    if parts[0] in DATASET_REGISTRY:
+    if parts[0] in all_datasets:
         return parts[0], parts[1]
 
     # Or it might be a task suite (e.g., libero_spatial)
-    for dataset_id, config in DATASET_REGISTRY.items():
+    for dataset_id, config in all_datasets.items():
         if parts[0].startswith(dataset_id.replace("_", "")):
             return dataset_id, episode_id
 
@@ -87,10 +93,11 @@ def parse_episode_id(episode_id: str) -> tuple:
 
 def get_loader_for_dataset(dataset_id: str, data_root: Path):
     """Get the appropriate loader for a dataset."""
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         return None
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     data_dir = data_root / dataset_id
 
     # Check format first
@@ -165,7 +172,8 @@ def get_loader_for_episode(episode_id: str, data_root: Path, dataset_id: str = N
                 pass
 
     # For other datasets, try to match by dataset_id first
-    if parsed_dataset_id and parsed_dataset_id in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if parsed_dataset_id and parsed_dataset_id in all_datasets:
         loader = get_loader_for_dataset(parsed_dataset_id, data_root)
         if loader:
             try:
@@ -177,8 +185,8 @@ def get_loader_for_episode(episode_id: str, data_root: Path, dataset_id: str = N
                 pass
 
     # Fallback: try each local dataset's loader (skip streaming datasets)
-    for ds_id in DATASET_REGISTRY:
-        config = DATASET_REGISTRY[ds_id]
+    for ds_id in all_datasets:
+        config = all_datasets[ds_id]
 
         # Skip streaming datasets - they're too slow to enumerate
         if config.get("streaming_recommended") or config.get("type") == "video":
@@ -253,15 +261,17 @@ def is_streaming_episode(episode_id: str, dataset_id: Optional[str]) -> tuple:
     Returns:
         Tuple of (is_streaming, repo_id, file_path)
     """
+    all_datasets = get_all_datasets()
+
     # If dataset_id is provided, check if it's streaming
-    if dataset_id and dataset_id in DATASET_REGISTRY:
-        config = DATASET_REGISTRY[dataset_id]
+    if dataset_id and dataset_id in all_datasets:
+        config = all_datasets[dataset_id]
         if config.get("streaming_recommended") and config.get("repo_id"):
             # Episode ID format for streaming: task_folder/subfolder/file.mcap
             return True, config["repo_id"], episode_id
 
     # Check if episode_id matches a streaming dataset pattern
-    for ds_id, config in DATASET_REGISTRY.items():
+    for ds_id, config in all_datasets.items():
         if config.get("streaming_recommended") and config.get("repo_id"):
             # Check if episode_id looks like a HuggingFace path
             if "/" in episode_id and (
@@ -282,6 +292,7 @@ async def get_streaming_frames(
     resolution: str = "medium",
     quality: int = 70,
     dataset_id: str = None,
+    stream: str = "rgb",
 ) -> FramesResponse:
     """
     Get frames from a streaming HuggingFace episode.
@@ -296,12 +307,16 @@ async def get_streaming_frames(
         resolution: Image resolution (low/medium/high/original)
         quality: JPEG quality (10-100)
         dataset_id: Dataset identifier for caching
+        stream: Which stream to extract: "rgb" or "depth"
     """
     cache = get_encoded_frame_cache()
     effective_dataset_id = dataset_id or repo_id.replace("/", "_")
 
-    # Use full-episode cache key (no start/end) to survive browser refresh
-    episode_key = cache.get_episode_cache_key(effective_dataset_id, file_path, resolution, quality)
+    # Include stream in cache key to cache different streams separately
+    cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+    episode_key = cache.get_episode_cache_key(
+        effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+    )
 
     # Check if full episode is cached
     cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
@@ -331,11 +346,13 @@ async def get_streaming_frames(
 
     try:
         # Extract ALL frames (from 0 to a large number to get everything)
-        logger.info(f"Decoding full episode for caching: {file_path}")
-        raw_frames, total_frames = extractor.extract_frames_with_count(file_path, 0, 999999)
+        logger.info(f"Decoding full episode for caching: {file_path} (stream={stream})")
+        raw_frames, total_frames = extractor.extract_frames_with_count(
+            file_path, 0, 999999, stream=stream
+        )
 
         # Log decode result
-        logger.info(f"Decoded {len(raw_frames)} frames for episode {file_path}")
+        logger.info(f"Decoded {len(raw_frames)} frames for episode {file_path} (stream={stream})")
 
         # Convert ALL frames to FrameData with resolution/quality options
         all_frames_for_cache = []
@@ -394,6 +411,7 @@ async def get_frames(
     dataset_id: Optional[str] = Query(None, description="Dataset ID to load episode from"),
     resolution: str = Query("low", description="Image resolution: low (320x240), medium (640x480), high (960x720), original"),
     quality: int = Query(70, ge=10, le=100, description="WebP quality (10-100)"),
+    stream: str = Query("rgb", description="Stream to extract: rgb or depth"),
 ):
     """
     Get frames from an episode.
@@ -406,14 +424,15 @@ async def get_frames(
         dataset_id: Optional dataset ID (used to directly select the loader)
         resolution: Image resolution for streaming optimization
         quality: WebP encoding quality (lower = faster, smaller)
+        stream: Which modality stream to extract (rgb or depth)
     """
     # Check if this is a streaming episode
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
 
     if is_streaming:
-        logger.info(f"Loading streaming episode from {repo_id}: {file_path} (res={resolution}, q={quality})")
+        logger.info(f"Loading streaming episode from {repo_id}: {file_path} (res={resolution}, q={quality}, stream={stream})")
         try:
-            return await get_streaming_frames(repo_id, file_path, start, end, resolution, quality, dataset_id)
+            return await get_streaming_frames(repo_id, file_path, start, end, resolution, quality, dataset_id, stream)
         except Exception as e:
             logger.error(f"Streaming frame extraction failed: {e}")
             raise HTTPException(
@@ -432,8 +451,9 @@ async def get_frames(
     effective_dataset_id = dataset_id
     if not effective_dataset_id:
         # Try to extract from episode_id
+        all_datasets_local = get_all_datasets()
         parts = episode_id.split("/", 1)
-        if parts[0] in DATASET_REGISTRY:
+        if parts[0] in all_datasets_local:
             effective_dataset_id = parts[0]
         else:
             effective_dataset_id = "local"
@@ -531,6 +551,294 @@ async def get_frames(
     return FramesResponse(frames=frames, total_frames=max_frames, from_cache=False)
 
 
+# === SSE STREAMING ENDPOINT ===
+
+
+async def stream_frames_generator(
+    repo_id: str,
+    file_path: str,
+    start: int,
+    end: int,
+    resolution: str,
+    quality: int,
+    stream: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Generate Server-Sent Events for progressive frame streaming.
+
+    Yields frames one-by-one as they are decoded, allowing the client
+    to display frames before the entire episode is decoded.
+    """
+    extractor = StreamingFrameExtractor(repo_id)
+
+    try:
+        # Download the file first
+        local_path = extractor.download_file(file_path)
+        suffix = local_path.suffix.lower()
+
+        if suffix != '.mcap':
+            # For non-MCAP files, fall back to batch decoding
+            raw_frames, total_frames = extractor.extract_frames_with_count(
+                file_path, start, end, stream=stream
+            )
+
+            yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+
+            for frame_idx, timestamp, image in raw_frames:
+                image_base64 = encode_image_with_options(image, resolution, quality)
+                frame_data = {
+                    'type': 'frame',
+                    'index': frame_idx,
+                    'timestamp': timestamp,
+                    'data': image_base64,
+                }
+                yield f"data: {json.dumps(frame_data)}\n\n"
+                # Allow other tasks to run
+                await asyncio.sleep(0)
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        # For MCAP files, we can stream frames as they're decoded
+        # First, get total frame count
+        total_frames = extractor.get_frame_count(file_path)
+        yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+
+        # Extract frames progressively
+        # For H.264, we still need to decode from the beginning, but we can yield as we go
+        raw_frames = extractor.extract_frames_from_mcap(
+            local_path, start, end,
+            episode_path=file_path,
+            stream=stream
+        )
+
+        for frame_idx, timestamp, image in raw_frames:
+            image_base64 = encode_image_with_options(image, resolution, quality)
+            frame_data = {
+                'type': 'frame',
+                'index': frame_idx,
+                'timestamp': timestamp,
+                'data': image_base64,
+            }
+            yield f"data: {json.dumps(frame_data)}\n\n"
+            # Allow other tasks to run
+            await asyncio.sleep(0)
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    except Exception as e:
+        logger.error(f"SSE streaming error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+
+@router.get("/{episode_id:path}/frames/stream")
+async def stream_frames(
+    episode_id: str,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID"),
+    start: int = Query(0, ge=0),
+    end: int = Query(100, ge=1),
+    resolution: str = Query("low", description="Image resolution"),
+    quality: int = Query(70, ge=10, le=100, description="WebP quality"),
+    stream: str = Query("rgb", description="Stream: rgb or depth"),
+):
+    """
+    Stream frames using Server-Sent Events (SSE).
+
+    This endpoint returns frames progressively as they're decoded,
+    allowing the client to display frames before the entire episode
+    is ready. Much better user experience for large episodes.
+
+    SSE Event Types:
+    - total: Contains total_frames count
+    - frame: Contains frame index, timestamp, and base64-encoded image
+    - done: Signals completion
+    - error: Contains error message
+
+    Args:
+        episode_id: Episode identifier
+        dataset_id: Optional dataset ID
+        start: Start frame index
+        end: End frame index
+        resolution: Image resolution (low/medium/high/original)
+        quality: WebP quality (10-100)
+        stream: Which stream to extract (rgb or depth)
+    """
+    # Check if this is a streaming episode
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    if not is_streaming:
+        raise HTTPException(
+            status_code=400,
+            detail="SSE streaming only available for HuggingFace streaming datasets"
+        )
+
+    return StreamingResponse(
+        stream_frames_generator(
+            repo_id, file_path, start, end, resolution, quality, stream
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
+
+
+class IMUData(BaseModel):
+    """IMU sensor data from an episode."""
+    timestamps: List[float] = []
+    accel_x: List[float] = []
+    accel_y: List[float] = []
+    accel_z: List[float] = []
+    gyro_x: List[float] = []
+    gyro_y: List[float] = []
+    gyro_z: List[float] = []
+    error: Optional[str] = None
+
+
+class ActionsData(BaseModel):
+    """Action data from an episode."""
+    timestamps: List[float] = []
+    actions: List[List[float]] = []  # 2D array: [frame][dimension]
+    dimension_labels: Optional[List[str]] = None
+    error: Optional[str] = None
+
+
+@router.get("/{episode_id:path}/imu", response_model=IMUData)
+async def get_imu_data(
+    episode_id: str,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID to load episode from"),
+):
+    """
+    Get IMU data from an episode.
+
+    Only available for MCAP episodes that contain IMU topics.
+
+    Args:
+        episode_id: Episode identifier
+        dataset_id: Optional dataset ID (used to directly select the loader)
+
+    Returns:
+        IMU sensor data including accelerometer and gyroscope readings
+    """
+    # Check if this is a streaming episode
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    if not is_streaming:
+        return IMUData(error="IMU data only available for streaming MCAP episodes")
+
+    # Only MCAP files have IMU data
+    if not file_path.endswith(".mcap"):
+        return IMUData(error="IMU data only available for MCAP files")
+
+    extractor = StreamingFrameExtractor(repo_id)
+
+    try:
+        imu_data = extractor.extract_imu_data(file_path)
+
+        if "error" in imu_data:
+            return IMUData(error=imu_data["error"])
+
+        return IMUData(
+            timestamps=imu_data.get("timestamps", []),
+            accel_x=imu_data.get("accel_x", []),
+            accel_y=imu_data.get("accel_y", []),
+            accel_z=imu_data.get("accel_z", []),
+            gyro_x=imu_data.get("gyro_x", []),
+            gyro_y=imu_data.get("gyro_y", []),
+            gyro_z=imu_data.get("gyro_z", []),
+        )
+    except Exception as e:
+        logger.error(f"Failed to extract IMU data: {e}")
+        return IMUData(error=str(e))
+
+
+@router.get("/{episode_id:path}/actions", response_model=ActionsData)
+async def get_actions_data(
+    episode_id: str,
+    request: Request,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID to load episode from"),
+):
+    """
+    Get action data from an episode.
+
+    For streaming MCAP episodes, extracts action data from action/command topics.
+    For HDF5 episodes (LIBERO), reads from the actions array.
+
+    Args:
+        episode_id: Episode identifier
+        dataset_id: Optional dataset ID (used to directly select the loader)
+
+    Returns:
+        Action data including timestamps and action vectors
+    """
+    # Check if this is a streaming episode
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    if is_streaming:
+        # Only MCAP files have action data via topic extraction
+        if not file_path.endswith(".mcap"):
+            return ActionsData(error="Action data only available for MCAP files")
+
+        extractor = StreamingFrameExtractor(repo_id)
+
+        try:
+            actions_result = extractor.extract_actions_data(file_path)
+
+            if "error" in actions_result and actions_result["error"]:
+                return ActionsData(error=actions_result["error"])
+
+            return ActionsData(
+                timestamps=actions_result.get("timestamps", []),
+                actions=actions_result.get("actions", []),
+                dimension_labels=actions_result.get("dimension_labels"),
+            )
+        except Exception as e:
+            logger.error(f"Failed to extract actions data: {e}")
+            return ActionsData(error=str(e))
+
+    # For local episodes (HDF5), read actions from the episode
+    data_root = get_data_root(request)
+    loader, resolved_id = get_loader_for_episode(episode_id, data_root, dataset_id)
+
+    if loader is None:
+        return ActionsData(error=f"Episode not found: {episode_id}")
+
+    try:
+        episode = loader.load_episode(resolved_id)
+
+        if episode.actions is None or len(episode.actions) == 0:
+            return ActionsData(error="No action data in episode")
+
+        # Convert actions to list format
+        actions_list = episode.actions.tolist()
+
+        # Generate timestamps based on frame count and fps
+        fps = episode.metadata.get("fps", 30)
+        timestamps = [i / fps for i in range(len(actions_list))]
+
+        # Determine dimension labels based on action dimensions
+        num_dims = len(actions_list[0]) if actions_list else 0
+        dimension_labels = None
+        if num_dims == 7:
+            dimension_labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        elif num_dims == 6:
+            dimension_labels = ["x", "y", "z", "rx", "ry", "rz"]
+        elif num_dims == 3:
+            dimension_labels = ["x", "y", "z"]
+
+        return ActionsData(
+            timestamps=timestamps,
+            actions=actions_list,
+            dimension_labels=dimension_labels,
+        )
+    except Exception as e:
+        logger.error(f"Failed to load actions from episode: {e}")
+        return ActionsData(error=str(e))
+
+
+# NOTE: This catch-all route MUST be LAST to avoid matching /imu, /actions, etc.
 @router.get("/{episode_id:path}", response_model=EpisodeDetail)
 async def get_episode(
     episode_id: str,

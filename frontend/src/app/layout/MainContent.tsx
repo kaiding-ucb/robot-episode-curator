@@ -1,6 +1,7 @@
 "use client";
 
 import EpisodeViewer from "@/components/EpisodeViewer";
+import type { Modality } from "@/types/api";
 
 interface MainContentProps {
   selectedDataset: string | null;
@@ -8,7 +9,7 @@ interface MainContentProps {
   totalFrames: number;
   targetFrame: number | null;
   onFrameChange: () => void;
-  selectedMetric: string | null;
+  availableModalities?: Modality[];
 }
 
 export default function MainContent({
@@ -17,7 +18,7 @@ export default function MainContent({
   totalFrames,
   targetFrame,
   onFrameChange,
-  selectedMetric,
+  availableModalities = ["rgb"],
 }: MainContentProps) {
   return (
     <main className="flex-1 flex flex-col min-w-0">
@@ -45,7 +46,7 @@ export default function MainContent({
           totalFrames={totalFrames}
           targetFrame={targetFrame}
           onFrameChange={onFrameChange}
-          selectedMetric={selectedMetric}
+          availableModalities={availableModalities}
         />
       </div>
     </main>

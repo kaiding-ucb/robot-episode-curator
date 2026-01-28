@@ -3,7 +3,9 @@ Download Manager for coordinating dataset downloads.
 
 Manages multiple datasets and their download status.
 """
+import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -13,6 +15,96 @@ from .libero import LiberoDownloader
 from .huggingface import HuggingFaceDownloader
 
 logger = logging.getLogger(__name__)
+
+
+# Path for persisting dynamic datasets
+_DYNAMIC_REGISTRY_PATH = Path(os.environ.get(
+    "DATA_VIEWER_CONFIG_DIR",
+    Path.home() / ".config" / "data_viewer"
+)) / "dynamic_datasets.json"
+
+# Dynamic registry for user-added datasets via URL
+# Format: { "dataset_id": { ...config... } }
+_DYNAMIC_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_dynamic_registry() -> None:
+    """Load dynamic datasets from persistent storage."""
+    global _DYNAMIC_REGISTRY
+    if _DYNAMIC_REGISTRY_PATH.exists():
+        try:
+            with open(_DYNAMIC_REGISTRY_PATH, "r") as f:
+                _DYNAMIC_REGISTRY = json.load(f)
+            logger.info(f"Loaded {len(_DYNAMIC_REGISTRY)} dynamic datasets from {_DYNAMIC_REGISTRY_PATH}")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load dynamic registry: {e}")
+            _DYNAMIC_REGISTRY = {}
+
+
+def _save_dynamic_registry() -> None:
+    """Save dynamic datasets to persistent storage."""
+    try:
+        _DYNAMIC_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DYNAMIC_REGISTRY_PATH, "w") as f:
+            json.dump(_DYNAMIC_REGISTRY, f, indent=2)
+        logger.info(f"Saved {len(_DYNAMIC_REGISTRY)} dynamic datasets to {_DYNAMIC_REGISTRY_PATH}")
+    except IOError as e:
+        logger.error(f"Failed to save dynamic registry: {e}")
+
+
+# Load dynamic registry on module import
+_load_dynamic_registry()
+
+
+def add_dynamic_dataset(dataset_id: str, config: Dict[str, Any]) -> None:
+    """
+    Add a dataset to the dynamic registry and persist to disk.
+
+    Args:
+        dataset_id: Unique identifier for the dataset
+        config: Dataset configuration dict containing:
+            - name: Display name
+            - type: "teleop" or "video"
+            - repo_id: HuggingFace repository ID
+            - format: "mcap", "webdataset", "lerobot", etc.
+            - modalities: List of available modalities ["rgb", "depth", "imu", etc.]
+            - modality_config: Dict of modality name to ModalityConfig
+            - has_tasks: Whether dataset has task subdirectories
+            - streaming_recommended: Whether to use streaming mode
+    """
+    _DYNAMIC_REGISTRY[dataset_id] = config
+    _save_dynamic_registry()
+    logger.info(f"Added dynamic dataset: {dataset_id}")
+
+
+def remove_dynamic_dataset(dataset_id: str) -> bool:
+    """
+    Remove a dataset from the dynamic registry and persist to disk.
+
+    Args:
+        dataset_id: Dataset identifier to remove
+
+    Returns:
+        True if removed, False if not found
+    """
+    if dataset_id in _DYNAMIC_REGISTRY:
+        del _DYNAMIC_REGISTRY[dataset_id]
+        _save_dynamic_registry()
+        logger.info(f"Removed dynamic dataset: {dataset_id}")
+        return True
+    return False
+
+
+def get_dynamic_datasets() -> Dict[str, Dict[str, Any]]:
+    """Get all dynamically registered datasets."""
+    return _DYNAMIC_REGISTRY.copy()
+
+
+def get_all_datasets() -> Dict[str, Dict[str, Any]]:
+    """Get combined registry of static and dynamic datasets."""
+    combined = DATASET_REGISTRY.copy()
+    combined.update(_DYNAMIC_REGISTRY)
+    return combined
 
 
 # Dataset registry with download configurations
@@ -100,7 +192,9 @@ class DownloadManager:
             List of dataset info dictionaries
         """
         datasets = []
-        for dataset_id, config in DATASET_REGISTRY.items():
+        # Use combined registry (static + dynamic)
+        all_datasets = get_all_datasets()
+        for dataset_id, config in all_datasets.items():
             status = self.get_status(dataset_id)
             datasets.append(
                 {
@@ -112,6 +206,8 @@ class DownloadManager:
                     "requires_auth": config.get("requires_auth", False),
                     "requires_license": config.get("requires_license", False),
                     "streaming_recommended": config.get("streaming_recommended", False),
+                    "modalities": config.get("modalities", ["rgb"]),
+                    "has_tasks": config.get("has_tasks", True),
                     "status": status.get("status", "unknown"),
                 }
             )
@@ -130,11 +226,12 @@ class DownloadManager:
         if dataset_id in self._downloaders:
             return self._downloaders[dataset_id]
 
-        if dataset_id not in DATASET_REGISTRY:
+        all_datasets = get_all_datasets()
+        if dataset_id not in all_datasets:
             logger.warning(f"Unknown dataset: {dataset_id}")
             return None
 
-        config = DATASET_REGISTRY[dataset_id]
+        config = all_datasets[dataset_id]
         downloader_class = config.get("downloader_class")
 
         if downloader_class is None:
@@ -168,10 +265,11 @@ class DownloadManager:
         Returns:
             Status dictionary with status, size, etc.
         """
-        if dataset_id not in DATASET_REGISTRY:
+        all_datasets = get_all_datasets()
+        if dataset_id not in all_datasets:
             return {"status": "unknown", "error": f"Unknown dataset: {dataset_id}"}
 
-        config = DATASET_REGISTRY[dataset_id]
+        config = all_datasets[dataset_id]
 
         # Check if data directory exists
         data_dir = self.data_root / dataset_id

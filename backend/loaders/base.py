@@ -4,10 +4,37 @@ Defines the common interface that all loaders must implement.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import numpy as np
+
+
+class Modality(str, Enum):
+    """Supported data modalities in robotics datasets."""
+    RGB = "rgb"
+    DEPTH = "depth"
+    IMU = "imu"
+    ACTIONS = "actions"
+    STATES = "states"
+
+
+@dataclass
+class ModalityConfig:
+    """Configuration for a single modality."""
+    topic: Optional[str] = None  # MCAP topic name
+    type: str = "image"  # "image", "timeseries", "vector"
+    colormap: Optional[str] = None  # For depth: "viridis", "jet", etc.
+    key: Optional[str] = None  # HDF5/Parquet key
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topic": self.topic,
+            "type": self.type,
+            "colormap": self.colormap,
+            "key": self.key,
+        }
 
 
 @dataclass

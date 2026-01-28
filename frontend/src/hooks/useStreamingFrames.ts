@@ -1,0 +1,228 @@
+/**
+ * Hook for streaming frames using Server-Sent Events (SSE)
+ *
+ * Provides progressive frame loading where frames appear as they're decoded,
+ * rather than waiting for the entire batch to complete.
+ */
+import { useState, useEffect, useCallback, useRef } from "react";
+import type { Frame, StreamingOptions } from "@/types/api";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+
+interface UseStreamingFramesOptions extends StreamingOptions {
+  enabled?: boolean;
+}
+
+interface UseStreamingFramesResult {
+  frames: Map<number, Frame>;
+  totalFrames: number | null;
+  progress: number;
+  isLoading: boolean;
+  isComplete: boolean;
+  error: string | null;
+  cancel: () => void;
+}
+
+/**
+ * Hook that uses Server-Sent Events to stream frames progressively.
+ *
+ * Frames are added to a Map as they arrive, allowing immediate display
+ * of early frames while later frames are still being decoded.
+ */
+export function useStreamingFrames(
+  episodeId: string | null,
+  datasetId: string | null,
+  start: number,
+  end: number,
+  options: UseStreamingFramesOptions = {}
+): UseStreamingFramesResult {
+  const [frames, setFrames] = useState<Map<number, Frame>>(new Map());
+  const [totalFrames, setTotalFrames] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isComplete, setIsComplete] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  const { resolution = "low", quality = 70, stream = "rgb", enabled = true } = options;
+
+  // Calculate progress
+  const progress = totalFrames && totalFrames > 0
+    ? frames.size / totalFrames
+    : 0;
+
+  const cancel = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    // Cleanup on unmount or when dependencies change
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!episodeId || !datasetId || !enabled) {
+      setFrames(new Map());
+      setTotalFrames(null);
+      setIsComplete(false);
+      setError(null);
+      return;
+    }
+
+    // Reset state for new request
+    setFrames(new Map());
+    setTotalFrames(null);
+    setIsLoading(true);
+    setIsComplete(false);
+    setError(null);
+
+    // Build SSE URL
+    const params = new URLSearchParams({
+      dataset_id: datasetId,
+      start: start.toString(),
+      end: end.toString(),
+      resolution,
+      quality: quality.toString(),
+      stream,
+    });
+
+    const url = `${API_BASE}/episodes/${episodeId}/frames/stream?${params}`;
+
+    // Create EventSource for SSE
+    const eventSource = new EventSource(url);
+    eventSourceRef.current = eventSource;
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        switch (data.type) {
+          case "total":
+            setTotalFrames(data.total_frames);
+            break;
+
+          case "frame":
+            setFrames((prev) => {
+              const newMap = new Map(prev);
+              newMap.set(data.index, {
+                index: data.index,
+                timestamp: data.timestamp,
+                image: data.data,
+              });
+              return newMap;
+            });
+            break;
+
+          case "done":
+            setIsLoading(false);
+            setIsComplete(true);
+            eventSource.close();
+            eventSourceRef.current = null;
+            break;
+
+          case "error":
+            setError(data.message);
+            setIsLoading(false);
+            eventSource.close();
+            eventSourceRef.current = null;
+            break;
+        }
+      } catch (e) {
+        console.error("Failed to parse SSE message:", e);
+      }
+    };
+
+    eventSource.onerror = async (e) => {
+      // Check if connection was closed normally (after 'done')
+      if (eventSource.readyState === EventSource.CLOSED && isComplete) {
+        return;
+      }
+
+      // SSE failed - try falling back to regular frames endpoint
+      // This happens for non-streaming datasets (local HDF5, LeRobot, etc.)
+      eventSource.close();
+      eventSourceRef.current = null;
+
+      try {
+        const fallbackParams = new URLSearchParams({
+          dataset_id: datasetId,
+          start: start.toString(),
+          end: end.toString(),
+          resolution,
+          quality: quality.toString(),
+          stream,
+        });
+        const fallbackUrl = `${API_BASE}/episodes/${episodeId}/frames?${fallbackParams}`;
+        const response = await fetch(fallbackUrl);
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const framesArray = data.frames || data;
+        const total = data.total_frames;
+
+        // Convert to Map
+        const framesMap = new Map<number, Frame>();
+        for (const frame of framesArray) {
+          framesMap.set(frame.frame_idx, {
+            index: frame.frame_idx,
+            timestamp: frame.timestamp,
+            image: frame.image_base64,
+            action: frame.action,
+          });
+        }
+
+        setFrames(framesMap);
+        if (total !== undefined && total !== null) {
+          setTotalFrames(total);
+        }
+        setIsLoading(false);
+        setIsComplete(true);
+      } catch (fallbackError) {
+        console.error("Fallback frames fetch failed:", fallbackError);
+        setError("Connection error");
+        setIsLoading(false);
+      }
+    };
+
+    return () => {
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
+  }, [episodeId, datasetId, start, end, resolution, quality, stream, enabled]);
+
+  return {
+    frames,
+    totalFrames,
+    progress,
+    isLoading,
+    isComplete,
+    error,
+    cancel,
+  };
+}
+
+/**
+ * Convert Map<number, Frame> to array for rendering
+ */
+export function framesToArray(frames: Map<number, Frame>): Frame[] {
+  return Array.from(frames.values()).sort((a, b) => a.index - b.index);
+}
+
+/**
+ * Get a specific frame from the map, or undefined if not yet loaded
+ */
+export function getFrame(frames: Map<number, Frame>, index: number): Frame | undefined {
+  return frames.get(index);
+}

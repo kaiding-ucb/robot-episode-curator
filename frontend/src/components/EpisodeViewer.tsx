@@ -1,10 +1,12 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { useFrames } from "@/hooks/useApi";
-import type { StreamingOptions } from "@/types/api";
+import { useStreamingFrames, getFrame } from "@/hooks/useStreamingFrames";
+import type { StreamingOptions, Modality } from "@/types/api";
 import { useQualityEvents } from "@/hooks/useQuality";
 import EnhancedTimeline from "./EnhancedTimeline";
+import IMUChart from "./IMUChart";
+import ActionsChart from "./ActionsChart";
 
 interface EpisodeViewerProps {
   datasetId: string | null;
@@ -12,7 +14,7 @@ interface EpisodeViewerProps {
   totalFrames: number;
   targetFrame?: number | null;
   onFrameChange?: (frame: number) => void;
-  selectedMetric?: string | null;
+  availableModalities?: Modality[];
 }
 
 export default function EpisodeViewer({
@@ -21,36 +23,43 @@ export default function EpisodeViewer({
   totalFrames,
   targetFrame,
   onFrameChange,
-  selectedMetric,
+  availableModalities = ["rgb"],
 }: EpisodeViewerProps) {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [activeStream, setActiveStream] = useState<"rgb" | "depth">("rgb");
+  const [activeChartTab, setActiveChartTab] = useState<"none" | "actions" | "imu">("none");
+
+  // Check available modalities
+  const hasDepth = availableModalities.includes("depth");
+  const hasImu = availableModalities.includes("imu");
+  const hasActions = availableModalities.includes("actions");
 
   // Always use lowest resolution for fast loading
   const streamingOptions: StreamingOptions = useMemo(() => ({
     resolution: "low",  // 320x240
     quality: 30,        // Low quality for speed
-  }), []);
+    stream: activeStream,
+  }), [activeStream]);
 
-  // Fetch frames around the current position
-  // Larger batches = fewer boundary transitions = smoother playback
-  const batchSize = 750; // ~25 seconds at 30fps - covers most episodes in 1-2 batches
+  // Use SSE streaming for progressive frame loading
+  // Frames appear as they're decoded (~2-3s for first frame) rather than waiting for full batch
+  const batchSize = 750; // ~25 seconds at 30fps
   const batchStart = Math.floor(currentFrame / batchSize) * batchSize;
   const {
     frames,
-    loading,
-    error,
-    loadedRange,
     totalFrames: apiTotalFrames,
-    previousBatch,
-    prefetch,
-    clearPreviousBatch,
-  } = useFrames(
+    progress,
+    isLoading: loading,
+    isComplete,
+    error,
+    cancel,
+  } = useStreamingFrames(
     episodeId,
+    datasetId,
     batchStart,
     batchStart + batchSize,
-    datasetId,
     streamingOptions
   );
 
@@ -65,57 +74,41 @@ export default function EpisodeViewer({
     if (targetFrame !== null && targetFrame !== undefined && targetFrame !== currentFrame) {
       setCurrentFrame(targetFrame);
       setPlaying(false);
-      clearPreviousBatch(); // Clear fallback on manual seek
       onFrameChange?.(targetFrame);
     }
-  }, [targetFrame, clearPreviousBatch]);
+  }, [targetFrame, currentFrame, onFrameChange]);
 
-  // Pre-fetch next batch when approaching boundary
-  // Trigger earlier to ensure prefetch completes before boundary
+  // Cancel streaming when episode changes or component unmounts
   useEffect(() => {
-    if (!playing || !episodeId) return;
-    const positionInBatch = currentFrame - batchStart;
-    if (positionInBatch >= batchSize - 500) { // 500 frames before boundary (~17s at 30fps)
-      prefetch(batchStart + batchSize, batchStart + batchSize * 2);
-    }
-  }, [currentFrame, playing, batchStart, batchSize, prefetch, episodeId]);
+    return () => cancel();
+  }, [episodeId, cancel]);
 
-  // Get the frame to display from the loaded batch
-  // Priority: 1) Current batch if ready, 2) Current frames if they cover the frame, 3) Previous batch fallback
-  const isBatchReady = loadedRange && loadedRange.start === batchStart;
-  let displayFrame = null;
-  let isShowingFallback = false;
+  // Get the frame to display from the streaming Map
+  // Frames are added progressively as they arrive via SSE
+  const displayFrame = getFrame(frames, currentFrame);
 
-  if (isBatchReady) {
-    // Add bounds check to prevent accessing out-of-bounds frame index
-    const frameIndex = currentFrame - batchStart;
-    displayFrame = frameIndex >= 0 && frameIndex < frames.length ? frames[frameIndex] : null;
-  } else if (loadedRange && frames.length > 0) {
-    // During loading/transition: use current frames if they cover the requested frame
-    // This handles resolution changes (play/pause) where the batch range is same but quality differs
-    const frameIndex = currentFrame - loadedRange.start;
-    if (frameIndex >= 0 && frameIndex < frames.length) {
-      displayFrame = frames[frameIndex];
-      isShowingFallback = true;
+  // For streaming: show last available frame if current frame hasn't arrived yet
+  const lastLoadedFrame = useMemo(() => {
+    if (frames.size === 0) return null;
+    // Find the highest frame index that's <= currentFrame
+    let best = null;
+    for (const [idx, frame] of frames) {
+      if (idx <= currentFrame && (best === null || idx > best)) {
+        best = idx;
+      }
     }
-  }
+    return best !== null ? frames.get(best) : null;
+  }, [frames, currentFrame]);
 
-  // If still no frame, try previous batch - but only if currentFrame is within its range
-  if (!displayFrame && previousBatch?.episodeId === episodeId &&
-             currentFrame >= previousBatch.range.start &&
-             currentFrame < previousBatch.range.end) {
-    // Find the correct frame from previousBatch by index
-    const prevFrameIndex = currentFrame - previousBatch.range.start;
-    if (prevFrameIndex >= 0 && prevFrameIndex < previousBatch.frames.length) {
-      displayFrame = previousBatch.frames[prevFrameIndex];
-      isShowingFallback = true;
-    }
-  }
+  // Use current frame if available, otherwise fallback to last loaded frame
+  const frameToShow = displayFrame || lastLoadedFrame;
+  const isShowingFallback = !displayFrame && lastLoadedFrame !== null;
+
 
   // Track frame availability and loading state in refs so the interval callback can check them
   const hasFrameRef = useRef(false);
   const isLoadingRef = useRef(false);
-  hasFrameRef.current = displayFrame !== null || isShowingFallback;
+  hasFrameRef.current = frameToShow !== null;
   isLoadingRef.current = loading;
 
   // Playback logic - continues during loading, uses fallback frames
@@ -149,6 +142,7 @@ export default function EpisodeViewer({
   useEffect(() => {
     setCurrentFrame(0);
     setPlaying(false);
+    setActiveStream("rgb"); // Reset to RGB when episode changes
   }, [episodeId]);
 
   const handleFrameChange = useCallback((frame: number) => {
@@ -188,13 +182,16 @@ export default function EpisodeViewer({
     );
   }
 
-  if (loading && frames.length === 0) {
+  if (loading && frames.size === 0) {
     return (
       <div
         className="flex items-center justify-center h-full text-gray-500"
         data-testid="loading-frames"
       >
-        Loading frames...
+        <div className="text-center">
+          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+          <p>Loading frames...</p>
+        </div>
       </div>
     );
   }
@@ -214,10 +211,10 @@ export default function EpisodeViewer({
     <div className="flex flex-col h-full" data-testid="episode-viewer">
       {/* Video Display */}
       <div className="flex-1 min-h-0 bg-black flex items-center justify-center relative overflow-hidden">
-        {displayFrame ? (
+        {frameToShow ? (
           <img
-            key={`frame-${currentFrame}`}
-            src={`data:image/webp;base64,${displayFrame.image}`}
+            key={`frame-${frameToShow.index}`}
+            src={`data:image/webp;base64,${frameToShow.image}`}
             alt={`Frame ${currentFrame}`}
             className="max-w-full max-h-full object-contain"
             data-testid="frame-image"
@@ -231,13 +228,112 @@ export default function EpisodeViewer({
           Frame {currentFrame + 1} / {effectiveTotalFrames}
         </div>
 
-        {/* Action overlay (if available) */}
-        {displayFrame?.action && (
-          <div className="absolute bottom-2 left-2 bg-black/50 text-white text-xs px-2 py-1 rounded font-mono">
-            Action: [{displayFrame.action.map((a) => a.toFixed(2)).join(", ")}]
+        {/* Streaming progress indicator */}
+        {loading && frames.size > 0 && (
+          <div className="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded flex items-center gap-2">
+            <div className="w-24 h-1 bg-gray-600 rounded overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all duration-200"
+                style={{ width: `${progress * 100}%` }}
+              />
+            </div>
+            <span>{Math.round(progress * 100)}%</span>
           </div>
         )}
+
+        {/* Stream toggle - only if depth is available */}
+        {hasDepth && (
+          <div className="absolute top-2 right-2 flex gap-1">
+            <button
+              onClick={() => setActiveStream("rgb")}
+              className={`px-3 py-1 text-xs rounded-l transition-colors ${
+                activeStream === "rgb"
+                  ? "bg-blue-500 text-white"
+                  : "bg-black/50 text-gray-300 hover:bg-black/70"
+              }`}
+              data-testid="stream-rgb-btn"
+            >
+              RGB
+            </button>
+            <button
+              onClick={() => setActiveStream("depth")}
+              className={`px-3 py-1 text-xs rounded-r transition-colors ${
+                activeStream === "depth"
+                  ? "bg-purple-500 text-white"
+                  : "bg-black/50 text-gray-300 hover:bg-black/70"
+              }`}
+              data-testid="stream-depth-btn"
+            >
+              Depth
+            </button>
+          </div>
+        )}
+
       </div>
+
+      {/* Modality Chart Tabs - only show if actions or IMU available */}
+      {(hasActions || hasImu) && (
+        <div className="border-t border-gray-200 dark:border-gray-700">
+          {/* Tab Bar */}
+          <div className="flex gap-1 px-4 py-2 bg-gray-100 dark:bg-gray-800">
+            <button
+              onClick={() => setActiveChartTab("none")}
+              className={`px-3 py-1 text-xs rounded transition-colors ${
+                activeChartTab === "none"
+                  ? "bg-white dark:bg-gray-600 text-gray-900 dark:text-white shadow-sm"
+                  : "text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+              }`}
+              data-testid="chart-tab-none"
+            >
+              None
+            </button>
+            {hasActions && (
+              <button
+                onClick={() => setActiveChartTab("actions")}
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  activeChartTab === "actions"
+                    ? "bg-white dark:bg-gray-600 text-gray-900 dark:text-white shadow-sm"
+                    : "text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+                }`}
+                data-testid="chart-tab-actions"
+              >
+                Actions
+              </button>
+            )}
+            {hasImu && (
+              <button
+                onClick={() => setActiveChartTab("imu")}
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  activeChartTab === "imu"
+                    ? "bg-white dark:bg-gray-600 text-gray-900 dark:text-white shadow-sm"
+                    : "text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
+                }`}
+                data-testid="chart-tab-imu"
+              >
+                IMU
+              </button>
+            )}
+          </div>
+
+          {/* Chart Content */}
+          {activeChartTab === "actions" && hasActions && (
+            <ActionsChart
+              episodeId={episodeId}
+              datasetId={datasetId}
+              currentFrame={currentFrame}
+              totalFrames={effectiveTotalFrames}
+            />
+          )}
+          {activeChartTab === "imu" && hasImu && (
+            <IMUChart
+              episodeId={episodeId}
+              datasetId={datasetId}
+              currentFrame={currentFrame}
+              totalFrames={effectiveTotalFrames}
+            />
+          )}
+        </div>
+      )}
 
       {/* Timeline Controls */}
       <div className="p-4 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
@@ -248,7 +344,6 @@ export default function EpisodeViewer({
             totalFrames={effectiveTotalFrames}
             events={qualityEventsData?.events || []}
             onFrameChange={handleFrameChange}
-            selectedMetric={selectedMetric}
           />
         </div>
 

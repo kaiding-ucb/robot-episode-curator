@@ -27,23 +27,25 @@ export function useDatasets() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    async function fetchDatasets() {
-      try {
-        const res = await fetch(`${API_BASE}/datasets`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setDatasets(data);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to fetch datasets");
-      } finally {
-        setLoading(false);
-      }
+  const fetchDatasets = useCallback(async () => {
+    try {
+      setLoading(true);
+      const res = await fetch(`${API_BASE}/datasets`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setDatasets(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch datasets");
+    } finally {
+      setLoading(false);
     }
-    fetchDatasets();
   }, []);
 
-  return { datasets, loading, error };
+  useEffect(() => {
+    fetchDatasets();
+  }, [fetchDatasets]);
+
+  return { datasets, loading, error, refetch: fetchDatasets };
 }
 
 /**
@@ -229,8 +231,9 @@ export function useFrames(
     const datasetParam = dsId ? `&dataset_id=${dsId}` : '';
     const resolutionParam = options?.resolution ? `&resolution=${options.resolution}` : '';
     const qualityParam = options?.quality ? `&quality=${options.quality}` : '';
+    const streamParam = options?.stream ? `&stream=${options.stream}` : '';
     const res = await fetch(
-      `${API_BASE}/episodes/${epId}/frames?start=${rangeStart}&end=${rangeEnd}${datasetParam}${resolutionParam}${qualityParam}`
+      `${API_BASE}/episodes/${epId}/frames?start=${rangeStart}&end=${rangeEnd}${datasetParam}${resolutionParam}${qualityParam}${streamParam}`
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -578,4 +581,152 @@ export function useDatasetOverview(datasetId: string | null) {
   }, [fetchOverview]);
 
   return { overview, loading, error, refresh };
+}
+
+/**
+ * Fetch IMU data for an episode
+ */
+export function useIMUData(
+  episodeId: string | null,
+  datasetId: string | null
+) {
+  const [imuData, setImuData] = useState<{
+    timestamps: number[];
+    accel_x: number[];
+    accel_y: number[];
+    accel_z: number[];
+    gyro_x: number[];
+    gyro_y: number[];
+    gyro_z: number[];
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!episodeId || !datasetId) {
+      setImuData(null);
+      return;
+    }
+
+    async function fetchIMU() {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await fetch(
+          `${API_BASE}/episodes/${episodeId}/imu?dataset_id=${datasetId}`
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) {
+          setError(data.error);
+          setImuData(null);
+        } else {
+          setImuData(data);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to fetch IMU data");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchIMU();
+  }, [episodeId, datasetId]);
+
+  return { imuData, loading, error };
+}
+
+/**
+ * Fetch actions data for an episode
+ */
+export function useActionsData(
+  episodeId: string | null,
+  datasetId: string | null
+) {
+  const [actionsData, setActionsData] = useState<{
+    timestamps: number[];
+    actions: number[][];
+    dimension_labels: string[] | null;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!episodeId || !datasetId) {
+      setActionsData(null);
+      return;
+    }
+
+    async function fetchActions() {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await fetch(
+          `${API_BASE}/episodes/${episodeId}/actions?dataset_id=${datasetId}`
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) {
+          setError(data.error);
+          setActionsData(null);
+        } else {
+          setActionsData(data);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to fetch actions data");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchActions();
+  }, [episodeId, datasetId]);
+
+  return { actionsData, loading, error };
+}
+
+/**
+ * Probe a HuggingFace dataset URL
+ */
+export async function probeDataset(url: string) {
+  const res = await fetch(`${API_BASE}/datasets/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) {
+    const data = await res.json();
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Add a new dataset from HuggingFace URL
+ */
+export async function addDataset(url: string, name?: string, datasetId?: string) {
+  const res = await fetch(`${API_BASE}/datasets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, name, dataset_id: datasetId }),
+  });
+  if (!res.ok) {
+    const data = await res.json();
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Remove a dynamically added dataset
+ */
+export async function removeDataset(datasetId: string) {
+  const res = await fetch(`${API_BASE}/datasets/${datasetId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const data = await res.json();
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
 }

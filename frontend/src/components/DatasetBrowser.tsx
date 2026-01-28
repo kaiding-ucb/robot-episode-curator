@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
-import type { Dataset, EpisodeMetadata, Task, DatasetOverview } from "@/types/api";
+import { useState, useCallback } from "react";
+import type { Dataset, EpisodeMetadata, Task, DatasetOverview, Modality } from "@/types/api";
 import { useDatasets, useTasks, useTaskEpisodes, useDatasetOverview } from "@/hooks/useApi";
+import AddDatasetDialog from "./AddDatasetDialog";
 
 // Badge component for metadata display
 function OverviewBadge({
@@ -46,14 +47,15 @@ function ModalityChip({ modality }: { modality: string }) {
 }
 
 interface DatasetBrowserProps {
-  onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number) => void;
+  onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => void;
 }
 
 export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps) {
-  const { datasets, loading: loadingDatasets, error: datasetsError } = useDatasets();
+  const { datasets, loading: loadingDatasets, error: datasetsError, refetch: refetchDatasets } = useDatasets();
   const [selectedDataset, setSelectedDataset] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [overviewExpanded, setOverviewExpanded] = useState(true);
+  const [showAddDialog, setShowAddDialog] = useState(false);
 
   const { overview, loading: loadingOverview, error: overviewError, refresh: refreshOverview } = useDatasetOverview(selectedDataset);
   const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError } = useTasks(selectedDataset);
@@ -71,6 +73,10 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
   const handleBackToTasks = () => {
     setSelectedTask(null);
   };
+
+  const handleDatasetAdded = useCallback(() => {
+    refetchDatasets?.();
+  }, [refetchDatasets]);
 
   if (loadingDatasets) {
     return (
@@ -92,10 +98,27 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
 
   return (
     <div className="flex flex-col h-full" data-testid="dataset-browser">
+      {/* Add Dataset Dialog */}
+      <AddDatasetDialog
+        isOpen={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        onDatasetAdded={handleDatasetAdded}
+      />
+
       {/* Dataset List */}
       <div className={`border-b border-gray-200 dark:border-gray-700 ${selectedDataset ? 'max-h-[30%] overflow-auto' : ''}`}>
-        <h2 className="px-4 py-2 text-sm font-semibold text-gray-500 uppercase tracking-wider sticky top-0 bg-white dark:bg-gray-900 z-10">
-          Datasets
+        <h2 className="px-4 py-2 text-sm font-semibold text-gray-500 uppercase tracking-wider sticky top-0 bg-white dark:bg-gray-900 z-10 flex items-center justify-between">
+          <span>Datasets</span>
+          <button
+            onClick={() => setShowAddDialog(true)}
+            className="p-1 text-blue-500 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded"
+            title="Add HuggingFace Dataset"
+            data-testid="add-dataset-button"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
         </h2>
         <ul className="divide-y divide-gray-100 dark:divide-gray-800">
           {datasets.map((dataset) => (
@@ -117,6 +140,24 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                     <p className="text-sm text-gray-500">
                       {dataset.type === "teleop" ? "Teleoperation" : "Video"}
                     </p>
+                    {/* Modality badges */}
+                    {dataset.modalities && dataset.modalities.length > 1 && (
+                      <div className="flex gap-1 mt-1">
+                        {dataset.modalities.map((mod) => (
+                          <span
+                            key={mod}
+                            className={`px-1.5 py-0.5 text-xs rounded ${
+                              mod === "rgb" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300" :
+                              mod === "depth" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" :
+                              mod === "imu" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" :
+                              "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
+                            }`}
+                          >
+                            {mod}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <span
                     className={`px-2 py-1 text-xs rounded-full ${
@@ -390,7 +431,12 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                 {episodes.map((episode, index) => (
                   <li key={episode.id}>
                     <button
-                      onClick={() => onSelectEpisode?.(selectedDataset, episode.id, episode.num_frames || 0)}
+                      onClick={() => onSelectEpisode?.(
+                        selectedDataset,
+                        episode.id,
+                        episode.num_frames || 0,
+                        selectedDatasetInfo?.modalities
+                      )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
                       data-testid={`episode-item-${episode.id}`}
                     >

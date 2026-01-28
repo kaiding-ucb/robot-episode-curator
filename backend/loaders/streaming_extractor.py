@@ -5,16 +5,87 @@ Extracts frames from streaming datasets (MCAP, WebDataset/TAR, video files)
 by downloading individual episode files on demand.
 
 Includes persistent caching to avoid re-downloading and re-decoding on subsequent requests.
+Supports multiple modalities: RGB, depth, IMU.
 """
 import logging
 import os
 import pickle
 import tempfile
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# Depth colormap lookup
+DEPTH_COLORMAPS = {
+    "viridis": None,  # Will be cv2.COLORMAP_VIRIDIS
+    "jet": None,  # Will be cv2.COLORMAP_JET
+    "plasma": None,  # Will be cv2.COLORMAP_PLASMA
+    "magma": None,  # Will be cv2.COLORMAP_MAGMA
+}
+
+
+def _get_depth_colormap(name: str):
+    """Get OpenCV colormap constant by name."""
+    try:
+        import cv2
+        colormap_map = {
+            "viridis": cv2.COLORMAP_VIRIDIS,
+            "jet": cv2.COLORMAP_JET,
+            "plasma": cv2.COLORMAP_PLASMA,
+            "magma": cv2.COLORMAP_MAGMA,
+            "inferno": cv2.COLORMAP_INFERNO,
+            "turbo": cv2.COLORMAP_TURBO,
+        }
+        return colormap_map.get(name, cv2.COLORMAP_VIRIDIS)
+    except ImportError:
+        return None
+
+
+def colorize_depth(depth_data: np.ndarray, colormap: str = "viridis") -> np.ndarray:
+    """
+    Colorize a depth image for visualization.
+
+    Args:
+        depth_data: Depth data as numpy array (16-bit or float)
+        colormap: Name of colormap to use
+
+    Returns:
+        RGB colorized depth image (H, W, 3) uint8
+    """
+    try:
+        import cv2
+
+        # Normalize to 0-255
+        if depth_data.dtype == np.float32 or depth_data.dtype == np.float64:
+            # Float depth (assume meters, normalize by max)
+            depth_normalized = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX)
+        elif depth_data.dtype == np.uint16:
+            # 16-bit depth (common in RGB-D cameras)
+            depth_normalized = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX)
+        else:
+            depth_normalized = depth_data
+
+        depth_8bit = depth_normalized.astype(np.uint8)
+
+        # Apply colormap
+        cmap = _get_depth_colormap(colormap)
+        colored = cv2.applyColorMap(depth_8bit, cmap)
+
+        # Convert BGR to RGB
+        return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+
+    except ImportError:
+        logger.warning("OpenCV not available for depth colorization")
+        # Fallback: return grayscale expanded to 3 channels
+        if depth_data.dtype != np.uint8:
+            depth_normalized = ((depth_data - depth_data.min()) /
+                               (depth_data.max() - depth_data.min()) * 255).astype(np.uint8)
+        else:
+            depth_normalized = depth_data
+        return np.stack([depth_normalized] * 3, axis=-1)
 
 # Cache directory for downloaded files
 CACHE_DIR = Path(os.environ.get("HF_CACHE_DIR", Path.home() / ".cache" / "data_viewer" / "streaming"))
@@ -161,7 +232,9 @@ class StreamingFrameExtractor:
         start: int = 0,
         end: int = 10,
         camera_topic: str = "/robot0/sensor/camera0/compressed",
-        episode_path: str = None
+        episode_path: str = None,
+        stream: str = "rgb",
+        depth_colormap: str = "viridis"
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an MCAP file.
@@ -172,13 +245,16 @@ class StreamingFrameExtractor:
             end: End frame index
             camera_topic: Topic name for camera images
             episode_path: Original episode path (for persistent caching)
+            stream: Which stream to extract: "rgb" or "depth"
+            depth_colormap: Colormap for depth visualization
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
         """
         global _FRAME_CACHE
 
-        cache_key = str(file_path)
+        # Include stream in cache key to cache different streams separately
+        cache_key = f"{file_path}:{stream}"
 
         # Check in-memory cache first
         if cache_key in _FRAME_CACHE:
@@ -195,14 +271,15 @@ class StreamingFrameExtractor:
             # If cache doesn't have enough frames, we need to decode more
             logger.info(f"In-memory cache has {len(cached_frames)} frames, need up to {end}")
 
-        # Check persistent cache
-        if episode_path:
-            persistent_frames = _load_persistent_frame_cache(self.repo_id, episode_path)
+        # Check persistent cache (include stream in cache key)
+        persistent_cache_key = f"{episode_path}:{stream}" if episode_path else None
+        if persistent_cache_key:
+            persistent_frames = _load_persistent_frame_cache(self.repo_id, persistent_cache_key)
             if persistent_frames:
                 # Load into in-memory cache for faster subsequent access
                 _FRAME_CACHE[cache_key] = persistent_frames
                 if len(persistent_frames) >= end:
-                    logger.info(f"Loaded from persistent cache for {file_path} (range {start}-{end})")
+                    logger.info(f"Loaded from persistent cache for {file_path}:{stream} (range {start}-{end})")
                     return persistent_frames[start:end]
                 # Return partial frames if they cover the requested start
                 if len(persistent_frames) > start:
@@ -210,9 +287,33 @@ class StreamingFrameExtractor:
                     logger.info(f"Persistent cache partial hit: returning frames {start}-{actual_end} of {len(persistent_frames)} cached")
                     return persistent_frames[start:actual_end]
 
+        # Define topic patterns for different streams
+        if stream == "depth":
+            topic_patterns = ["depth", "range", "disparity"]
+        else:  # rgb is default
+            topic_patterns = ["rgb", "color", "image", "camera", "compressed"]
+
         try:
             from mcap.reader import make_reader
-            from mcap_protobuf.decoder import DecoderFactory
+
+            # Try to import decoder factories - ROS2 (CDR) and Protobuf
+            decoder_factories = []
+            try:
+                from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+                decoder_factories.append(Ros2DecoderFactory())
+                logger.debug("ROS2 decoder factory available")
+            except ImportError:
+                logger.debug("mcap-ros2-support not installed, ROS2 MCAP decoding unavailable")
+
+            try:
+                from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
+                decoder_factories.append(ProtobufDecoderFactory())
+                logger.debug("Protobuf decoder factory available")
+            except ImportError:
+                logger.debug("mcap-protobuf-support not installed")
+
+            if not decoder_factories:
+                raise ImportError("No MCAP decoder factories available. Install mcap-ros2-support or mcap-protobuf-support.")
 
             # For H.264, we need to decode ALL frames from the beginning
             # because H.264 uses inter-frame compression
@@ -220,35 +321,93 @@ class StreamingFrameExtractor:
             h264_data = []
             timestamps = []
 
+            def matches_topic_patterns(topic: str, patterns: List[str]) -> bool:
+                """Check if topic matches any of the patterns."""
+                topic_lower = topic.lower()
+                # For depth, we want to match depth topics but NOT rgb topics
+                if stream == "depth":
+                    return any(p in topic_lower for p in patterns) and "rgb" not in topic_lower
+                # For rgb, we want to match rgb topics but NOT depth topics
+                return any(p in topic_lower for p in patterns) and "depth" not in topic_lower
+
             with open(file_path, "rb") as f:
-                reader = make_reader(f, decoder_factories=[DecoderFactory()])
+                reader = make_reader(f, decoder_factories=decoder_factories)
+                msg_count = 0
 
                 for schema, channel, message, decoded_message in reader.iter_decoded_messages():
-                    # Look for camera topic (prefer robot0)
-                    if "/robot0/sensor/camera0/compressed" in channel.topic:
+                    msg_count += 1
+                    # Check if this topic matches our stream pattern
+                    topic_matches = matches_topic_patterns(channel.topic, topic_patterns)
+                    if msg_count <= 5:
+                        logger.debug(f"Message {msg_count}: topic={channel.topic}, matches={topic_matches}")
+
+                    if topic_matches:
                         if hasattr(decoded_message, 'data') and hasattr(decoded_message, 'format'):
                             img_format = decoded_message.format.lower()
                             img_data = decoded_message.data
                             timestamp = message.log_time / 1e9
 
-                            if img_format == 'h264':
+                            if len(frames) < 3:
+                                logger.info(f"Processing frame {len(frames)}: format='{img_format}', data_len={len(img_data)}")
+
+                            if 'h264' in img_format:
                                 # Collect ALL H.264 NAL units (don't stop early)
                                 h264_data.append(img_data)
                                 timestamps.append(timestamp)
-                            elif img_format in ['jpeg', 'jpg', 'png']:
+                            elif 'jpeg' in img_format or 'jpg' in img_format or 'png' in img_format:
                                 # Direct decode for JPEG/PNG
                                 import cv2
                                 nparr = np.frombuffer(img_data, np.uint8)
-                                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                # For depth, use UNCHANGED to preserve 16-bit
+                                decode_flag = cv2.IMREAD_UNCHANGED if stream == "depth" else cv2.IMREAD_COLOR
+                                image = cv2.imdecode(nparr, decode_flag)
                                 if image is not None:
-                                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                                    if stream == "depth":
+                                        # Colorize depth for visualization
+                                        image = colorize_depth(image, depth_colormap)
+                                    else:
+                                        # RGB: Convert BGR to RGB
+                                        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                                     frames.append((len(frames), timestamp, image))
+                                    # Early termination for JPEG - stop when we have enough frames
+                                    if len(frames) >= end:
+                                        logger.info(f"Reached requested frame limit ({end}), stopping extraction")
+                                        break
+                            elif img_format in ['16uc1', 'mono16', '16uc', 'depth']:
+                                # Raw 16-bit depth data
+                                import cv2
+                                depth_array = np.frombuffer(img_data, dtype=np.uint16)
+                                # Try to reshape (may need to know dimensions)
+                                # Common depth camera resolutions
+                                for h, w in [(480, 640), (720, 1280), (240, 320), (424, 512)]:
+                                    if depth_array.size == h * w:
+                                        depth_array = depth_array.reshape((h, w))
+                                        break
+                                if len(depth_array.shape) == 2:
+                                    image = colorize_depth(depth_array, depth_colormap)
+                                    frames.append((len(frames), timestamp, image))
+                                    # Early termination for depth - stop when we have enough frames
+                                    if len(frames) >= end:
+                                        logger.info(f"Reached requested frame limit ({end}), stopping extraction")
+                                        break
+
+                    # Check if we have enough frames (handles break from inner conditions)
+                    if len(frames) >= end:
+                        break
 
             # If we have H.264 data, decode ALL frames from the beginning
             if h264_data and not frames:
-                logger.info(f"Decoding {len(h264_data)} H.264 NAL units from MCAP")
+                logger.info(f"Decoding {len(h264_data)} H.264 NAL units from MCAP (stream={stream})")
                 # Decode all frames (start=0) and cache them
                 frames = self._decode_h264_frames(h264_data, timestamps, 0, len(h264_data))
+
+                # For depth stream, colorize all decoded frames
+                if stream == "depth" and frames:
+                    colorized_frames = []
+                    for idx, ts, img in frames:
+                        colorized = colorize_depth(img, depth_colormap)
+                        colorized_frames.append((idx, ts, colorized))
+                    frames = colorized_frames
 
                 # Log decode completion status
                 logger.info(f"H.264 decode complete: {len(frames)} frames from {len(h264_data)} NAL units")
@@ -258,11 +417,11 @@ class StreamingFrameExtractor:
                 # Cache the decoded frames for future requests (both in-memory and persistent)
                 if frames:
                     _FRAME_CACHE[cache_key] = frames
-                    logger.info(f"Cached {len(frames)} decoded frames in memory for {file_path}")
+                    logger.info(f"Cached {len(frames)} decoded frames in memory for {file_path}:{stream}")
 
                     # Save to persistent cache for future sessions
-                    if episode_path:
-                        _save_persistent_frame_cache(self.repo_id, episode_path, frames)
+                    if persistent_cache_key:
+                        _save_persistent_frame_cache(self.repo_id, persistent_cache_key, frames)
 
             # Return requested range
             if frames:
@@ -522,6 +681,8 @@ class StreamingFrameExtractor:
         episode_path: str,
         start: int = 0,
         end: int = 10,
+        stream: str = "rgb",
+        depth_colormap: str = "viridis"
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an episode file (auto-detects format).
@@ -533,6 +694,8 @@ class StreamingFrameExtractor:
             episode_path: Path within the HuggingFace repo
             start: Start frame index
             end: End frame index
+            stream: Which stream to extract: "rgb" or "depth"
+            depth_colormap: Colormap for depth visualization
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
@@ -544,13 +707,100 @@ class StreamingFrameExtractor:
         suffix = local_path.suffix.lower()
 
         if suffix == '.mcap':
-            return self.extract_frames_from_mcap(local_path, start, end, episode_path=episode_path)
+            return self.extract_frames_from_mcap(
+                local_path, start, end,
+                episode_path=episode_path,
+                stream=stream,
+                depth_colormap=depth_colormap
+            )
         elif suffix == '.tar':
             return self.extract_frames_from_tar(local_path, start, end)
         elif suffix in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
             return self.extract_frames_from_video(local_path, start, end)
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
+
+    def extract_imu_data(
+        self,
+        episode_path: str,
+    ) -> Dict[str, Any]:
+        """
+        Extract IMU data from an MCAP episode file.
+
+        Args:
+            episode_path: Path within the HuggingFace repo
+
+        Returns:
+            Dictionary with IMU data:
+            {
+                "timestamps": List[float],
+                "accel_x": List[float],
+                "accel_y": List[float],
+                "accel_z": List[float],
+                "gyro_x": List[float],
+                "gyro_y": List[float],
+                "gyro_z": List[float]
+            }
+        """
+        local_path = self.download_file(episode_path)
+        suffix = local_path.suffix.lower()
+
+        if suffix != '.mcap':
+            return {"error": f"IMU extraction only supported for MCAP files, got {suffix}"}
+
+        try:
+            from mcap.reader import make_reader
+            from mcap_protobuf.decoder import DecoderFactory
+
+            imu_data = {
+                "timestamps": [],
+                "accel_x": [],
+                "accel_y": [],
+                "accel_z": [],
+                "gyro_x": [],
+                "gyro_y": [],
+                "gyro_z": [],
+            }
+
+            # IMU topic patterns
+            imu_patterns = ["imu", "accelerometer", "gyroscope", "accel", "gyro"]
+
+            with open(local_path, "rb") as f:
+                reader = make_reader(f, decoder_factories=[DecoderFactory()])
+
+                for schema, channel, message, decoded_message in reader.iter_decoded_messages():
+                    topic_lower = channel.topic.lower()
+                    if any(p in topic_lower for p in imu_patterns):
+                        timestamp = message.log_time / 1e9
+
+                        # Try to extract IMU data from decoded message
+                        # ROS sensor_msgs/Imu format
+                        if hasattr(decoded_message, 'linear_acceleration'):
+                            accel = decoded_message.linear_acceleration
+                            imu_data["timestamps"].append(timestamp)
+                            imu_data["accel_x"].append(getattr(accel, 'x', 0.0))
+                            imu_data["accel_y"].append(getattr(accel, 'y', 0.0))
+                            imu_data["accel_z"].append(getattr(accel, 'z', 0.0))
+
+                            if hasattr(decoded_message, 'angular_velocity'):
+                                gyro = decoded_message.angular_velocity
+                                imu_data["gyro_x"].append(getattr(gyro, 'x', 0.0))
+                                imu_data["gyro_y"].append(getattr(gyro, 'y', 0.0))
+                                imu_data["gyro_z"].append(getattr(gyro, 'z', 0.0))
+                            else:
+                                imu_data["gyro_x"].append(0.0)
+                                imu_data["gyro_y"].append(0.0)
+                                imu_data["gyro_z"].append(0.0)
+
+            logger.info(f"Extracted {len(imu_data['timestamps'])} IMU samples from {episode_path}")
+            return imu_data
+
+        except ImportError as e:
+            logger.error(f"MCAP library not installed: {e}")
+            return {"error": "MCAP library not installed"}
+        except Exception as e:
+            logger.error(f"Failed to extract IMU data: {e}")
+            return {"error": str(e)}
 
     def get_frame_count(self, episode_path: str) -> int:
         """
@@ -620,6 +870,8 @@ class StreamingFrameExtractor:
         episode_path: str,
         start: int = 0,
         end: int = 10,
+        stream: str = "rgb",
+        depth_colormap: str = "viridis"
     ) -> Tuple[List[Tuple[int, float, np.ndarray]], int]:
         """
         Extract frames from an episode file and return total frame count.
@@ -631,6 +883,8 @@ class StreamingFrameExtractor:
             episode_path: Path within the HuggingFace repo
             start: Start frame index
             end: End frame index
+            stream: Which stream to extract: "rgb" or "depth"
+            depth_colormap: Colormap for depth visualization
 
         Returns:
             Tuple of (frames_list, total_frame_count)
@@ -644,7 +898,12 @@ class StreamingFrameExtractor:
 
         # Extract frames (with episode_path for persistent caching)
         if suffix == '.mcap':
-            frames = self.extract_frames_from_mcap(local_path, start, end, episode_path=episode_path)
+            frames = self.extract_frames_from_mcap(
+                local_path, start, end,
+                episode_path=episode_path,
+                stream=stream,
+                depth_colormap=depth_colormap
+            )
         elif suffix == '.tar':
             frames = self.extract_frames_from_tar(local_path, start, end)
         elif suffix in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:

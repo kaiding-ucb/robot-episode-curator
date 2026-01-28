@@ -2,6 +2,16 @@
  * API types for the Data Viewer frontend
  */
 
+// === MODALITY TYPES ===
+export type Modality = "rgb" | "depth" | "imu" | "actions" | "states";
+
+export interface ModalityConfig {
+  topic?: string;
+  type?: "image" | "timeseries" | "vector";
+  colormap?: string;
+  key?: string;
+}
+
 export interface Dataset {
   id: string;
   name: string;
@@ -9,6 +19,9 @@ export interface Dataset {
   description?: string;
   episode_count?: number;
   size_mb?: number;
+  modalities?: Modality[];
+  modality_config?: Record<string, ModalityConfig>;
+  has_tasks?: boolean;
 }
 
 export interface EpisodeMetadata {
@@ -65,6 +78,38 @@ export type ImageResolution = "low" | "medium" | "high" | "original";
 export interface StreamingOptions {
   resolution?: ImageResolution;
   quality?: number; // 10-100
+  stream?: "rgb" | "depth"; // Which stream to fetch
+}
+
+// === PROBE & ADD DATASET TYPES ===
+export interface ProbeResponse {
+  repo_id: string;
+  name: string;
+  format_detected?: string;
+  has_tasks: boolean;
+  modalities: Modality[];
+  modality_config?: Record<string, ModalityConfig>;
+  sample_files: string[];
+  error?: string;
+}
+
+export interface AddDatasetResponse {
+  dataset_id: string;
+  name: string;
+  success: boolean;
+  error?: string;
+}
+
+// === IMU DATA TYPES ===
+export interface IMUData {
+  timestamps: number[];
+  accel_x: number[];
+  accel_y: number[];
+  accel_z: number[];
+  gyro_x: number[];
+  gyro_y: number[];
+  gyro_z: number[];
+  error?: string;
 }
 
 // === CACHE MANAGEMENT TYPES ===
