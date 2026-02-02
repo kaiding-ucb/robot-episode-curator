@@ -772,6 +772,37 @@ async def stream_frames_generator(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+async def serve_cached_frames_as_sse(
+    cached_episode: dict,
+    start: int,
+    end: int,
+    file_path: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Serve cached frames as SSE events (much faster than re-decoding).
+    """
+    all_frames = cached_episode["frames"]
+    total_frames = cached_episode["total"]
+
+    yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+
+    # Clamp range to available frames
+    actual_end = min(end, len(all_frames))
+    for f in all_frames[start:actual_end]:
+        frame_data = {
+            'type': 'frame',
+            'index': f["frame_idx"],
+            'timestamp': f.get("timestamp"),
+            'data': f.get("image_base64"),
+        }
+        yield f"data: {json.dumps(frame_data)}\n\n"
+        # Allow other tasks to run
+        await asyncio.sleep(0)
+
+    logger.info(f"Served {actual_end - start} frames from cache via SSE: {file_path}")
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
 @router.get("/{episode_id:path}/frames/stream")
 async def stream_frames(
     episode_id: str,
@@ -789,6 +820,8 @@ async def stream_frames(
     This endpoint returns frames progressively as they're decoded,
     allowing the client to display frames before the entire episode
     is ready. Much better user experience for large episodes.
+
+    If frames are already cached, serves them immediately from cache.
 
     SSE Event Types:
     - total: Contains total_frames count
@@ -815,6 +848,28 @@ async def stream_frames(
             detail="SSE streaming only available for HuggingFace streaming datasets"
         )
 
+    # Check cache FIRST - serve from cache if available (much faster!)
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+    cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+    episode_key = cache.get_episode_cache_key(
+        effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+    )
+
+    cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+    if cached_episode:
+        logger.info(f"SSE serving from cache: {file_path} ({len(cached_episode['frames'])} frames)")
+        return StreamingResponse(
+            serve_cached_frames_as_sse(cached_episode, start, end, file_path),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    # Not cached - stream and cache as we go
     # Create disconnection checker from request
     async def is_disconnected():
         return await request.is_disconnected()
