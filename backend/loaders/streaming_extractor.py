@@ -94,9 +94,35 @@ CACHE_DIR = Path(os.environ.get("HF_CACHE_DIR", Path.home() / ".cache" / "data_v
 FRAME_CACHE_DIR = CACHE_DIR / "decoded_frames"
 FRAME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory cache for decoded frames (episode_path -> list of frames)
-# This avoids re-decoding H.264 on every batch request within a session
+# Memory-limited LRU cache for decoded frames
+# Only cache a few recent episodes to prevent memory explosion
+# Each frame is ~3MB at 720p, so 1000 frames = ~3GB max per episode
 _FRAME_CACHE: dict = {}
+_FRAME_CACHE_ORDER: list = []  # Track access order for LRU eviction
+_FRAME_CACHE_MAX_EPISODES = 2  # Only keep 2 most recent episodes in memory
+_FRAME_CACHE_MAX_FRAMES_PER_EPISODE = 500  # Max frames to cache per episode
+
+
+def _evict_frame_cache_if_needed():
+    """Evict oldest episodes from cache if we exceed limits."""
+    global _FRAME_CACHE, _FRAME_CACHE_ORDER
+
+    while len(_FRAME_CACHE_ORDER) > _FRAME_CACHE_MAX_EPISODES:
+        oldest_key = _FRAME_CACHE_ORDER.pop(0)
+        if oldest_key in _FRAME_CACHE:
+            # Log what we're evicting
+            evicted_frames = len(_FRAME_CACHE[oldest_key])
+            del _FRAME_CACHE[oldest_key]
+            logger.info(f"Evicted {evicted_frames} frames from memory cache: {oldest_key}")
+
+
+def _update_frame_cache_access(cache_key: str):
+    """Update LRU order when a cache key is accessed."""
+    global _FRAME_CACHE_ORDER
+
+    if cache_key in _FRAME_CACHE_ORDER:
+        _FRAME_CACHE_ORDER.remove(cache_key)
+    _FRAME_CACHE_ORDER.append(cache_key)
 
 
 def _get_frame_cache_path(repo_id: str, episode_path: str) -> Path:
@@ -108,13 +134,23 @@ def _get_frame_cache_path(repo_id: str, episode_path: str) -> Path:
 
 
 def _load_persistent_frame_cache(repo_id: str, episode_path: str) -> Optional[List]:
-    """Load frames from persistent cache if available."""
+    """Load frames from persistent cache if available.
+
+    WARNING: This loads ALL frames into memory. For large episodes (>1GB cache files),
+    we skip loading to prevent memory explosion.
+    """
     cache_path = _get_frame_cache_path(repo_id, episode_path)
     if cache_path.exists():
         try:
+            # Skip loading if cache file is too large (>500MB = potentially huge memory usage)
+            cache_size_mb = cache_path.stat().st_size / (1024 * 1024)
+            if cache_size_mb > 500:
+                logger.warning(f"Skipping persistent cache load - file too large ({cache_size_mb:.1f}MB): {episode_path}")
+                return None
+
             with open(cache_path, 'rb') as f:
                 data = pickle.load(f)
-                logger.info(f"Loaded {len(data)} frames from persistent cache for {episode_path}")
+                logger.info(f"Loaded {len(data)} frames from persistent cache for {episode_path} ({cache_size_mb:.1f}MB)")
                 return data
         except Exception as e:
             logger.warning(f"Failed to load persistent frame cache: {e}")
@@ -122,7 +158,16 @@ def _load_persistent_frame_cache(repo_id: str, episode_path: str) -> Optional[Li
 
 
 def _save_persistent_frame_cache(repo_id: str, episode_path: str, frames: List) -> bool:
-    """Save frames to persistent cache."""
+    """Save frames to persistent cache.
+
+    WARNING: Only saves if episode is reasonably sized (<2000 frames) to prevent
+    creating huge cache files that cause memory issues when loaded.
+    """
+    # Don't save huge episodes - they'll cause memory issues when loading
+    if len(frames) > 2000:
+        logger.info(f"Skipping persistent cache save - too many frames ({len(frames)}): {episode_path}")
+        return False
+
     cache_path = _get_frame_cache_path(repo_id, episode_path)
     try:
         with open(cache_path, 'wb') as f:
@@ -259,6 +304,7 @@ class StreamingFrameExtractor:
         # Check in-memory cache first
         if cache_key in _FRAME_CACHE:
             cached_frames = _FRAME_CACHE[cache_key]
+            _update_frame_cache_access(cache_key)
             if len(cached_frames) >= end:
                 logger.info(f"Using in-memory cached frames for {file_path} (range {start}-{end})")
                 return cached_frames[start:end]
@@ -268,16 +314,21 @@ class StreamingFrameExtractor:
                 actual_end = min(end, len(cached_frames))
                 logger.info(f"Cache partial hit: returning frames {start}-{actual_end} of {len(cached_frames)} cached for {file_path}")
                 return cached_frames[start:actual_end]
-            # If cache doesn't have enough frames, we need to decode more
-            logger.info(f"In-memory cache has {len(cached_frames)} frames, need up to {end}")
+            # If cache doesn't have enough frames, fall through to persistent cache
+            logger.info(f"In-memory cache has {len(cached_frames)} frames, need up to {end}, checking persistent cache")
 
         # Check persistent cache (include stream in cache key)
         persistent_cache_key = f"{episode_path}:{stream}" if episode_path else None
         if persistent_cache_key:
             persistent_frames = _load_persistent_frame_cache(self.repo_id, persistent_cache_key)
             if persistent_frames:
-                # Load into in-memory cache for faster subsequent access
-                _FRAME_CACHE[cache_key] = persistent_frames
+                # Only cache limited frames in memory to prevent memory explosion
+                # Return directly from persistent cache (disk) for frames beyond limit
+                frames_to_cache = persistent_frames[:_FRAME_CACHE_MAX_FRAMES_PER_EPISODE]
+                _FRAME_CACHE[cache_key] = frames_to_cache
+                _update_frame_cache_access(cache_key)
+                _evict_frame_cache_if_needed()
+
                 if len(persistent_frames) >= end:
                     logger.info(f"Loaded from persistent cache for {file_path}:{stream} (range {start}-{end})")
                     return persistent_frames[start:end]
@@ -416,8 +467,13 @@ class StreamingFrameExtractor:
 
                 # Cache the decoded frames for future requests (both in-memory and persistent)
                 if frames:
-                    _FRAME_CACHE[cache_key] = frames
-                    logger.info(f"Cached {len(frames)} decoded frames in memory for {file_path}:{stream}")
+                    # Limit in-memory cache to prevent memory explosion
+                    # Only cache first N frames in memory; full episode is in persistent cache
+                    frames_to_cache = frames[:_FRAME_CACHE_MAX_FRAMES_PER_EPISODE]
+                    _FRAME_CACHE[cache_key] = frames_to_cache
+                    _update_frame_cache_access(cache_key)
+                    _evict_frame_cache_if_needed()
+                    logger.info(f"Cached {len(frames_to_cache)} of {len(frames)} frames in memory for {file_path}:{stream}")
 
                     # Save to persistent cache for future sessions
                     if persistent_cache_key:
@@ -792,6 +848,16 @@ class StreamingFrameExtractor:
                                 imu_data["gyro_y"].append(0.0)
                                 imu_data["gyro_z"].append(0.0)
 
+                        # Foxglove IMUMeasurement format (used by RealOmni)
+                        elif hasattr(decoded_message, 'linear_acceleration_x'):
+                            imu_data["timestamps"].append(timestamp)
+                            imu_data["accel_x"].append(getattr(decoded_message, 'linear_acceleration_x', 0.0))
+                            imu_data["accel_y"].append(getattr(decoded_message, 'linear_acceleration_y', 0.0))
+                            imu_data["accel_z"].append(getattr(decoded_message, 'linear_acceleration_z', 0.0))
+                            imu_data["gyro_x"].append(getattr(decoded_message, 'angular_velocity_x', 0.0))
+                            imu_data["gyro_y"].append(getattr(decoded_message, 'angular_velocity_y', 0.0))
+                            imu_data["gyro_z"].append(getattr(decoded_message, 'angular_velocity_z', 0.0))
+
             logger.info(f"Extracted {len(imu_data['timestamps'])} IMU samples from {episode_path}")
             return imu_data
 
@@ -801,6 +867,182 @@ class StreamingFrameExtractor:
         except Exception as e:
             logger.error(f"Failed to extract IMU data: {e}")
             return {"error": str(e)}
+
+    def extract_actions_data(
+        self,
+        episode_path: str,
+    ) -> Dict[str, Any]:
+        """
+        Extract action data from an MCAP episode file.
+
+        Args:
+            episode_path: Path within the HuggingFace repo
+
+        Returns:
+            Dictionary with action data:
+            {
+                "timestamps": List[float],
+                "actions": List[List[float]],  # 2D array: [frame][dimension]
+                "dimension_labels": List[str],  # Optional dimension labels
+                "error": Optional[str]
+            }
+        """
+        local_path = self.download_file(episode_path)
+        suffix = local_path.suffix.lower()
+
+        if suffix != '.mcap':
+            return {"error": f"Action extraction only supported for MCAP files, got {suffix}"}
+
+        try:
+            from mcap.reader import make_reader
+
+            # Try to import decoder factories
+            decoder_factories = []
+            try:
+                from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+                decoder_factories.append(Ros2DecoderFactory())
+            except ImportError:
+                pass
+            try:
+                from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
+                decoder_factories.append(ProtobufDecoderFactory())
+            except ImportError:
+                pass
+
+            if not decoder_factories:
+                return {"error": "No MCAP decoder factories available"}
+
+            actions_data = {
+                "timestamps": [],
+                "actions": [],
+                "dimension_labels": None,
+            }
+
+            # Action topic patterns (common conventions)
+            # Include eef_pose for end-effector pose data (RealOmni)
+            action_patterns = ["action", "command", "control", "cmd", "joint", "gripper", "target", "eef_pose", "end_effector"]
+
+            with open(local_path, "rb") as f:
+                reader = make_reader(f, decoder_factories=decoder_factories)
+
+                for schema, channel, message, decoded_message in reader.iter_decoded_messages():
+                    topic_lower = channel.topic.lower()
+
+                    # Skip camera/image topics
+                    if any(p in topic_lower for p in ["camera", "image", "rgb", "depth", "compressed"]):
+                        continue
+
+                    # Check if this looks like an action topic
+                    if any(p in topic_lower for p in action_patterns):
+                        timestamp = message.log_time / 1e9
+
+                        # Try to extract action data from decoded message
+                        action_vector = self._extract_action_vector(decoded_message)
+
+                        if action_vector is not None:
+                            actions_data["timestamps"].append(timestamp)
+                            actions_data["actions"].append(action_vector)
+
+            # Try to infer dimension labels
+            if actions_data["actions"]:
+                num_dims = len(actions_data["actions"][0])
+                # Common robotics action labels
+                if num_dims == 7:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+                elif num_dims == 6:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
+                elif num_dims == 3:
+                    actions_data["dimension_labels"] = ["x", "y", "z"]
+
+            logger.info(f"Extracted {len(actions_data['timestamps'])} action samples from {episode_path}")
+            return actions_data
+
+        except ImportError as e:
+            logger.error(f"MCAP library not installed: {e}")
+            return {"error": "MCAP library not installed"}
+        except Exception as e:
+            logger.error(f"Failed to extract actions data: {e}")
+            return {"error": str(e)}
+
+    def _extract_action_vector(self, decoded_message) -> Optional[List[float]]:
+        """
+        Extract action vector from a decoded MCAP message.
+
+        Handles various ROS and Foxglove message types that might contain action data.
+        """
+        # Try common message attribute patterns
+
+        # Float64MultiArray / Float32MultiArray
+        if hasattr(decoded_message, 'data'):
+            data = decoded_message.data
+            if hasattr(data, '__iter__') and not isinstance(data, (str, bytes)):
+                try:
+                    return [float(x) for x in data]
+                except (TypeError, ValueError):
+                    pass
+
+        # JointState message
+        if hasattr(decoded_message, 'position') and not hasattr(decoded_message, 'orientation'):
+            positions = decoded_message.position
+            if hasattr(positions, '__iter__'):
+                try:
+                    return [float(x) for x in positions]
+                except (TypeError, ValueError):
+                    pass
+
+        # Twist message (linear + angular velocity)
+        if hasattr(decoded_message, 'linear') and hasattr(decoded_message, 'angular'):
+            try:
+                linear = decoded_message.linear
+                angular = decoded_message.angular
+                return [
+                    getattr(linear, 'x', 0.0),
+                    getattr(linear, 'y', 0.0),
+                    getattr(linear, 'z', 0.0),
+                    getattr(angular, 'x', 0.0),
+                    getattr(angular, 'y', 0.0),
+                    getattr(angular, 'z', 0.0),
+                ]
+            except (TypeError, ValueError):
+                pass
+
+        # Foxglove PoseInFrame message (used by RealOmni)
+        if hasattr(decoded_message, 'pose'):
+            try:
+                pose = decoded_message.pose
+                pos = getattr(pose, 'position', None)
+                ori = getattr(pose, 'orientation', None)
+                if pos is not None and ori is not None:
+                    return [
+                        getattr(pos, 'x', 0.0),
+                        getattr(pos, 'y', 0.0),
+                        getattr(pos, 'z', 0.0),
+                        getattr(ori, 'x', 0.0),
+                        getattr(ori, 'y', 0.0),
+                        getattr(ori, 'z', 0.0),
+                        getattr(ori, 'w', 1.0),
+                    ]
+            except (TypeError, ValueError):
+                pass
+
+        # ROS Pose message (position + orientation directly)
+        if hasattr(decoded_message, 'position') and hasattr(decoded_message, 'orientation'):
+            try:
+                pos = decoded_message.position
+                ori = decoded_message.orientation
+                return [
+                    getattr(pos, 'x', 0.0),
+                    getattr(pos, 'y', 0.0),
+                    getattr(pos, 'z', 0.0),
+                    getattr(ori, 'x', 0.0),
+                    getattr(ori, 'y', 0.0),
+                    getattr(ori, 'z', 0.0),
+                    getattr(ori, 'w', 1.0),
+                ]
+            except (TypeError, ValueError):
+                pass
+
+        return None
 
     def get_frame_count(self, episode_path: str) -> int:
         """
