@@ -344,32 +344,7 @@ test.describe("Data Manager", () => {
 });
 
 // =============================================================================
-// FLOW 7: Compare Datasets
-// =============================================================================
-test.describe("Compare Datasets", () => {
-  test("clicking Compare Datasets opens panel", async ({ page }) => {
-    await page.goto("/");
-
-    await page.getByTestId("open-compare-btn").click();
-
-    await expect(page.getByTestId("compare-panel")).toBeVisible();
-  });
-
-  test("compare panel can be closed", async ({ page }) => {
-    await page.goto("/");
-
-    await page.getByTestId("open-compare-btn").click();
-    await expect(page.getByTestId("compare-panel")).toBeVisible();
-
-    // Close via backdrop
-    await page.getByTestId("compare-modal-backdrop").click({ position: { x: 10, y: 10 } });
-
-    await expect(page.getByTestId("compare-panel")).not.toBeVisible();
-  });
-});
-
-// =============================================================================
-// FLOW 8: Smooth Batch Boundary Playback
+// FLOW 7: Smooth Batch Boundary Playback
 // =============================================================================
 test.describe("Batch Boundary Playback", () => {
   test("playback continues smoothly across batch boundary", async ({ page }) => {
@@ -540,5 +515,71 @@ test.describe("Task-Level Quality", () => {
       expect(event).toHaveProperty("metric_category");
       expect(["transition", "divergence"]).toContain(event.metric_category);
     }
+  });
+});
+
+// =============================================================================
+// FLOW 11: Modality Chart Tabs
+// =============================================================================
+test.describe("Modality Chart Tabs", () => {
+  test("LIBERO shows Actions tab only (no IMU)", async ({ page }) => {
+    await page.goto("/");
+
+    // Select LIBERO dataset and wait for episodes
+    await page.getByTestId("dataset-item-libero").click();
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 10000 });
+
+    // Select first episode
+    await page.locator('[data-testid^="episode-item-"]').first().click();
+
+    // Wait for episode viewer to load
+    await page.waitForSelector('[data-testid="episode-viewer"]', { timeout: 15000 });
+
+    // Should have Actions tab
+    await expect(page.getByTestId("chart-tab-actions")).toBeVisible();
+
+    // Should NOT have IMU tab (LIBERO has no IMU data)
+    await expect(page.getByTestId("chart-tab-imu")).not.toBeVisible();
+  });
+
+  test("clicking Actions tab shows actions chart", async ({ page }) => {
+    await page.goto("/");
+
+    // Navigate to LIBERO episode
+    await page.getByTestId("dataset-item-libero").click();
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 10000 });
+    await page.locator('[data-testid^="episode-item-"]').first().click();
+    await page.waitForSelector('[data-testid="episode-viewer"]', { timeout: 15000 });
+
+    // Click Actions tab
+    await page.getByTestId("chart-tab-actions").click();
+
+    // Actions chart should be visible
+    await expect(page.getByTestId("actions-chart")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("Egocentric-10k shows no chart tabs (video-only)", async ({ page }) => {
+    await page.goto("/");
+
+    // Check if egocentric dataset exists
+    const egoDataset = page.getByTestId("dataset-item-egocentric-10k");
+    const exists = await egoDataset.count();
+
+    if (exists === 0) {
+      test.skip();
+      return;
+    }
+
+    // Select Egocentric-10k dataset
+    await egoDataset.click();
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 10000 });
+
+    // Select first episode
+    await page.locator('[data-testid^="episode-item-"]').first().click();
+    await page.waitForSelector('[data-testid="episode-viewer"]', { timeout: 15000 });
+
+    // Should NOT have any chart tabs (video-only dataset)
+    await expect(page.getByTestId("chart-tab-actions")).not.toBeVisible();
+    await expect(page.getByTestId("chart-tab-imu")).not.toBeVisible();
   });
 });

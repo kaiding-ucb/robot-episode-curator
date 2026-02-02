@@ -253,6 +253,7 @@ async def get_all_cache_stats():
     # Encoded frames cache (what the UI currently shows)
     encoded_path = cache_base / "frames"
     caches.append({
+        "key": "encoded_frames",
         "name": "Encoded Frames",
         "path": str(encoded_path),
         "size_mb": round(_get_dir_size_mb(encoded_path), 2),
@@ -272,6 +273,7 @@ async def get_all_cache_stats():
                 elif item.is_dir():
                     streaming_size += _get_dir_size_mb(item) * 1024 * 1024
     caches.append({
+        "key": "streaming",
         "name": "Downloaded Episodes",
         "path": str(streaming_path),
         "size_mb": round(streaming_size / (1024 * 1024), 2),
@@ -282,6 +284,7 @@ async def get_all_cache_stats():
     # Decoded frames cache (THE PROBLEMATIC ONE - can be 100GB+!)
     decoded_path = cache_base / "streaming" / "decoded_frames"
     caches.append({
+        "key": "decoded_frames",
         "name": "Decoded Frames (WARNING)",
         "path": str(decoded_path),
         "size_mb": round(_get_dir_size_mb(decoded_path), 2),
@@ -291,6 +294,7 @@ async def get_all_cache_stats():
 
     # HuggingFace cache
     caches.append({
+        "key": "huggingface",
         "name": "HuggingFace Hub",
         "path": str(hf_cache),
         "size_mb": round(_get_dir_size_mb(hf_cache), 2),
@@ -301,6 +305,7 @@ async def get_all_cache_stats():
     # Quality cache
     quality_path = cache_base / "quality"
     caches.append({
+        "key": "quality",
         "name": "Quality Metrics",
         "path": str(quality_path),
         "size_mb": round(_get_dir_size_mb(quality_path), 2),

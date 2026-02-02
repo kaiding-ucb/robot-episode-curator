@@ -547,6 +547,7 @@ export function useEpisodeCache() {
  * Types for all caches
  */
 interface CacheInfo {
+  key: string;
   name: string;
   path: string;
   size_mb: number;

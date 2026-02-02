@@ -116,6 +116,7 @@ DATASET_REGISTRY = {
         "size_estimate_gb": 10,
         "downloader_class": LiberoDownloader,
         "requires_auth": False,
+        "modalities": ["rgb", "actions"],
     },
     "egocentric_10k": {
         "name": "Egocentric-10K",
@@ -136,6 +137,7 @@ DATASET_REGISTRY = {
         "repo_id": "genrobot2025/10Kh-RealOmin-OpenData",
         "requires_auth": True,
         "streaming_recommended": True,
+        "modalities": ["rgb", "depth", "imu", "actions"],
     },
     "libero_lerobot": {
         "name": "LIBERO (LeRobot)",

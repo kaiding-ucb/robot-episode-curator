@@ -281,7 +281,7 @@ export default function DataManager({ onClose }: DataManagerProps) {
               {/* Cache List */}
               <div className="space-y-3" data-testid="all-caches-list">
                 {allCaches.caches.map((cache) => {
-                  const cacheKey = cache.name.toLowerCase().replace(/[^a-z]/g, '_');
+                  const cacheKey = cache.key;
                   const isClearing = clearingCache === cacheKey;
                   const sizeDisplay = cache.size_mb >= 1000
                     ? `${(cache.size_mb / 1024).toFixed(1)} GB`

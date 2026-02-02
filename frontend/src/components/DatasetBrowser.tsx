@@ -184,8 +184,8 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
             className="w-full px-4 py-2 flex items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
             data-testid="overview-toggle"
           >
-            <span className="text-sm font-semibold text-gray-500 uppercase tracking-wider">
-              Overview
+            <span className="text-sm font-semibold text-gray-700 dark:text-gray-200 truncate">
+              {selectedDatasetInfo?.name || "Overview"}
             </span>
             <svg
               className={`w-4 h-4 text-gray-400 transition-transform ${overviewExpanded ? "rotate-180" : ""}`}
@@ -435,7 +435,7 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                         selectedDataset,
                         episode.id,
                         episode.num_frames || 0,
-                        selectedDatasetInfo?.modalities
+                        overview?.modalities as Modality[] | undefined
                       )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
                       data-testid={`episode-item-${episode.id}`}
