@@ -218,6 +218,158 @@ async def get_cache_stats():
     )
 
 
+def _get_dir_size_mb(path: Path) -> float:
+    """Get total size of a directory in MB."""
+    if not path.exists():
+        return 0.0
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+    except (PermissionError, OSError):
+        pass
+    return total / (1024 * 1024)
+
+
+@router.get("/cache/all")
+async def get_all_cache_stats():
+    """
+    Get comprehensive statistics for ALL cache locations.
+
+    This includes hidden caches that don't appear in Finder or Mac Storage Management:
+    - Encoded frames cache (JSON files)
+    - Streaming cache (downloaded tar/mp4/mcap files)
+    - Decoded frames cache (pickle files - can be huge!)
+    - HuggingFace hub cache
+    """
+    import os
+    home = Path.home()
+    cache_base = home / ".cache" / "data_viewer"
+    hf_cache = home / ".cache" / "huggingface"
+
+    caches = []
+
+    # Encoded frames cache (what the UI currently shows)
+    encoded_path = cache_base / "frames"
+    caches.append({
+        "name": "Encoded Frames",
+        "path": str(encoded_path),
+        "size_mb": round(_get_dir_size_mb(encoded_path), 2),
+        "description": "WebP-encoded frames for quick loading",
+        "safe_to_clear": True,
+    })
+
+    # Streaming cache (downloaded source files)
+    streaming_path = cache_base / "streaming"
+    # Exclude decoded_frames subdirectory
+    streaming_size = 0.0
+    if streaming_path.exists():
+        for item in streaming_path.iterdir():
+            if item.name != "decoded_frames":
+                if item.is_file():
+                    streaming_size += item.stat().st_size
+                elif item.is_dir():
+                    streaming_size += _get_dir_size_mb(item) * 1024 * 1024
+    caches.append({
+        "name": "Downloaded Episodes",
+        "path": str(streaming_path),
+        "size_mb": round(streaming_size / (1024 * 1024), 2),
+        "description": "Downloaded tar/mp4/mcap files from HuggingFace",
+        "safe_to_clear": True,
+    })
+
+    # Decoded frames cache (THE PROBLEMATIC ONE - can be 100GB+!)
+    decoded_path = cache_base / "streaming" / "decoded_frames"
+    caches.append({
+        "name": "Decoded Frames (WARNING)",
+        "path": str(decoded_path),
+        "size_mb": round(_get_dir_size_mb(decoded_path), 2),
+        "description": "Raw decoded video frames as pickle - CAN BE HUGE!",
+        "safe_to_clear": True,
+    })
+
+    # HuggingFace cache
+    caches.append({
+        "name": "HuggingFace Hub",
+        "path": str(hf_cache),
+        "size_mb": round(_get_dir_size_mb(hf_cache), 2),
+        "description": "HuggingFace model/dataset downloads",
+        "safe_to_clear": True,
+    })
+
+    # Quality cache
+    quality_path = cache_base / "quality"
+    caches.append({
+        "name": "Quality Metrics",
+        "path": str(quality_path),
+        "size_mb": round(_get_dir_size_mb(quality_path), 2),
+        "description": "Computed quality metrics",
+        "safe_to_clear": True,
+    })
+
+    total_mb = sum(c["size_mb"] for c in caches)
+
+    return {
+        "caches": caches,
+        "total_size_mb": round(total_mb, 2),
+        "total_size_gb": round(total_mb / 1024, 2),
+    }
+
+
+@router.delete("/cache/all/{cache_name}")
+async def clear_specific_cache(cache_name: str):
+    """
+    Clear a specific cache by name.
+
+    Valid names: encoded_frames, streaming, decoded_frames, huggingface, quality
+    """
+    import shutil
+    home = Path.home()
+    cache_base = home / ".cache" / "data_viewer"
+
+    cache_paths = {
+        "encoded_frames": cache_base / "frames",
+        "streaming": cache_base / "streaming",
+        "decoded_frames": cache_base / "streaming" / "decoded_frames",
+        "huggingface": home / ".cache" / "huggingface",
+        "quality": cache_base / "quality",
+    }
+
+    if cache_name not in cache_paths:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown cache: {cache_name}. Valid: {list(cache_paths.keys())}"
+        )
+
+    path = cache_paths[cache_name]
+    if not path.exists():
+        return {"message": f"Cache {cache_name} is already empty", "bytes_freed": 0}
+
+    size_before = _get_dir_size_mb(path) * 1024 * 1024
+
+    try:
+        if cache_name == "decoded_frames":
+            # Only clear pickle files, keep directory
+            for f in path.glob("*.pkl"):
+                f.unlink()
+        else:
+            # Clear all contents but keep directory
+            for item in path.iterdir():
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {e}")
+
+    return {
+        "message": f"Cleared {cache_name} cache",
+        "bytes_freed": int(size_before),
+        "mb_freed": round(size_before / (1024 * 1024), 2),
+    }
+
+
 @router.delete("/cache/episodes/{dataset_id}/{episode_id:path}")
 async def delete_episode_cache(dataset_id: str, episode_id: str):
     """
