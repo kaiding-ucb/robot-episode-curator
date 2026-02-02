@@ -112,20 +112,27 @@ export interface IMUData {
   error?: string;
 }
 
+// === ACTIONS DATA TYPES ===
+export interface ActionsData {
+  timestamps: number[];
+  actions: number[][];  // 2D array: [frame][dimension]
+  dimension_labels: string[] | null;
+  error?: string;
+}
+
 // === CACHE MANAGEMENT TYPES ===
 export interface CachedEpisode {
   dataset_id: string;
   episode_id: string;
   size_mb: number;
-  cached_at: string; // ISO timestamp
+  cached_at: number; // Unix timestamp
   batch_count: number;
 }
 
 export interface CacheStats {
   total_size_mb: number;
   episode_count: number;
-  frame_cache_size_mb: number;
-  quality_cache_size_mb: number;
+  batch_count: number;
 }
 
 export interface DeleteCacheResponse {

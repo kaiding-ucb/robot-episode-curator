@@ -562,21 +562,44 @@ async def stream_frames_generator(
     resolution: str,
     quality: int,
     stream: str,
+    is_disconnected: callable = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generate Server-Sent Events for progressive frame streaming.
 
     Yields frames one-by-one as they are decoded, allowing the client
     to display frames before the entire episode is decoded.
+
+    Args:
+        is_disconnected: Optional async callable to check if client disconnected
     """
     extractor = StreamingFrameExtractor(repo_id)
 
+    async def check_disconnected():
+        """Check if client has disconnected."""
+        if is_disconnected:
+            try:
+                return await is_disconnected()
+            except Exception:
+                return False
+        return False
+
     try:
+        # Check for disconnection before heavy work
+        if await check_disconnected():
+            logger.info(f"Client disconnected before download: {file_path}")
+            return
+
         # Download the file first
         local_path = extractor.download_file(file_path)
         suffix = local_path.suffix.lower()
 
         if suffix != '.mcap':
+            # Check for disconnection
+            if await check_disconnected():
+                logger.info(f"Client disconnected before decoding: {file_path}")
+                return
+
             # For non-MCAP files, fall back to batch decoding
             raw_frames, total_frames = extractor.extract_frames_with_count(
                 file_path, start, end, stream=stream
@@ -585,6 +608,11 @@ async def stream_frames_generator(
             yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
 
             for frame_idx, timestamp, image in raw_frames:
+                # Check for disconnection periodically (every 10 frames)
+                if frame_idx % 10 == 0 and await check_disconnected():
+                    logger.info(f"Client disconnected during streaming: {file_path} at frame {frame_idx}")
+                    return
+
                 image_base64 = encode_image_with_options(image, resolution, quality)
                 frame_data = {
                     'type': 'frame',
@@ -597,6 +625,11 @@ async def stream_frames_generator(
                 await asyncio.sleep(0)
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        # Check for disconnection before MCAP processing
+        if await check_disconnected():
+            logger.info(f"Client disconnected before MCAP processing: {file_path}")
             return
 
         # For MCAP files, we can stream frames as they're decoded
@@ -613,6 +646,11 @@ async def stream_frames_generator(
         )
 
         for frame_idx, timestamp, image in raw_frames:
+            # Check for disconnection periodically (every 10 frames)
+            if frame_idx % 10 == 0 and await check_disconnected():
+                logger.info(f"Client disconnected during MCAP streaming: {file_path} at frame {frame_idx}")
+                return
+
             image_base64 = encode_image_with_options(image, resolution, quality)
             frame_data = {
                 'type': 'frame',
@@ -626,6 +664,9 @@ async def stream_frames_generator(
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
+    except GeneratorExit:
+        # Client closed connection
+        logger.info(f"Client closed connection (GeneratorExit): {file_path}")
     except Exception as e:
         logger.error(f"SSE streaming error: {e}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -634,6 +675,7 @@ async def stream_frames_generator(
 @router.get("/{episode_id:path}/frames/stream")
 async def stream_frames(
     episode_id: str,
+    request: Request,
     dataset_id: Optional[str] = Query(None, description="Dataset ID"),
     start: int = Query(0, ge=0),
     end: int = Query(100, ge=1),
@@ -656,6 +698,7 @@ async def stream_frames(
 
     Args:
         episode_id: Episode identifier
+        request: FastAPI Request object for disconnection detection
         dataset_id: Optional dataset ID
         start: Start frame index
         end: End frame index
@@ -672,9 +715,14 @@ async def stream_frames(
             detail="SSE streaming only available for HuggingFace streaming datasets"
         )
 
+    # Create disconnection checker from request
+    async def is_disconnected():
+        return await request.is_disconnected()
+
     return StreamingResponse(
         stream_frames_generator(
-            repo_id, file_path, start, end, resolution, quality, stream
+            repo_id, file_path, start, end, resolution, quality, stream,
+            is_disconnected=is_disconnected
         ),
         media_type="text/event-stream",
         headers={

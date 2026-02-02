@@ -182,7 +182,11 @@ export default function EpisodeViewer({
     );
   }
 
-  if (loading && frames.size === 0) {
+  // Only show full loading screen if we have NO frames at all
+  // If we have previous frames, show them with a loading overlay instead
+  const showFullLoadingScreen = loading && frames.size === 0 && !frameToShow;
+
+  if (showFullLoadingScreen) {
     return (
       <div
         className="flex items-center justify-center h-full text-gray-500"

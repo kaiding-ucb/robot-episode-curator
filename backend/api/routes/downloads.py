@@ -5,6 +5,10 @@ Endpoints:
 - GET /api/downloads/status - Get status of all downloads
 - POST /api/downloads/{dataset_id} - Start download
 - GET /api/downloads/disk-space - Check available disk space
+- GET /api/downloads/cache/episodes - List cached episodes
+- GET /api/downloads/cache/stats - Get cache statistics
+- DELETE /api/downloads/cache/episodes - Clear all cache
+- DELETE /api/downloads/cache/episodes/{dataset_id}/{episode_id} - Delete specific episode cache
 """
 import logging
 from pathlib import Path
@@ -14,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 
 from downloaders.manager import DownloadManager
+from cache import get_encoded_frame_cache
 
 logger = logging.getLogger(__name__)
 
@@ -153,3 +158,91 @@ async def get_disk_space(request: Request):
         used_gb=space.get("used_gb", 0),
         available_gb=space.get("available_gb", 0),
     )
+
+
+# ============================================================================
+# Episode Cache Management
+# ============================================================================
+
+
+class CachedEpisodeResponse(BaseModel):
+    """Information about a cached episode."""
+
+    dataset_id: str
+    episode_id: str
+    size_mb: float
+    cached_at: float
+    batch_count: int
+
+
+class CacheStatsResponse(BaseModel):
+    """Cache statistics."""
+
+    total_size_mb: float
+    episode_count: int
+    batch_count: int
+
+
+@router.get("/cache/episodes", response_model=List[CachedEpisodeResponse])
+async def list_cached_episodes():
+    """
+    List all cached episodes with size and timestamp.
+    """
+    cache = get_encoded_frame_cache()
+    episodes = cache.list_cached_episodes()
+
+    return [
+        CachedEpisodeResponse(
+            dataset_id=ep.dataset_id,
+            episode_id=ep.episode_id,
+            size_mb=ep.size_mb,
+            cached_at=ep.cached_at,
+            batch_count=ep.batch_count,
+        )
+        for ep in episodes
+    ]
+
+
+@router.get("/cache/stats", response_model=CacheStatsResponse)
+async def get_cache_stats():
+    """
+    Get cache statistics (total size, episode count, etc.).
+    """
+    cache = get_encoded_frame_cache()
+    stats = cache.get_cache_stats()
+
+    return CacheStatsResponse(
+        total_size_mb=stats.get("total_size_mb", 0),
+        episode_count=stats.get("episode_count", 0),
+        batch_count=stats.get("batch_count", 0),
+    )
+
+
+@router.delete("/cache/episodes/{dataset_id}/{episode_id:path}")
+async def delete_episode_cache(dataset_id: str, episode_id: str):
+    """
+    Delete cached frames for a specific episode.
+    """
+    cache = get_encoded_frame_cache()
+    bytes_freed = cache.delete_episode_cache(dataset_id, episode_id)
+
+    return {
+        "message": f"Deleted cache for {dataset_id}/{episode_id}",
+        "bytes_freed": bytes_freed,
+        "mb_freed": bytes_freed / (1024 * 1024),
+    }
+
+
+@router.delete("/cache/episodes")
+async def clear_all_cache():
+    """
+    Clear all cached episodes.
+    """
+    cache = get_encoded_frame_cache()
+    bytes_freed = cache.clear_all()
+
+    return {
+        "message": "Cleared all episode cache",
+        "bytes_freed": bytes_freed,
+        "mb_freed": bytes_freed / (1024 * 1024),
+    }

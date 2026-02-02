@@ -43,6 +43,8 @@ export function useStreamingFrames(
   const [error, setError] = useState<string | null>(null);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const prevEpisodeIdRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const { resolution = "low", quality = 70, stream = "rgb", enabled = true } = options;
 
@@ -52,9 +54,15 @@ export function useStreamingFrames(
     : 0;
 
   const cancel = useCallback(() => {
+    // Close SSE connection
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
+    }
+    // Abort any fetch requests
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
     }
     setIsLoading(false);
   }, []);
@@ -70,17 +78,35 @@ export function useStreamingFrames(
   }, []);
 
   useEffect(() => {
+    // Cancel any previous request immediately
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
     if (!episodeId || !datasetId || !enabled) {
       setFrames(new Map());
       setTotalFrames(null);
       setIsComplete(false);
       setError(null);
+      prevEpisodeIdRef.current = null;
       return;
     }
 
-    // Reset state for new request
-    setFrames(new Map());
-    setTotalFrames(null);
+    // Only clear frames when episode changes, NOT when batch (start/end) changes
+    // This keeps the UI responsive during batch transitions
+    const episodeChanged = prevEpisodeIdRef.current !== episodeId;
+    if (episodeChanged) {
+      setFrames(new Map());
+      setTotalFrames(null);
+      prevEpisodeIdRef.current = episodeId;
+    }
+
+    // Reset loading state for new request
     setIsLoading(true);
     setIsComplete(false);
     setError(null);
@@ -153,6 +179,10 @@ export function useStreamingFrames(
       eventSourceRef.current = null;
 
       try {
+        // Create AbortController for the fetch request
+        const abortController = new AbortController();
+        abortControllerRef.current = abortController;
+
         const fallbackParams = new URLSearchParams({
           dataset_id: datasetId,
           start: start.toString(),
@@ -162,7 +192,7 @@ export function useStreamingFrames(
           stream,
         });
         const fallbackUrl = `${API_BASE}/episodes/${episodeId}/frames?${fallbackParams}`;
-        const response = await fetch(fallbackUrl);
+        const response = await fetch(fallbackUrl, { signal: abortController.signal });
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -190,6 +220,10 @@ export function useStreamingFrames(
         setIsLoading(false);
         setIsComplete(true);
       } catch (fallbackError) {
+        // Don't treat abort as an error - it's intentional cancellation
+        if (fallbackError instanceof Error && fallbackError.name === 'AbortError') {
+          return;
+        }
         console.error("Fallback frames fetch failed:", fallbackError);
         setError("Connection error");
         setIsLoading(false);
@@ -199,6 +233,10 @@ export function useStreamingFrames(
     return () => {
       eventSource.close();
       eventSourceRef.current = null;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
     };
   }, [episodeId, datasetId, start, end, resolution, quality, stream, enabled]);
 
