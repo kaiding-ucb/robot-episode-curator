@@ -544,6 +544,78 @@ export function useEpisodeCache() {
 }
 
 /**
+ * Types for all caches
+ */
+interface CacheInfo {
+  name: string;
+  path: string;
+  size_mb: number;
+  description: string;
+  safe_to_clear: boolean;
+}
+
+interface AllCachesStats {
+  caches: CacheInfo[];
+  total_size_mb: number;
+  total_size_gb: number;
+}
+
+/**
+ * Hook for comprehensive cache management (all hidden caches)
+ */
+export function useAllCaches() {
+  const [allCaches, setAllCaches] = useState<AllCachesStats | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState<string | null>(null);
+
+  const fetchAllCaches = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/downloads/cache/all`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAllCaches(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch all caches");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const clearCache = useCallback(async (cacheName: string) => {
+    setClearing(cacheName);
+    try {
+      const res = await fetch(`${API_BASE}/downloads/cache/all/${cacheName}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      // Refresh the list
+      await fetchAllCaches();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to clear cache");
+      return false;
+    } finally {
+      setClearing(null);
+    }
+  }, [fetchAllCaches]);
+
+  return {
+    allCaches,
+    loading,
+    error,
+    clearing,
+    fetchAllCaches,
+    clearCache,
+  };
+}
+
+/**
  * Fetch dataset overview metadata
  */
 export function useDatasetOverview(datasetId: string | null) {

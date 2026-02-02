@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useDownloads, useEpisodeCache } from "@/hooks/useApi";
+import { useDownloads, useEpisodeCache, useAllCaches } from "@/hooks/useApi";
 
 interface DataManagerProps {
   onClose?: () => void;
@@ -18,8 +18,16 @@ export default function DataManager({ onClose }: DataManagerProps) {
     deleteEpisodeCache,
     clearAllCache,
   } = useEpisodeCache();
+  const {
+    allCaches,
+    loading: allCachesLoading,
+    error: allCachesError,
+    clearing: clearingCache,
+    fetchAllCaches,
+    clearCache,
+  } = useAllCaches();
 
-  const [activeTab, setActiveTab] = useState<"datasets" | "cache">("datasets");
+  const [activeTab, setActiveTab] = useState<"datasets" | "cache" | "storage">("datasets");
   const [deletingEpisode, setDeletingEpisode] = useState<string | null>(null);
   const [clearingAll, setClearingAll] = useState(false);
 
@@ -28,7 +36,10 @@ export default function DataManager({ onClose }: DataManagerProps) {
     if (activeTab === "cache") {
       fetchCachedEpisodes();
     }
-  }, [activeTab, fetchCachedEpisodes]);
+    if (activeTab === "storage") {
+      fetchAllCaches();
+    }
+  }, [activeTab, fetchCachedEpisodes, fetchAllCaches]);
 
   const handleDeleteEpisode = async (datasetId: string, episodeId: string) => {
     const key = `${datasetId}/${episodeId}`;
@@ -122,6 +133,22 @@ export default function DataManager({ onClose }: DataManagerProps) {
             </span>
           )}
         </button>
+        <button
+          onClick={() => setActiveTab("storage")}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${
+            activeTab === "storage"
+              ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+              : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+          }`}
+          data-testid="tab-storage"
+        >
+          Storage
+          {allCaches && allCaches.total_size_gb > 1 && (
+            <span className="ml-2 px-2 py-0.5 text-xs bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-300 rounded-full">
+              {allCaches.total_size_gb.toFixed(0)} GB
+            </span>
+          )}
+        </button>
       </div>
 
       {/* Datasets Tab Content */}
@@ -211,6 +238,130 @@ export default function DataManager({ onClose }: DataManagerProps) {
               </div>
             ))}
           </div>
+        </>
+      )}
+
+      {/* Storage Tab Content - All Hidden Caches */}
+      {activeTab === "storage" && (
+        <>
+          {/* Error */}
+          {allCachesError && (
+            <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded-lg">
+              {allCachesError}
+            </div>
+          )}
+
+          {/* Loading */}
+          {allCachesLoading && (
+            <div className="text-center py-8 text-gray-500">
+              Scanning all caches...
+            </div>
+          )}
+
+          {/* All Caches Summary */}
+          {allCaches && (
+            <>
+              <div className="mb-6 p-4 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg" data-testid="storage-summary">
+                <div className="flex items-center gap-2 mb-2">
+                  <svg className="w-5 h-5 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  <h3 className="text-sm font-semibold text-orange-700 dark:text-orange-300">
+                    Hidden Cache Storage
+                  </h3>
+                </div>
+                <p className="text-2xl font-bold text-orange-800 dark:text-orange-200">
+                  {allCaches.total_size_gb.toFixed(1)} GB
+                </p>
+                <p className="text-xs text-orange-600 dark:text-orange-400 mt-1">
+                  These caches are in ~/.cache and don&apos;t appear in Finder
+                </p>
+              </div>
+
+              {/* Cache List */}
+              <div className="space-y-3" data-testid="all-caches-list">
+                {allCaches.caches.map((cache) => {
+                  const cacheKey = cache.name.toLowerCase().replace(/[^a-z]/g, '_');
+                  const isClearing = clearingCache === cacheKey;
+                  const sizeDisplay = cache.size_mb >= 1000
+                    ? `${(cache.size_mb / 1024).toFixed(1)} GB`
+                    : `${cache.size_mb.toFixed(0)} MB`;
+                  const isLarge = cache.size_mb > 1000;
+                  const isWarning = cache.name.includes("WARNING");
+
+                  return (
+                    <div
+                      key={cache.name}
+                      className={`p-4 border rounded-lg ${
+                        isWarning
+                          ? "border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/10"
+                          : isLarge
+                          ? "border-orange-300 dark:border-orange-700 bg-orange-50 dark:bg-orange-900/10"
+                          : "border-gray-200 dark:border-gray-700"
+                      }`}
+                      data-testid={`cache-${cacheKey}`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium text-gray-900 dark:text-white">
+                              {cache.name.replace(" (WARNING)", "")}
+                            </p>
+                            {isWarning && (
+                              <span className="px-1.5 py-0.5 text-xs bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 rounded">
+                                Danger
+                              </span>
+                            )}
+                            {isLarge && !isWarning && (
+                              <span className="px-1.5 py-0.5 text-xs bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300 rounded">
+                                Large
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-500 mt-0.5">{cache.description}</p>
+                          <p className="text-xs text-gray-400 mt-1 truncate" title={cache.path}>
+                            {cache.path}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className={`text-sm font-semibold ${
+                            isLarge ? "text-orange-600 dark:text-orange-400" : "text-gray-600 dark:text-gray-400"
+                          }`}>
+                            {sizeDisplay}
+                          </span>
+                          {cache.size_mb > 0 && (
+                            <button
+                              onClick={() => clearCache(cacheKey)}
+                              disabled={isClearing}
+                              className={`px-3 py-1.5 text-xs rounded transition-colors disabled:opacity-50 ${
+                                isWarning || isLarge
+                                  ? "bg-red-500 text-white hover:bg-red-600"
+                                  : "bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600"
+                              }`}
+                              data-testid={`clear-${cacheKey}`}
+                            >
+                              {isClearing ? "Clearing..." : "Clear"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Refresh Button */}
+              <div className="mt-4 text-center">
+                <button
+                  onClick={fetchAllCaches}
+                  disabled={allCachesLoading}
+                  className="text-sm text-blue-500 hover:text-blue-700 disabled:opacity-50"
+                >
+                  Refresh
+                </button>
+              </div>
+            </>
+          )}
         </>
       )}
 
