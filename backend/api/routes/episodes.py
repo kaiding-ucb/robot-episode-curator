@@ -563,6 +563,7 @@ async def stream_frames_generator(
     quality: int,
     stream: str,
     is_disconnected: callable = None,
+    dataset_id: str = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generate Server-Sent Events for progressive frame streaming.
@@ -570,13 +571,22 @@ async def stream_frames_generator(
     Yields frames one-by-one as they are decoded, allowing the client
     to display frames before the entire episode is decoded.
 
+    Also caches frames after streaming completes so they appear in "Cached Episodes".
+
     Args:
         is_disconnected: Optional async callable to check if client disconnected
+        dataset_id: Dataset ID for caching
     """
     import concurrent.futures
 
     extractor = StreamingFrameExtractor(repo_id)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    # Collect frames for caching
+    frames_for_cache = []
+    total_frames_count = 0
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
     loop = asyncio.get_event_loop()
 
     async def check_disconnected():
@@ -633,6 +643,7 @@ async def stream_frames_generator(
                 return  # Client disconnected during extraction
             raw_frames, total_frames = result
 
+            total_frames_count = total_frames
             yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
 
             for frame_idx, timestamp, image in raw_frames:
@@ -648,9 +659,35 @@ async def stream_frames_generator(
                     'timestamp': timestamp,
                     'data': image_base64,
                 }
+                # Collect for caching
+                frames_for_cache.append({
+                    "frame_idx": frame_idx,
+                    "timestamp": timestamp,
+                    "image_base64": image_base64,
+                    "action": None,
+                })
                 yield f"data: {json.dumps(frame_data)}\n\n"
                 # Allow other tasks to run
                 await asyncio.sleep(0)
+
+            # Cache frames after successful streaming
+            if frames_for_cache:
+                cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+                episode_key = cache.get_episode_cache_key(
+                    effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+                )
+                cache.store_episode_frames(
+                    episode_key,
+                    frames_for_cache,
+                    total_frames_count,
+                    {
+                        "dataset_id": effective_dataset_id,
+                        "episode_id": file_path,
+                        "resolution": resolution,
+                        "quality": quality,
+                    },
+                )
+                logger.info(f"Cached {len(frames_for_cache)} frames from SSE streaming: {file_path}")
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
@@ -665,6 +702,7 @@ async def stream_frames_generator(
         total_frames = await run_in_thread(extractor.get_frame_count, file_path)
         if total_frames is None:
             return  # Client disconnected
+        total_frames_count = total_frames
         yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
 
         # Extract frames progressively (in thread pool)
@@ -691,9 +729,35 @@ async def stream_frames_generator(
                 'timestamp': timestamp,
                 'data': image_base64,
             }
+            # Collect for caching
+            frames_for_cache.append({
+                "frame_idx": frame_idx,
+                "timestamp": timestamp,
+                "image_base64": image_base64,
+                "action": None,
+            })
             yield f"data: {json.dumps(frame_data)}\n\n"
             # Allow other tasks to run
             await asyncio.sleep(0)
+
+        # Cache frames after successful streaming
+        if frames_for_cache:
+            cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+            episode_key = cache.get_episode_cache_key(
+                effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+            )
+            cache.store_episode_frames(
+                episode_key,
+                frames_for_cache,
+                total_frames_count,
+                {
+                    "dataset_id": effective_dataset_id,
+                    "episode_id": file_path,
+                    "resolution": resolution,
+                    "quality": quality,
+                },
+            )
+            logger.info(f"Cached {len(frames_for_cache)} MCAP frames from SSE streaming: {file_path}")
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -758,7 +822,8 @@ async def stream_frames(
     return StreamingResponse(
         stream_frames_generator(
             repo_id, file_path, start, end, resolution, quality, stream,
-            is_disconnected=is_disconnected
+            is_disconnected=is_disconnected,
+            dataset_id=dataset_id,
         ),
         media_type="text/event-stream",
         headers={
