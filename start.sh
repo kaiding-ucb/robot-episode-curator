@@ -12,11 +12,11 @@ NC='\033[0m' # No Color
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Start backend
-echo -e "${BLUE}Starting Backend (FastAPI)...${NC}"
+# Start backend with multiple workers (prevents one stuck request from blocking all others)
+echo -e "${BLUE}Starting Backend (FastAPI with 4 workers)...${NC}"
 cd "$SCRIPT_DIR/backend"
 source "$SCRIPT_DIR/.venv/bin/activate"
-uvicorn api.main:app --reload --port 8000 &
+gunicorn api.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 300 &
 BACKEND_PID=$!
 echo "Backend PID: $BACKEND_PID"
 
