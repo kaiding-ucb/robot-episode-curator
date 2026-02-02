@@ -670,15 +670,27 @@ async def stream_frames_generator(
                 # Allow other tasks to run
                 await asyncio.sleep(0)
 
-            # Cache frames after successful streaming
+            # Cache frames after successful streaming - MERGE with existing cache
             if frames_for_cache:
                 cache_key_suffix = f":{stream}" if stream != "rgb" else ""
                 episode_key = cache.get_episode_cache_key(
                     effective_dataset_id, file_path + cache_key_suffix, resolution, quality
                 )
+                # Load existing cached frames and merge
+                existing = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+                if existing:
+                    # Merge: create dict by frame_idx, update with new frames
+                    frames_dict = {f["frame_idx"]: f for f in existing["frames"]}
+                    for f in frames_for_cache:
+                        frames_dict[f["frame_idx"]] = f
+                    # Sort by frame_idx
+                    merged_frames = sorted(frames_dict.values(), key=lambda x: x["frame_idx"])
+                    logger.info(f"Merged cache: {len(existing['frames'])} existing + {len(frames_for_cache)} new = {len(merged_frames)} total")
+                else:
+                    merged_frames = frames_for_cache
                 cache.store_episode_frames(
                     episode_key,
-                    frames_for_cache,
+                    merged_frames,
                     total_frames_count,
                     {
                         "dataset_id": effective_dataset_id,
@@ -687,7 +699,7 @@ async def stream_frames_generator(
                         "quality": quality,
                     },
                 )
-                logger.info(f"Cached {len(frames_for_cache)} frames from SSE streaming: {file_path}")
+                logger.info(f"Cached {len(merged_frames)} frames from SSE streaming: {file_path}")
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
@@ -740,15 +752,27 @@ async def stream_frames_generator(
             # Allow other tasks to run
             await asyncio.sleep(0)
 
-        # Cache frames after successful streaming
+        # Cache frames after successful streaming - MERGE with existing cache
         if frames_for_cache:
             cache_key_suffix = f":{stream}" if stream != "rgb" else ""
             episode_key = cache.get_episode_cache_key(
                 effective_dataset_id, file_path + cache_key_suffix, resolution, quality
             )
+            # Load existing cached frames and merge
+            existing = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+            if existing:
+                # Merge: create dict by frame_idx, update with new frames
+                frames_dict = {f["frame_idx"]: f for f in existing["frames"]}
+                for f in frames_for_cache:
+                    frames_dict[f["frame_idx"]] = f
+                # Sort by frame_idx
+                merged_frames = sorted(frames_dict.values(), key=lambda x: x["frame_idx"])
+                logger.info(f"Merged MCAP cache: {len(existing['frames'])} existing + {len(frames_for_cache)} new = {len(merged_frames)} total")
+            else:
+                merged_frames = frames_for_cache
             cache.store_episode_frames(
                 episode_key,
-                frames_for_cache,
+                merged_frames,
                 total_frames_count,
                 {
                     "dataset_id": effective_dataset_id,
@@ -757,7 +781,7 @@ async def stream_frames_generator(
                     "quality": quality,
                 },
             )
-            logger.info(f"Cached {len(frames_for_cache)} MCAP frames from SSE streaming: {file_path}")
+            logger.info(f"Cached {len(merged_frames)} MCAP frames from SSE streaming: {file_path}")
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -858,16 +882,24 @@ async def stream_frames(
 
     cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
     if cached_episode:
-        logger.info(f"SSE serving from cache: {file_path} ({len(cached_episode['frames'])} frames)")
-        return StreamingResponse(
-            serve_cached_frames_as_sse(cached_episode, start, end, file_path),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
+        cached_frame_count = len(cached_episode['frames'])
+        # Only serve from cache if we have enough frames for the requested range
+        # Cache must have frames up to at least 'end' (or all frames if end > total)
+        has_enough_frames = cached_frame_count >= end or cached_frame_count >= cached_episode.get('total', 0)
+
+        if has_enough_frames and start < cached_frame_count:
+            logger.info(f"SSE serving from cache: {file_path} ({cached_frame_count} frames, requested {start}-{end})")
+            return StreamingResponse(
+                serve_cached_frames_as_sse(cached_episode, start, end, file_path),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+        else:
+            logger.info(f"Cache incomplete for {file_path}: have {cached_frame_count} frames, need up to {end}")
 
     # Not cached - stream and cache as we go
     # Create disconnection checker from request
