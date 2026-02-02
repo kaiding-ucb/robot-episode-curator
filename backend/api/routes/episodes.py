@@ -573,7 +573,11 @@ async def stream_frames_generator(
     Args:
         is_disconnected: Optional async callable to check if client disconnected
     """
+    import concurrent.futures
+
     extractor = StreamingFrameExtractor(repo_id)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
 
     async def check_disconnected():
         """Check if client has disconnected."""
@@ -584,14 +588,34 @@ async def stream_frames_generator(
                 return False
         return False
 
+    async def run_in_thread(func, *args, **kwargs):
+        """Run blocking function in thread pool with disconnection checking."""
+        future = loop.run_in_executor(executor, lambda: func(*args, **kwargs))
+
+        # Poll for completion while checking for disconnection
+        while not future.done():
+            if await check_disconnected():
+                future.cancel()
+                logger.info(f"Cancelled blocking operation due to client disconnect: {file_path}")
+                return None
+            try:
+                # Wait a short time for the future
+                return await asyncio.wait_for(asyncio.shield(future), timeout=0.5)
+            except asyncio.TimeoutError:
+                # Future not done yet, loop and check disconnection again
+                continue
+        return future.result()
+
     try:
         # Check for disconnection before heavy work
         if await check_disconnected():
             logger.info(f"Client disconnected before download: {file_path}")
             return
 
-        # Download the file first
-        local_path = extractor.download_file(file_path)
+        # Download the file in thread pool (allows disconnection checking)
+        local_path = await run_in_thread(extractor.download_file, file_path)
+        if local_path is None:
+            return  # Client disconnected during download
         suffix = local_path.suffix.lower()
 
         if suffix != '.mcap':
@@ -600,10 +624,14 @@ async def stream_frames_generator(
                 logger.info(f"Client disconnected before decoding: {file_path}")
                 return
 
-            # For non-MCAP files, fall back to batch decoding
-            raw_frames, total_frames = extractor.extract_frames_with_count(
+            # For non-MCAP files, fall back to batch decoding (in thread pool)
+            result = await run_in_thread(
+                extractor.extract_frames_with_count,
                 file_path, start, end, stream=stream
             )
+            if result is None:
+                return  # Client disconnected during extraction
+            raw_frames, total_frames = result
 
             yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
 
@@ -633,17 +661,22 @@ async def stream_frames_generator(
             return
 
         # For MCAP files, we can stream frames as they're decoded
-        # First, get total frame count
-        total_frames = extractor.get_frame_count(file_path)
+        # First, get total frame count (in thread pool)
+        total_frames = await run_in_thread(extractor.get_frame_count, file_path)
+        if total_frames is None:
+            return  # Client disconnected
         yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
 
-        # Extract frames progressively
+        # Extract frames progressively (in thread pool)
         # For H.264, we still need to decode from the beginning, but we can yield as we go
-        raw_frames = extractor.extract_frames_from_mcap(
+        raw_frames = await run_in_thread(
+            extractor.extract_frames_from_mcap,
             local_path, start, end,
             episode_path=file_path,
             stream=stream
         )
+        if raw_frames is None:
+            return  # Client disconnected during extraction
 
         for frame_idx, timestamp, image in raw_frames:
             # Check for disconnection periodically (every 10 frames)
@@ -670,6 +703,9 @@ async def stream_frames_generator(
     except Exception as e:
         logger.error(f"SSE streaming error: {e}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    finally:
+        # Clean up executor
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 @router.get("/{episode_id:path}/frames/stream")
