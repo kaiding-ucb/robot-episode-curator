@@ -83,44 +83,18 @@ async def health():
 # Exception handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    origin = request.headers.get("origin", "")
-    allowed_origins = [
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:3001", "http://127.0.0.1:3001",
-        "http://localhost:3002", "http://127.0.0.1:3002",
-    ]
-    cors_headers = {}
-    if origin in allowed_origins:
-        cors_headers = {
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
-        }
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers=cors_headers,
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    origin = request.headers.get("origin", "")
-    allowed_origins = [
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:3001", "http://127.0.0.1:3001",
-        "http://localhost:3002", "http://127.0.0.1:3002",
-    ]
-    cors_headers = {}
-    if origin in allowed_origins:
-        cors_headers = {
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
-        }
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
-        headers=cors_headers,
+        content={"detail": "Internal server error"},
     )
 
 
