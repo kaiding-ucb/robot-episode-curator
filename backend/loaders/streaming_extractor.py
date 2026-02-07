@@ -179,6 +179,62 @@ def _save_persistent_frame_cache(repo_id: str, episode_path: str, frames: List) 
         return False
 
 
+def cleanup_decoded_frames(repo_id: str, episode_path: str, stream: str = "rgb") -> bool:
+    """
+    Delete decoded frame pickle files after WebP encoding completes.
+
+    Called automatically after an episode is fully cached to free storage.
+    Decoded frames are intermediate data that can always be regenerated
+    from the source files if needed.
+
+    Args:
+        repo_id: HuggingFace repository ID
+        episode_path: Path to the episode file
+        stream: Stream type (rgb or depth)
+
+    Returns:
+        True if cleanup was successful or file didn't exist
+    """
+    cache_key = f"{episode_path}:{stream}" if stream != "rgb" else episode_path
+    cache_path = _get_frame_cache_path(repo_id, cache_key)
+
+    if cache_path.exists():
+        try:
+            size_mb = cache_path.stat().st_size / (1024 * 1024)
+            cache_path.unlink()
+            logger.info(f"Cleaned up decoded frames ({size_mb:.1f} MB): {episode_path}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to cleanup decoded frames: {e}")
+            return False
+    return True
+
+
+def cleanup_all_decoded_frames() -> dict:
+    """
+    Delete ALL decoded frame pickle files.
+
+    Useful for storage management - decoded frames are intermediate
+    and can always be regenerated from source files.
+
+    Returns:
+        Dict with files_deleted and bytes_freed
+    """
+    count = 0
+    bytes_freed = 0
+
+    for pkl_file in FRAME_CACHE_DIR.glob("*.pkl"):
+        try:
+            bytes_freed += pkl_file.stat().st_size
+            pkl_file.unlink()
+            count += 1
+        except Exception:
+            pass
+
+    logger.info(f"Cleaned up {count} decoded frame files ({bytes_freed / 1024 / 1024:.1f} MB)")
+    return {"files_deleted": count, "bytes_freed": bytes_freed}
+
+
 class StreamingFrameExtractor:
     """
     Extracts frames from streaming HuggingFace datasets.
@@ -279,7 +335,8 @@ class StreamingFrameExtractor:
         camera_topic: str = "/robot0/sensor/camera0/compressed",
         episode_path: str = None,
         stream: str = "rgb",
-        depth_colormap: str = "viridis"
+        depth_colormap: str = "viridis",
+        force_full_extraction: bool = False
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an MCAP file.
@@ -310,7 +367,8 @@ class StreamingFrameExtractor:
                 return cached_frames[start:end]
             # If cache has frames covering the requested start, return what we have
             # This handles partial decode scenarios where decode stops early
-            if len(cached_frames) > start:
+            # BUT skip this for force_full_extraction (background caching needs ALL frames)
+            if len(cached_frames) > start and not force_full_extraction:
                 actual_end = min(end, len(cached_frames))
                 logger.info(f"Cache partial hit: returning frames {start}-{actual_end} of {len(cached_frames)} cached for {file_path}")
                 return cached_frames[start:actual_end]
@@ -333,7 +391,8 @@ class StreamingFrameExtractor:
                     logger.info(f"Loaded from persistent cache for {file_path}:{stream} (range {start}-{end})")
                     return persistent_frames[start:end]
                 # Return partial frames if they cover the requested start
-                if len(persistent_frames) > start:
+                # BUT skip this for force_full_extraction (background caching needs ALL frames)
+                if len(persistent_frames) > start and not force_full_extraction:
                     actual_end = min(end, len(persistent_frames))
                     logger.info(f"Persistent cache partial hit: returning frames {start}-{actual_end} of {len(persistent_frames)} cached")
                     return persistent_frames[start:actual_end]
@@ -738,7 +797,8 @@ class StreamingFrameExtractor:
         start: int = 0,
         end: int = 10,
         stream: str = "rgb",
-        depth_colormap: str = "viridis"
+        depth_colormap: str = "viridis",
+        force_full_extraction: bool = False
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an episode file (auto-detects format).
@@ -752,6 +812,7 @@ class StreamingFrameExtractor:
             end: End frame index
             stream: Which stream to extract: "rgb" or "depth"
             depth_colormap: Colormap for depth visualization
+            force_full_extraction: If True, bypass partial cache returns (for background caching)
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
@@ -767,7 +828,8 @@ class StreamingFrameExtractor:
                 local_path, start, end,
                 episode_path=episode_path,
                 stream=stream,
-                depth_colormap=depth_colormap
+                depth_colormap=depth_colormap,
+                force_full_extraction=force_full_extraction
             )
         elif suffix == '.tar':
             return self.extract_frames_from_tar(local_path, start, end)

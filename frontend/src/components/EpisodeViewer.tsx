@@ -31,6 +31,14 @@ export default function EpisodeViewer({
   const [activeStream, setActiveStream] = useState<"rgb" | "depth">("rgb");
   const [activeChartTab, setActiveChartTab] = useState<"none" | "actions" | "imu">("none");
 
+  // Background caching status
+  const [cachingStatus, setCachingStatus] = useState<{
+    status: "not_cached" | "caching" | "cached" | "not_applicable" | "started" | null;
+    progress?: number;
+    totalFrames?: number;
+  }>({ status: null });
+  const cachingTriggeredRef = useRef(false);
+
   // Check available modalities
   const hasDepth = availableModalities.includes("depth");
   const hasImu = availableModalities.includes("imu");
@@ -42,6 +50,113 @@ export default function EpisodeViewer({
     quality: 30,        // Low quality for speed
     stream: activeStream,
   }), [activeStream]);
+
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+
+  // Trigger background caching when play is clicked
+  const triggerBackgroundCaching = useCallback(async () => {
+    if (!episodeId || !datasetId || cachingTriggeredRef.current) return;
+    // Don't trigger if already cached, caching, or not applicable
+    if (cachingStatus.status === "cached" || cachingStatus.status === "caching" ||
+        cachingStatus.status === "started" || cachingStatus.status === "not_applicable") return;
+
+    cachingTriggeredRef.current = true;
+
+    try {
+      const params = new URLSearchParams({
+        dataset_id: datasetId,
+        resolution: streamingOptions.resolution || "low",
+        quality: String(streamingOptions.quality || 70),
+        stream: activeStream,
+      });
+
+      const res = await fetch(
+        `${API_BASE}/episodes/${encodeURIComponent(episodeId)}/cache?${params}`,
+        { method: "POST" }
+      );
+      const data = await res.json();
+      setCachingStatus({
+        status: data.status === "started" ? "caching" : data.status,
+        progress: data.progress,
+        totalFrames: data.total_frames,
+      });
+    } catch (err) {
+      console.error("Failed to trigger background caching:", err);
+    }
+  }, [episodeId, datasetId, cachingStatus.status, streamingOptions, activeStream, API_BASE]);
+
+  // Check caching status when episode loads (to resume showing progress for ongoing caching)
+  useEffect(() => {
+    if (!episodeId || !datasetId) return;
+
+    const checkInitialStatus = async () => {
+      try {
+        const params = new URLSearchParams({
+          dataset_id: datasetId,
+          resolution: streamingOptions.resolution || "low",
+          quality: String(streamingOptions.quality || 70),
+          stream: activeStream,
+        });
+
+        const res = await fetch(
+          `${API_BASE}/episodes/${encodeURIComponent(episodeId)}/cache/status?${params}`
+        );
+        const data = await res.json();
+        setCachingStatus({
+          status: data.status,
+          progress: data.progress,
+          totalFrames: data.total_frames,
+        });
+        // If already caching, don't trigger again
+        if (data.status === "caching" || data.status === "cached") {
+          cachingTriggeredRef.current = true;
+        } else {
+          cachingTriggeredRef.current = false;
+        }
+      } catch (err) {
+        console.error("Failed to check initial caching status:", err);
+        setCachingStatus({ status: null });
+        cachingTriggeredRef.current = false;
+      }
+    };
+
+    checkInitialStatus();
+  }, [episodeId, datasetId, streamingOptions, activeStream, API_BASE]);
+
+  // Poll caching status while caching is in progress
+  useEffect(() => {
+    if (!episodeId || !datasetId) return;
+    // Poll when status is "caching" or "started" (which means caching just began)
+    if (cachingStatus.status !== "caching" && cachingStatus.status !== "started") return;
+
+    const pollStatus = async () => {
+      try {
+        const params = new URLSearchParams({
+          dataset_id: datasetId,
+          resolution: streamingOptions.resolution || "low",
+          quality: String(streamingOptions.quality || 70),
+          stream: activeStream,
+        });
+
+        const res = await fetch(
+          `${API_BASE}/episodes/${encodeURIComponent(episodeId)}/cache/status?${params}`
+        );
+        const data = await res.json();
+        setCachingStatus({
+          status: data.status,
+          progress: data.progress,
+          totalFrames: data.total_frames,
+        });
+      } catch (err) {
+        console.error("Failed to poll caching status:", err);
+      }
+    };
+
+    // Poll immediately, then every 2 seconds
+    pollStatus();
+    const interval = setInterval(pollStatus, 2000);
+    return () => clearInterval(interval);
+  }, [episodeId, datasetId, cachingStatus.status, streamingOptions, activeStream, API_BASE]);
 
   // Use SSE streaming for progressive frame loading
   // Frames appear as they're decoded (~2-3s for first frame) rather than waiting for full batch
@@ -153,8 +268,14 @@ export default function EpisodeViewer({
   }, [onFrameChange]);
 
   const togglePlayback = useCallback(() => {
-    setPlaying((prev) => !prev);
-  }, []);
+    setPlaying((prev) => {
+      // Trigger background caching when starting playback
+      if (!prev) {
+        triggerBackgroundCaching();
+      }
+      return !prev;
+    });
+  }, [triggerBackgroundCaching]);
 
   if (!episodeId) {
     return (
@@ -242,6 +363,25 @@ export default function EpisodeViewer({
               />
             </div>
             <span>{Math.round(progress * 100)}%</span>
+          </div>
+        )}
+
+        {/* Caching status indicator */}
+        {(cachingStatus.status === "caching" || cachingStatus.status === "started") && (
+          <div
+            className="absolute top-2 left-1/2 -translate-x-1/2 bg-blue-500/90 text-white text-xs px-3 py-1 rounded-full flex items-center gap-2"
+            data-testid="caching-indicator"
+          >
+            <div className="animate-spin w-3 h-3 border border-white border-t-transparent rounded-full" />
+            <span>Caching... {cachingStatus.progress || 0}%</span>
+          </div>
+        )}
+        {cachingStatus.status === "cached" && (
+          <div
+            className="absolute top-2 left-1/2 -translate-x-1/2 bg-green-500/90 text-white text-xs px-3 py-1 rounded-full"
+            data-testid="cached-indicator"
+          >
+            Cached
           </div>
         )}
 

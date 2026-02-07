@@ -581,7 +581,11 @@ class EncodedFrameCache:
 
     def list_cached_episodes(self) -> list:
         """
-        Return all cached episodes with size and timestamp.
+        Return all FULLY cached episodes with size and timestamp.
+
+        Only returns episodes where full_episode=True in the cache file,
+        meaning ALL frames have been encoded and cached. Partial caches
+        are not included.
 
         Returns:
             List of CachedEpisodeInfo objects
@@ -606,28 +610,34 @@ class EncodedFrameCache:
                 # Restore original episode_id from safe name
                 episode_id = episode_dir.name.replace("__", "/")
 
-                # Calculate total size and get latest timestamp
+                # Look for a cache file with full_episode=True
                 total_size = 0
                 latest_timestamp = 0
-                batch_count = 0
+                full_episode_found = False
 
                 for cache_file in episode_dir.glob("*.json"):
                     try:
                         stat = cache_file.stat()
                         total_size += stat.st_size
                         latest_timestamp = max(latest_timestamp, stat.st_mtime)
-                        batch_count += 1
+
+                        # Check if this cache file has full_episode flag
+                        with open(cache_file, "r") as f:
+                            data = json.load(f)
+                            if data.get("full_episode", False):
+                                full_episode_found = True
                     except Exception:
                         continue
 
-                if batch_count > 0:
+                # Only include episodes that are fully cached
+                if full_episode_found:
                     episodes.append(
                         CachedEpisodeInfo(
                             dataset_id=dataset_id,
                             episode_id=episode_id,
                             size_bytes=total_size,
                             cached_at=latest_timestamp,
-                            batch_count=batch_count,
+                            batch_count=1,  # Now represents "full episode cached"
                         )
                     )
 

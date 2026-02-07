@@ -2,7 +2,7 @@
 
 import { useState, useCallback } from "react";
 import type { Dataset, EpisodeMetadata, Task, DatasetOverview, Modality } from "@/types/api";
-import { useDatasets, useTasks, useTaskEpisodes, useDatasetOverview } from "@/hooks/useApi";
+import { useDatasets, useTasks, useTaskEpisodes, useDatasetOverview, removeDataset } from "@/hooks/useApi";
 import AddDatasetDialog from "./AddDatasetDialog";
 
 // Badge component for metadata display
@@ -56,6 +56,8 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [overviewExpanded, setOverviewExpanded] = useState(true);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [removingDataset, setRemovingDataset] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
   const { overview, loading: loadingOverview, error: overviewError, refresh: refreshOverview } = useDatasetOverview(selectedDataset);
   const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError } = useTasks(selectedDataset);
@@ -77,6 +79,25 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
   const handleDatasetAdded = useCallback(() => {
     refetchDatasets?.();
   }, [refetchDatasets]);
+
+  const handleRemoveDataset = useCallback(async (e: React.MouseEvent, datasetId: string) => {
+    e.stopPropagation(); // Prevent selecting the dataset
+    setRemoveError(null);
+    setRemovingDataset(datasetId);
+    try {
+      await removeDataset(datasetId);
+      // Clear selection if removing the selected dataset
+      if (selectedDataset === datasetId) {
+        setSelectedDataset(null);
+        setSelectedTask(null);
+      }
+      refetchDatasets?.();
+    } catch (err) {
+      setRemoveError(err instanceof Error ? err.message : "Failed to remove dataset");
+    } finally {
+      setRemovingDataset(null);
+    }
+  }, [selectedDataset, refetchDatasets]);
 
   if (loadingDatasets) {
     return (
@@ -120,9 +141,23 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
             </svg>
           </button>
         </h2>
+        {/* Remove error message */}
+        {removeError && (
+          <div className="mx-4 mb-2 px-3 py-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded text-sm text-red-700 dark:text-red-300 flex items-center justify-between">
+            <span>{removeError}</span>
+            <button
+              onClick={() => setRemoveError(null)}
+              className="ml-2 text-red-500 hover:text-red-700"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        )}
         <ul className="divide-y divide-gray-100 dark:divide-gray-800">
           {datasets.map((dataset) => (
-            <li key={dataset.id}>
+            <li key={dataset.id} className="group relative">
               <button
                 onClick={() => handleSelectDataset(dataset.id)}
                 className={`w-full px-4 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors ${
@@ -133,8 +168,8 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                 data-testid={`dataset-item-${dataset.id}`}
               >
                 <div className="flex items-center justify-between">
-                  <div>
-                    <p className="font-medium text-gray-900 dark:text-white">
+                  <div className="flex-1 min-w-0 pr-2">
+                    <p className="font-medium text-gray-900 dark:text-white truncate">
                       {dataset.name}
                     </p>
                     <p className="text-sm text-gray-500">
@@ -160,7 +195,7 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                     )}
                   </div>
                   <span
-                    className={`px-2 py-1 text-xs rounded-full ${
+                    className={`px-2 py-1 text-xs rounded-full flex-shrink-0 ${
                       dataset.type === "teleop"
                         ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
                         : "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
@@ -169,6 +204,25 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
                     {dataset.type}
                   </span>
                 </div>
+              </button>
+              {/* Remove button - appears on hover */}
+              <button
+                onClick={(e) => handleRemoveDataset(e, dataset.id)}
+                disabled={removingDataset === dataset.id}
+                className="absolute right-2 top-2 p-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded"
+                title="Remove dataset"
+                data-testid={`remove-dataset-${dataset.id}`}
+              >
+                {removingDataset === dataset.id ? (
+                  <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                )}
               </button>
             </li>
           ))}

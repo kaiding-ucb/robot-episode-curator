@@ -22,12 +22,17 @@ from pydantic import BaseModel
 
 from downloaders.manager import DATASET_REGISTRY, get_all_datasets
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
-from loaders.streaming_extractor import StreamingFrameExtractor
+from loaders.streaming_extractor import StreamingFrameExtractor, cleanup_decoded_frames
 from cache import get_encoded_frame_cache
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Background caching state - tracks which episodes are being cached
+# and their progress (0-100%)
+_caching_tasks: Dict[str, asyncio.Task] = {}
+_caching_progress: Dict[str, Dict[str, Any]] = {}  # {key: {progress: 0-100, status: str, total_frames: int}}
 
 
 class EpisodeDetail(BaseModel):
@@ -670,36 +675,8 @@ async def stream_frames_generator(
                 # Allow other tasks to run
                 await asyncio.sleep(0)
 
-            # Cache frames after successful streaming - MERGE with existing cache
-            if frames_for_cache:
-                cache_key_suffix = f":{stream}" if stream != "rgb" else ""
-                episode_key = cache.get_episode_cache_key(
-                    effective_dataset_id, file_path + cache_key_suffix, resolution, quality
-                )
-                # Load existing cached frames and merge
-                existing = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
-                if existing:
-                    # Merge: create dict by frame_idx, update with new frames
-                    frames_dict = {f["frame_idx"]: f for f in existing["frames"]}
-                    for f in frames_for_cache:
-                        frames_dict[f["frame_idx"]] = f
-                    # Sort by frame_idx
-                    merged_frames = sorted(frames_dict.values(), key=lambda x: x["frame_idx"])
-                    logger.info(f"Merged cache: {len(existing['frames'])} existing + {len(frames_for_cache)} new = {len(merged_frames)} total")
-                else:
-                    merged_frames = frames_for_cache
-                cache.store_episode_frames(
-                    episode_key,
-                    merged_frames,
-                    total_frames_count,
-                    {
-                        "dataset_id": effective_dataset_id,
-                        "episode_id": file_path,
-                        "resolution": resolution,
-                        "quality": quality,
-                    },
-                )
-                logger.info(f"Cached {len(merged_frames)} frames from SSE streaming: {file_path}")
+            # NOTE: No partial caching here - full episode caching is handled
+            # by the background caching endpoint POST /episodes/{id}/cache
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
@@ -752,36 +729,8 @@ async def stream_frames_generator(
             # Allow other tasks to run
             await asyncio.sleep(0)
 
-        # Cache frames after successful streaming - MERGE with existing cache
-        if frames_for_cache:
-            cache_key_suffix = f":{stream}" if stream != "rgb" else ""
-            episode_key = cache.get_episode_cache_key(
-                effective_dataset_id, file_path + cache_key_suffix, resolution, quality
-            )
-            # Load existing cached frames and merge
-            existing = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
-            if existing:
-                # Merge: create dict by frame_idx, update with new frames
-                frames_dict = {f["frame_idx"]: f for f in existing["frames"]}
-                for f in frames_for_cache:
-                    frames_dict[f["frame_idx"]] = f
-                # Sort by frame_idx
-                merged_frames = sorted(frames_dict.values(), key=lambda x: x["frame_idx"])
-                logger.info(f"Merged MCAP cache: {len(existing['frames'])} existing + {len(frames_for_cache)} new = {len(merged_frames)} total")
-            else:
-                merged_frames = frames_for_cache
-            cache.store_episode_frames(
-                episode_key,
-                merged_frames,
-                total_frames_count,
-                {
-                    "dataset_id": effective_dataset_id,
-                    "episode_id": file_path,
-                    "resolution": resolution,
-                    "quality": quality,
-                },
-            )
-            logger.info(f"Cached {len(merged_frames)} MCAP frames from SSE streaming: {file_path}")
+        # NOTE: No partial caching here - full episode caching is handled
+        # by the background caching endpoint POST /episodes/{id}/cache
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -1072,6 +1021,226 @@ async def get_actions_data(
     except Exception as e:
         logger.error(f"Failed to load actions from episode: {e}")
         return ActionsData(error=str(e))
+
+
+# =============================================================================
+# Background Caching Endpoints
+# =============================================================================
+
+
+class CachingStatusResponse(BaseModel):
+    """Response for caching status endpoint."""
+    status: str  # "not_cached" | "caching" | "cached" | "error" | "not_applicable"
+    progress: Optional[int] = None  # 0-100 when caching
+    total_frames: Optional[int] = None
+    error: Optional[str] = None
+
+
+@router.post("/{episode_id:path}/cache")
+async def start_background_caching(
+    episode_id: str,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID"),
+    resolution: str = Query("low", description="Image resolution"),
+    quality: int = Query(70, ge=10, le=100, description="WebP quality"),
+    stream: str = Query("rgb", description="Stream: rgb or depth"),
+) -> CachingStatusResponse:
+    """
+    Start caching an entire episode in the background.
+
+    Called when user starts playback. Returns immediately while
+    caching proceeds in background. If episode is already fully cached,
+    returns immediately with status="cached".
+
+    This endpoint triggers a background task that:
+    1. Decodes ALL frames from the episode
+    2. Encodes them to WebP format
+    3. Stores them in the encoded frames cache
+    4. Cleans up decoded frames (pickle files) after completion
+
+    Args:
+        episode_id: Episode identifier
+        dataset_id: Optional dataset ID
+        resolution: Image resolution (low/medium/high/original)
+        quality: WebP quality (10-100)
+        stream: Which stream to cache (rgb or depth)
+    """
+    # Check if this is a streaming episode
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    if not is_streaming:
+        return CachingStatusResponse(status="not_applicable", error="Only streaming episodes need caching")
+
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+    cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+    episode_key = cache.get_episode_cache_key(
+        effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+    )
+
+    # Check if already fully cached
+    cached = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+    if cached and cached.get("full_episode"):
+        return CachingStatusResponse(
+            status="cached",
+            total_frames=cached.get("total", len(cached.get("frames", [])))
+        )
+
+    # Create a unique task key
+    task_key = f"{effective_dataset_id}/{file_path}/{stream}/{resolution}/{quality}"
+
+    # Check if already caching
+    if task_key in _caching_tasks:
+        task = _caching_tasks[task_key]
+        if not task.done():
+            progress_info = _caching_progress.get(task_key, {})
+            return CachingStatusResponse(
+                status="caching",
+                progress=progress_info.get("progress", 0),
+                total_frames=progress_info.get("total_frames")
+            )
+
+    # Define the background caching task
+    async def cache_full_episode():
+        try:
+            _caching_progress[task_key] = {"progress": 0, "status": "caching", "total_frames": 0}
+            logger.info(f"Starting background caching for: {file_path}")
+
+            extractor = StreamingFrameExtractor(repo_id)
+
+            # Get total frame count first (run in thread to avoid blocking)
+            total_frames = await asyncio.to_thread(extractor.get_frame_count, file_path)
+            _caching_progress[task_key]["total_frames"] = total_frames
+            logger.info(f"Background caching {file_path}: {total_frames} total frames")
+
+            # Process in batches to avoid blocking the event loop
+            BATCH_SIZE = 200
+            all_frames = []
+
+            for batch_start in range(0, total_frames, BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, total_frames)
+
+                # Define batch extraction function
+                def extract_batch(start, end):
+                    batch_frames = []
+                    raw_frames = extractor.extract_frames(
+                        file_path, start=start, end=end, stream=stream,
+                        force_full_extraction=True
+                    )
+                    for frame_idx, timestamp, image in raw_frames:
+                        image_base64 = encode_image_with_options(image, resolution, quality)
+                        batch_frames.append({
+                            "frame_idx": frame_idx,
+                            "timestamp": timestamp,
+                            "image_base64": image_base64,
+                            "action": None,
+                        })
+                    return batch_frames
+
+                # Run batch extraction in thread pool
+                batch_frames = await asyncio.to_thread(extract_batch, batch_start, batch_end)
+                all_frames.extend(batch_frames)
+
+                # Update progress
+                progress = int((len(all_frames) / total_frames) * 100) if total_frames > 0 else 0
+                _caching_progress[task_key]["progress"] = min(progress, 99)
+
+                # Yield control to event loop between batches
+                await asyncio.sleep(0)
+
+            # Store as full episode
+            cache.store_episode_frames(
+                episode_key,
+                all_frames,
+                len(all_frames),
+                {
+                    "dataset_id": effective_dataset_id,
+                    "episode_id": file_path,
+                    "resolution": resolution,
+                    "quality": quality,
+                },
+            )
+
+            logger.info(f"Background caching complete: {file_path} ({len(all_frames)} frames)")
+            _caching_progress[task_key] = {"progress": 100, "status": "complete", "total_frames": len(all_frames)}
+
+            # Cleanup decoded frames after successful encoding
+            cleanup_decoded_frames(repo_id, file_path, stream)
+
+        except Exception as e:
+            logger.error(f"Background caching failed for {file_path}: {e}")
+            _caching_progress[task_key] = {"progress": 0, "status": "error", "error": str(e)}
+
+    # Start the background task
+    task = asyncio.create_task(cache_full_episode())
+    _caching_tasks[task_key] = task
+
+    return CachingStatusResponse(status="started", progress=0)
+
+
+@router.get("/{episode_id:path}/cache/status")
+async def get_caching_status(
+    episode_id: str,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID"),
+    resolution: str = Query("low", description="Image resolution"),
+    quality: int = Query(70, ge=10, le=100, description="WebP quality"),
+    stream: str = Query("rgb", description="Stream: rgb or depth"),
+) -> CachingStatusResponse:
+    """
+    Get the caching status for an episode.
+
+    Returns the current status of caching:
+    - "not_cached": Episode has not been cached
+    - "caching": Background caching in progress (includes progress %)
+    - "cached": Episode is fully cached
+    - "error": Caching failed
+    - "not_applicable": Not a streaming episode
+    """
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    if not is_streaming:
+        return CachingStatusResponse(status="not_applicable")
+
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+    cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+    episode_key = cache.get_episode_cache_key(
+        effective_dataset_id, file_path + cache_key_suffix, resolution, quality
+    )
+
+    # Check if fully cached
+    cached = cache.get_episode_frames(episode_key, effective_dataset_id, file_path)
+    if cached and cached.get("full_episode"):
+        return CachingStatusResponse(
+            status="cached",
+            progress=100,
+            total_frames=cached.get("total", len(cached.get("frames", [])))
+        )
+
+    # Check if caching in progress
+    task_key = f"{effective_dataset_id}/{file_path}/{stream}/{resolution}/{quality}"
+    if task_key in _caching_progress:
+        progress_info = _caching_progress[task_key]
+        status = progress_info.get("status", "caching")
+
+        if status == "complete":
+            return CachingStatusResponse(
+                status="cached",
+                progress=100,
+                total_frames=progress_info.get("total_frames")
+            )
+        elif status == "error":
+            return CachingStatusResponse(
+                status="error",
+                error=progress_info.get("error")
+            )
+        else:
+            return CachingStatusResponse(
+                status="caching",
+                progress=progress_info.get("progress", 0),
+                total_frames=progress_info.get("total_frames")
+            )
+
+    return CachingStatusResponse(status="not_cached")
 
 
 # NOTE: This catch-all route MUST be LAST to avoid matching /imu, /actions, etc.

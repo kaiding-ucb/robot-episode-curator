@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .base import Downloader, DownloadResult, DownloadStatus
-from .libero import LiberoDownloader
 from .huggingface import HuggingFaceDownloader
 
 logger = logging.getLogger(__name__)
@@ -109,15 +108,6 @@ def get_all_datasets() -> Dict[str, Dict[str, Any]]:
 
 # Dataset registry with download configurations
 DATASET_REGISTRY = {
-    "libero": {
-        "name": "LIBERO",
-        "type": "teleop",
-        "description": "LIBERO benchmark - 130 manipulation tasks",
-        "size_estimate_gb": 10,
-        "downloader_class": LiberoDownloader,
-        "requires_auth": False,
-        "modalities": ["rgb", "actions"],
-    },
     "egocentric_10k": {
         "name": "Egocentric-10K",
         "type": "video",
@@ -138,16 +128,6 @@ DATASET_REGISTRY = {
         "requires_auth": True,
         "streaming_recommended": True,
         "modalities": ["rgb", "depth", "imu", "actions"],
-    },
-    "libero_lerobot": {
-        "name": "LIBERO (LeRobot)",
-        "type": "teleop",
-        "description": "LIBERO benchmark in LeRobot format",
-        "size_estimate_gb": 5,
-        "downloader_class": HuggingFaceDownloader,
-        "repo_id": "HuggingFaceVLA/libero",
-        "requires_auth": False,
-        "format": "lerobot",
     },
     "ego4d": {
         "name": "Ego4D",
