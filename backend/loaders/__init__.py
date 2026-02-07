@@ -4,7 +4,37 @@ from .hdf5_loader import HDF5Loader
 from .webdataset_loader import WebDatasetLoader
 from .lerobot_loader import LeRobotLoader
 from .rlds_loader import RLDSLoader
-from .mcap_utils import detect_mcap_modalities, list_mcap_channels, get_mcap_metadata
+from .mcap_utils import detect_mcap_modalities, get_mcap_channel_list
+
+
+def get_repo_id_for_dataset(dataset_id: str) -> str | None:
+    """
+    Get the HuggingFace repo ID for a dataset.
+
+    Args:
+        dataset_id: Internal dataset identifier
+
+    Returns:
+        HuggingFace repo ID or None if not found
+    """
+    # Import here to avoid circular dependency
+    from downloaders.manager import DATASET_REGISTRY
+
+    if dataset_id not in DATASET_REGISTRY:
+        return None
+
+    config = DATASET_REGISTRY[dataset_id]
+
+    # Return explicit repo_id if set
+    if "repo_id" in config:
+        return config["repo_id"]
+
+    # For LIBERO, use the LeRobot format version
+    if dataset_id == "libero":
+        return "HuggingFaceVLA/libero"
+
+    return None
+
 
 __all__ = [
     "DatasetLoader",
@@ -16,6 +46,6 @@ __all__ = [
     "LeRobotLoader",
     "RLDSLoader",
     "detect_mcap_modalities",
-    "list_mcap_channels",
-    "get_mcap_metadata",
+    "get_mcap_channel_list",
+    "get_repo_id_for_dataset",
 ]

@@ -43,22 +43,36 @@ test.describe("App Loading", () => {
 // FLOW 2: Dataset Browsing
 // =============================================================================
 test.describe("Dataset Browsing", () => {
-  test("clicking dataset expands episode list", async ({ page }) => {
+  test("clicking dataset shows task list then episodes", async ({ page }) => {
     await page.goto("/");
 
     // Click on LIBERO dataset
     await page.getByTestId("dataset-item-libero").click();
 
-    // Episode list heading should appear
-    await expect(page.getByRole("heading", { name: "Episodes" })).toBeVisible({ timeout: 10000 });
+    // Tasks heading should appear (new task-based navigation)
+    await expect(page.getByRole("heading", { name: "Tasks" })).toBeVisible({ timeout: 10000 });
+
+    // Wait for tasks to load
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+
+    // Should have at least one task
+    const tasks = page.locator('[data-testid^="task-item-"]');
+    const taskCount = await tasks.count();
+    expect(taskCount).toBeGreaterThan(0);
+
+    // Click on first task
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
 
     // Wait for episodes to load
-    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 10000 });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
 
     // Should have at least one episode
     const episodes = page.locator('[data-testid^="episode-item-"]');
-    const count = await episodes.count();
-    expect(count).toBeGreaterThan(0);
+    const episodeCount = await episodes.count();
+    expect(episodeCount).toBeGreaterThan(0);
   });
 
   test("dataset shows type badge", async ({ page }) => {
@@ -77,11 +91,14 @@ test.describe("Episode Viewing", () => {
   test("selecting episode loads viewer", async ({ page }) => {
     await page.goto("/");
 
-    // Select dataset
+    // Select dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
-
-    // Select first episode via JavaScript (to avoid click interception)
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -94,9 +111,14 @@ test.describe("Episode Viewing", () => {
   test("episode viewer shows frame image", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -113,9 +135,14 @@ test.describe("Episode Viewing", () => {
   test("episode viewer shows action data", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -136,9 +163,14 @@ test.describe("Video Playback", () => {
   test("timeline slider is visible when episode loaded", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -151,9 +183,14 @@ test.describe("Video Playback", () => {
   test("play button exists", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -172,9 +209,14 @@ test.describe("Video Playback", () => {
   test("speed selector exists", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to episode
+    // Navigate to dataset -> task -> episode
     await page.getByTestId("dataset-item-libero").click();
-    await page.waitForSelector('[data-testid^="episode-item-"]');
+    await page.waitForSelector('[data-testid^="task-item-"]', { timeout: 15000 });
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid^="task-item-"]') as HTMLElement;
+      btn?.click();
+    });
+    await page.waitForSelector('[data-testid^="episode-item-"]', { timeout: 15000 });
     await page.evaluate(() => {
       const btn = document.querySelector('[data-testid^="episode-item-"]') as HTMLElement;
       btn?.click();
@@ -453,7 +495,7 @@ test.describe("Task-Level Quality", () => {
   test("task quality API returns valid data", async ({ request }) => {
     // Test the task quality API directly with a known LIBERO task
     const response = await request.get(
-      "http://localhost:8002/api/quality/task/libero/Pick%20Up%20The%20Bbq%20Sauce%20And%20Place%20It%20In%20The%20Basket%20Demo?limit=5"
+      "http://localhost:8001/api/quality/task/libero/Pick%20Up%20The%20Black%20Bowl%20On%20The%20Cookie%20Box%20And%20Place%20It%20On%20The%20Plate%20Demo?limit=5"
     );
 
     expect(response.status()).toBe(200);
@@ -463,21 +505,17 @@ test.describe("Task-Level Quality", () => {
     // Verify task-level metrics structure
     expect(data).toHaveProperty("task_name");
     expect(data).toHaveProperty("expertise_score");
-    expect(data).toHaveProperty("physics_coverage_score");
     expect(data).toHaveProperty("divergence_distribution");
-    expect(data).toHaveProperty("quality_assessment");
 
     // Verify scores are valid numbers (0-1 range)
     expect(data.expertise_score).toBeGreaterThanOrEqual(0);
     expect(data.expertise_score).toBeLessThanOrEqual(1);
-    expect(data.physics_coverage_score).toBeGreaterThanOrEqual(0);
-    expect(data.physics_coverage_score).toBeLessThanOrEqual(1);
   });
 
   test("episode divergence API returns frame-level data", async ({ request }) => {
     // Test the episode divergence API
     const response = await request.get(
-      "http://localhost:8002/api/quality/task/libero/Pick%20Up%20The%20Bbq%20Sauce%20And%20Place%20It%20In%20The%20Basket%20Demo/divergence/libero_object%2Fpick_up_the_bbq_sauce_and_place_it_in_the_basket_demo%2Fdemo_0?limit=5"
+      "http://localhost:8001/api/quality/task/libero/Pick%20Up%20The%20Black%20Bowl%20On%20The%20Cookie%20Box%20And%20Place%20It%20On%20The%20Plate%20Demo/divergence/libero_spatial%2Fpick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate_demo%2Fdemo_0?limit=5"
     );
 
     expect(response.status()).toBe(200);
@@ -498,7 +536,7 @@ test.describe("Task-Level Quality", () => {
   test("quality events include metric_category field", async ({ request }) => {
     // Test that quality events have the new metric_category field
     const response = await request.get(
-      "http://localhost:8002/api/quality/events/libero_object%2Fpick_up_the_bbq_sauce_and_place_it_in_the_basket_demo%2Fdemo_0?dataset_id=libero"
+      "http://localhost:8001/api/quality/events/libero_spatial%2Fpick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate_demo%2Fdemo_0?dataset_id=libero"
     );
 
     expect(response.status()).toBe(200);

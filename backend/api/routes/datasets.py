@@ -34,7 +34,7 @@ from downloaders.manager import (
 )
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.base import Modality
-from loaders.mcap_utils import detect_mcap_modalities, list_mcap_channels
+from loaders.mcap_utils import detect_mcap_modalities
 
 logger = logging.getLogger(__name__)
 
