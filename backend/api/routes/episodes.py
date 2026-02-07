@@ -9,6 +9,7 @@ Endpoints:
 """
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 from io import BytesIO
@@ -28,6 +29,24 @@ from cache import get_encoded_frame_cache
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Shared thread pool for CPU-bound operations (video decoding, encoding)
+# 8 workers provides headroom for 5 parallel caching + 3 for API calls
+_HEAVY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="heavy_ops"
+)
+
+# Dedicated thread pool for parallel frame encoding within batches
+# More workers = faster encoding (WebP encoding releases GIL)
+import multiprocessing
+_ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(8, multiprocessing.cpu_count()),
+    thread_name_prefix="encode"
+)
+
+# Semaphore to limit concurrent caching operations to prevent resource exhaustion
+_CACHING_SEMAPHORE = asyncio.Semaphore(5)
 
 # Background caching state - tracks which episodes are being cached
 # and their progress (0-100%)
@@ -234,18 +253,17 @@ def encode_image_with_options(
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
 
-        # Resize if needed
+        # Resize if needed - use INTER_LINEAR for speed (2x faster than INTER_AREA)
         target_size = RESOLUTION_MAP.get(resolution)
         if target_size and (image.shape[1] > target_size[0] or image.shape[0] > target_size[1]):
-            # Use cv2.resize with INTER_AREA for quality downsampling
-            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+            image = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
 
         # Convert to PIL Image
         pil_image = Image.fromarray(image)
 
-        # Encode to WebP with specified quality (40-50% smaller than JPEG)
+        # Encode to WebP with method=0 for fastest compression
         buffer = BytesIO()
-        pil_image.save(buffer, format="WEBP", quality=quality)
+        pil_image.save(buffer, format="WEBP", quality=quality, method=0)
         buffer.seek(0)
 
         return base64.b64encode(buffer.read()).decode("utf-8")
@@ -1119,21 +1137,33 @@ async def start_background_caching(
             for batch_start in range(0, total_frames, BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, total_frames)
 
-                # Define batch extraction function
+                # Define batch extraction function with parallel encoding
                 def extract_batch(start, end):
-                    batch_frames = []
-                    raw_frames = extractor.extract_frames(
+                    # First extract all raw frames
+                    raw_frames = list(extractor.extract_frames(
                         file_path, start=start, end=end, stream=stream,
                         force_full_extraction=True
-                    )
-                    for frame_idx, timestamp, image in raw_frames:
+                    ))
+
+                    if not raw_frames:
+                        return []
+
+                    # Encode frames in parallel using thread pool
+                    def encode_single_frame(frame_data):
+                        frame_idx, timestamp, image = frame_data
                         image_base64 = encode_image_with_options(image, resolution, quality)
-                        batch_frames.append({
+                        return {
                             "frame_idx": frame_idx,
                             "timestamp": timestamp,
                             "image_base64": image_base64,
                             "action": None,
-                        })
+                        }
+
+                    # Submit all encoding tasks in parallel
+                    futures = [_ENCODE_EXECUTOR.submit(encode_single_frame, f) for f in raw_frames]
+
+                    # Collect results in order
+                    batch_frames = [future.result() for future in futures]
                     return batch_frames
 
                 # Run batch extraction in thread pool

@@ -4,7 +4,7 @@ from .hdf5_loader import HDF5Loader
 from .webdataset_loader import WebDatasetLoader
 from .lerobot_loader import LeRobotLoader
 from .rlds_loader import RLDSLoader
-from .mcap_utils import detect_mcap_modalities, get_mcap_channel_list
+from .mcap_utils import detect_mcap_modalities, list_mcap_channels
 
 
 def get_repo_id_for_dataset(dataset_id: str) -> str | None:
@@ -46,6 +46,6 @@ __all__ = [
     "LeRobotLoader",
     "RLDSLoader",
     "detect_mcap_modalities",
-    "get_mcap_channel_list",
+    "list_mcap_channels",
     "get_repo_id_for_dataset",
 ]

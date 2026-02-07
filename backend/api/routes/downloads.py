@@ -187,9 +187,10 @@ class CacheStatsResponse(BaseModel):
 async def list_cached_episodes():
     """
     List all cached episodes with size and timestamp.
+    Uses async method to avoid blocking the event loop on large caches.
     """
     cache = get_encoded_frame_cache()
-    episodes = cache.list_cached_episodes()
+    episodes = await cache.list_cached_episodes_async()
 
     return [
         CachedEpisodeResponse(
@@ -207,9 +208,10 @@ async def list_cached_episodes():
 async def get_cache_stats():
     """
     Get cache statistics (total size, episode count, etc.).
+    Uses async method to avoid blocking the event loop.
     """
     cache = get_encoded_frame_cache()
-    stats = cache.get_cache_stats()
+    stats = await cache.get_cache_stats_async()
 
     return CacheStatsResponse(
         total_size_mb=stats.get("total_size_mb", 0),
@@ -232,18 +234,11 @@ def _get_dir_size_mb(path: Path) -> float:
     return total / (1024 * 1024)
 
 
-@router.get("/cache/all")
-async def get_all_cache_stats():
+def _compute_all_cache_stats_sync() -> dict:
     """
-    Get comprehensive statistics for ALL cache locations.
-
-    This includes hidden caches that don't appear in Finder or Mac Storage Management:
-    - Encoded frames cache (JSON files)
-    - Streaming cache (downloaded tar/mp4/mcap files)
-    - Decoded frames cache (pickle files - can be huge!)
-    - HuggingFace hub cache
+    Synchronous helper to compute all cache statistics.
+    This function does blocking file I/O and should be run in an executor.
     """
-    import os
     home = Path.home()
     cache_base = home / ".cache" / "data_viewer"
     hf_cache = home / ".cache" / "huggingface"
@@ -320,6 +315,26 @@ async def get_all_cache_stats():
         "total_size_mb": round(total_mb, 2),
         "total_size_gb": round(total_mb / 1024, 2),
     }
+
+
+@router.get("/cache/all")
+async def get_all_cache_stats():
+    """
+    Get comprehensive statistics for ALL cache locations.
+
+    This includes hidden caches that don't appear in Finder or Mac Storage Management:
+    - Encoded frames cache (JSON files)
+    - Streaming cache (downloaded tar/mp4/mcap files)
+    - Decoded frames cache (pickle files - can be huge!)
+    - HuggingFace hub cache
+
+    Uses executor to avoid blocking the event loop on large caches.
+    """
+    import asyncio
+    from api.routes.episodes import _HEAVY_EXECUTOR
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_HEAVY_EXECUTOR, _compute_all_cache_stats_sync)
 
 
 @router.delete("/cache/all/{cache_name}")
