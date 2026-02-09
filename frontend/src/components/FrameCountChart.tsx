@@ -22,9 +22,15 @@ function buildHistogram(
   if (!data.episodes.length) return [];
 
   const outlierSet = new Set(data.outlier_episode_ids);
-  const frames = data.episodes.map((ep) => ep.estimated_frames);
-  const min = Math.min(...frames);
-  const max = Math.max(...frames);
+
+  // Separate outlier and non-outlier frames to compute a meaningful bin range
+  const mainEpisodes = data.episodes.filter((ep) => !outlierSet.has(ep.episode_id));
+  const mainFrames = mainEpisodes.map((ep) => ep.estimated_frames);
+
+  // Fall back to all frames if every episode is an outlier (or no outliers detected)
+  const rangeFrames = mainFrames.length > 0 ? mainFrames : data.episodes.map((ep) => ep.estimated_frames);
+  const min = Math.min(...rangeFrames);
+  const max = Math.max(...rangeFrames);
   const range = max - min || 1;
   const binWidth = range / numBins;
 
@@ -40,10 +46,9 @@ function buildHistogram(
   }
 
   for (const ep of data.episodes) {
-    const idx = Math.min(
-      Math.floor((ep.estimated_frames - min) / binWidth),
-      numBins - 1
-    );
+    // Clamp outliers to first/last bin so they still appear in the chart
+    const rawIdx = Math.floor((ep.estimated_frames - min) / binWidth);
+    const idx = Math.max(0, Math.min(rawIdx, numBins - 1));
     bins[idx].count++;
     bins[idx].episodes.push(ep.file_name);
     if (outlierSet.has(ep.episode_id)) {
@@ -114,11 +119,13 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
     return ticks;
   }, [bins]);
 
-  // Mean and std positions in pixel space
+  // Mean and std positions in pixel space, clamped to chart bounds
   const minFrame = bins[0].rangeStart;
   const maxFrame = bins[bins.length - 1].rangeEnd;
   const frameRange = maxFrame - minFrame || 1;
-  const meanX = padding.left + ((data.mean_frames - minFrame) / frameRange) * innerWidth;
+  const meanXRaw = ((data.mean_frames - minFrame) / frameRange) * innerWidth;
+  const meanX = padding.left + Math.max(0, Math.min(innerWidth, meanXRaw));
+  const meanOffChart = data.mean_frames < minFrame || data.mean_frames > maxFrame;
   const stdLeftPx = padding.left + Math.max(0, ((data.mean_frames - data.std_frames - minFrame) / frameRange) * innerWidth);
   const stdRightPx = padding.left + Math.min(innerWidth, ((data.mean_frames + data.std_frames - minFrame) / frameRange) * innerWidth);
 
@@ -223,17 +230,17 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
             stroke="#ef4444"
             strokeWidth="1.5"
             strokeDasharray="4,3"
-            opacity="0.8"
+            opacity={meanOffChart ? 0.4 : 0.8}
           />
           <text
             x={meanX}
             y={padding.top - 6}
-            textAnchor="middle"
+            textAnchor={data.mean_frames > maxFrame ? "end" : data.mean_frames < minFrame ? "start" : "middle"}
             fontSize="9"
             fill="#ef4444"
             fontWeight="500"
           >
-            mean ({Math.round(data.mean_frames)})
+            {data.mean_frames > maxFrame ? "mean →" : data.mean_frames < minFrame ? "← mean" : "mean"} ({Math.round(data.mean_frames)})
           </text>
 
           {/* X-axis labels */}
@@ -317,7 +324,7 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
 
       {/* Source note */}
       <div className="mt-2 text-xs text-gray-400 italic">
-        Frame counts estimated from file sizes (~50KB/frame). A well-curated dataset should approximate a normal distribution.
+        {data.source_note || "Frame counts estimated from file sizes (~50KB/frame). A well-curated dataset should approximate a normal distribution."}
       </div>
     </div>
   );

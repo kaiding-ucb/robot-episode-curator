@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useFrameCounts, useSignalComparison } from "@/hooks/useDatasetAnalysis";
+import { useFrameCounts, useSignalComparison, useDatasetCapabilities } from "@/hooks/useDatasetAnalysis";
 import { useDatasets, useTasks } from "@/hooks/useApi";
 import FrameCountChart from "./FrameCountChart";
 import SignalComparisonChart from "./SignalComparisonChart";
@@ -37,6 +37,12 @@ export default function DatasetAnalysis({
   // Data hooks
   const { tasks } = useTasks(datasetId);
   const {
+    capabilities,
+    loading: capabilitiesLoading,
+    fetchCapabilities,
+    reset: resetCapabilities,
+  } = useDatasetCapabilities();
+  const {
     data: frameCountData,
     loading: frameCountLoading,
     error: frameCountError,
@@ -47,6 +53,22 @@ export default function DatasetAnalysis({
     startAnalysis,
     cancelAnalysis,
   } = useSignalComparison();
+
+  // Fetch capabilities when dataset changes
+  useEffect(() => {
+    if (datasetId) {
+      fetchCapabilities(datasetId);
+    } else {
+      resetCapabilities();
+    }
+  }, [datasetId, fetchCapabilities, resetCapabilities]);
+
+  // If signal comparison not supported, default to frame-counts tab
+  useEffect(() => {
+    if (capabilities && !capabilities.supports_signal_comparison && activeTab === "signal-comparison") {
+      setActiveTab("frame-counts");
+    }
+  }, [capabilities, activeTab]);
 
   // Auto-select first task when tasks load
   useEffect(() => {
@@ -68,13 +90,22 @@ export default function DatasetAnalysis({
     }
   }, [datasetId, selectedTask, maxEpisodes, startAnalysis]);
 
+  const signalsDisabled = capabilities !== null && !capabilities.supports_signal_comparison;
+
   return (
     <div className="p-6" data-testid="dataset-analysis-modal">
       {/* Header */}
       <div className="flex justify-between items-center mb-4">
-        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
-          Dataset Analysis
-        </h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
+            Dataset Analysis
+          </h2>
+          {capabilities && (
+            <span className="px-2 py-0.5 text-xs font-medium rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 uppercase tracking-wide">
+              {capabilities.format}
+            </span>
+          )}
+        </div>
         <button
           onClick={onClose}
           className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
@@ -145,17 +176,31 @@ export default function DatasetAnalysis({
           Frame Counts
         </button>
         <button
-          onClick={() => setActiveTab("signal-comparison")}
+          onClick={() => !signalsDisabled && setActiveTab("signal-comparison")}
           className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
-            activeTab === "signal-comparison"
-              ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
-              : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+            signalsDisabled
+              ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
+              : activeTab === "signal-comparison"
+                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
           }`}
           data-testid="signal-comparison-tab"
+          title={signalsDisabled ? capabilities?.signal_comparison_note : undefined}
         >
           Signal Comparison
+          {signalsDisabled && (
+            <span className="ml-1.5 text-xs text-gray-400 dark:text-gray-500">(N/A)</span>
+          )}
         </button>
       </div>
+
+      {/* Signal comparison info banner when disabled */}
+      {signalsDisabled && capabilities?.signal_comparison_note && activeTab === "frame-counts" && (
+        <div className="mb-4 px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-sm text-blue-700 dark:text-blue-300">
+          <span className="font-medium">Signal Comparison unavailable:</span>{" "}
+          {capabilities.signal_comparison_note}
+        </div>
+      )}
 
       {/* Tab Content */}
       <div className="min-h-[300px]">
@@ -203,7 +248,7 @@ export default function DatasetAnalysis({
               </div>
               <span className="text-sm text-gray-600 dark:text-gray-400">episodes</span>
 
-              {signalState.phase === "idle" || signalState.phase === "complete" || signalState.phase === "error" ? (
+              {signalState.phase === "idle" || signalState.phase === "complete" || signalState.phase === "error" || signalState.phase === "no_signals" ? (
                 <button
                   onClick={handleStartSignalAnalysis}
                   className="px-4 py-1.5 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 transition-colors"
@@ -239,6 +284,18 @@ export default function DatasetAnalysis({
                       width: `${signalState.progress.total > 0 ? ((signalState.progress.current) / signalState.progress.total) * 100 : 0}%`,
                     }}
                   />
+                </div>
+              </div>
+            )}
+
+            {/* No signals message */}
+            {signalState.phase === "no_signals" && signalState.noSignalsReason && (
+              <div className="px-4 py-6 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-center">
+                <div className="text-sm text-blue-700 dark:text-blue-300 font-medium mb-1">
+                  Signal Comparison Not Available
+                </div>
+                <div className="text-sm text-blue-600 dark:text-blue-400">
+                  {signalState.noSignalsReason}
                 </div>
               </div>
             )}

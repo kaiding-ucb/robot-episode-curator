@@ -2,10 +2,16 @@
 Dataset Analysis API routes.
 
 Provides high-level dataset analysis endpoints:
+- Format detection and capability reporting
 - Frame count distribution (zero download, uses HF tree API file sizes)
-- Batch actions/IMU signal comparison (parallel MCAP downloads, no video decode)
+- Batch actions/IMU signal comparison (parallel downloads, no video decode)
+
+Supports multiple formats:
+- MCAP (RealOmni): Uses StreamingFrameExtractor for actions + IMU
+- LeRobot/Parquet (Libero, etc.): Downloads tiny Parquet files for actions (no IMU)
 """
 import asyncio
+import io
 import json
 import logging
 import math
@@ -15,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -43,6 +51,7 @@ class FrameCountDistribution(BaseModel):
     max_frames: int
     outlier_episode_ids: List[str]
     source: str  # "file_size_estimate" or "metadata"
+    source_note: str = ""
 
 
 class EpisodeSignals(BaseModel):
@@ -50,6 +59,15 @@ class EpisodeSignals(BaseModel):
     actions: Optional[Dict[str, Any]] = None
     imu: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+
+class DatasetCapabilities(BaseModel):
+    format: str
+    has_actions: bool
+    has_imu: bool
+    supports_frame_counts: bool
+    supports_signal_comparison: bool
+    signal_comparison_note: str
 
 
 # --- HF Token Helper ---
@@ -75,11 +93,261 @@ def _get_hf_headers() -> Dict[str, str]:
     return headers
 
 
-# --- Frame Count Estimation ---
+# --- Format Detection & Capabilities ---
 
-# Bytes per frame heuristic for MCAP with H.264 compressed video
-MCAP_BYTES_PER_FRAME = 50 * 1024  # ~50KB per compressed frame
+# Bytes-per-frame heuristics by format
+BYTES_PER_FRAME = {
+    "mcap": 50 * 1024,       # ~50KB per compressed frame (with video+depth)
+    "webdataset": None,       # Use duration-based estimate
+    "video": None,            # Use duration-based estimate
+    "lerobot": None,          # Use parquet row counts
+    "hdf5": 20 * 1024,       # ~20KB per frame
+}
 
+# Size threshold for signal extraction (500 MB)
+SIGNAL_SIZE_THRESHOLD_MB = 500
+
+
+def _detect_format(dataset_info: Dict[str, Any], episode_files: List[Dict[str, Any]]) -> str:
+    """
+    Detect the dataset format from config or file extensions.
+
+    Returns: "mcap", "lerobot", "webdataset", "video", "hdf5", or "unknown"
+    """
+    fmt = dataset_info.get("format")
+    if fmt:
+        return fmt
+
+    # Infer from file extensions
+    extensions = {Path(ep["path"]).suffix.lower() for ep in episode_files}
+    if ".parquet" in extensions:
+        return "lerobot"
+    if ".mcap" in extensions:
+        return "mcap"
+    if ".tar" in extensions:
+        return "webdataset"
+    if extensions & {".mp4", ".avi", ".mov", ".mkv"}:
+        return "video"
+    if extensions & {".hdf5", ".h5"}:
+        return "hdf5"
+    return "unknown"
+
+
+def _get_format_metadata(dataset_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Get format metadata from registry config.
+
+    Returns: {format, has_actions, has_imu, max_file_size_mb}
+    """
+    fmt = dataset_info.get("format", "unknown")
+    return {
+        "format": fmt,
+        "has_actions": dataset_info.get("has_actions", fmt in ("mcap", "lerobot")),
+        "has_imu": dataset_info.get("has_imu", False),
+        "max_file_size_mb": dataset_info.get("max_episode_size_mb"),
+    }
+
+
+def _get_capabilities(dataset_info: Dict[str, Any]) -> DatasetCapabilities:
+    """Build capabilities object for a dataset."""
+    meta = _get_format_metadata(dataset_info)
+    fmt = meta["format"]
+    has_actions = meta["has_actions"]
+    has_imu = meta["has_imu"]
+    max_size_mb = meta["max_file_size_mb"]
+
+    supports_frame_counts = True
+    supports_signals = True
+    note = ""
+
+    if not has_actions:
+        supports_signals = False
+        if fmt in ("webdataset", "video"):
+            note = "Video-only dataset — no robot action or IMU signals available"
+        else:
+            note = "This dataset does not contain action signals"
+    elif max_size_mb is not None and max_size_mb > SIGNAL_SIZE_THRESHOLD_MB:
+        supports_signals = False
+        note = f"Episode files are too large for signal extraction (~{max_size_mb:,.0f} MB each). Frame count analysis is still available."
+    elif fmt in ("webdataset", "video"):
+        supports_signals = False
+        note = "Signal comparison is not supported for this format"
+
+    return DatasetCapabilities(
+        format=fmt,
+        has_actions=has_actions,
+        has_imu=has_imu,
+        supports_frame_counts=supports_frame_counts,
+        supports_signal_comparison=supports_signals,
+        signal_comparison_note=note,
+    )
+
+
+def _estimate_frames(size_bytes: int, fmt: str) -> int:
+    """Estimate frame count from file size based on format."""
+    if fmt == "mcap":
+        bpf = BYTES_PER_FRAME["mcap"]
+        return max(1, size_bytes // bpf) if size_bytes > 0 else 0
+    elif fmt == "hdf5":
+        bpf = BYTES_PER_FRAME["hdf5"]
+        return max(1, size_bytes // bpf) if size_bytes > 0 else 0
+    elif fmt in ("webdataset", "video"):
+        # Estimate from typical video bitrate (~5 Mbps, 30fps)
+        if size_bytes > 0:
+            duration_secs = size_bytes / (5 * 1024 * 1024 / 8)  # 5 Mbps bitrate
+            return max(1, int(duration_secs * 30))  # 30 fps
+        return 0
+    elif fmt == "lerobot":
+        # Parquet: rough estimate (~200 bytes/row for robotics data)
+        return max(1, size_bytes // 200) if size_bytes > 0 else 0
+    else:
+        # Default fallback: use MCAP heuristic
+        bpf = BYTES_PER_FRAME["mcap"]
+        return max(1, size_bytes // bpf) if size_bytes > 0 else 0
+
+
+def _get_source_note(fmt: str) -> str:
+    """Return human-readable explanation of estimation method."""
+    notes = {
+        "mcap": "Frame counts estimated from file sizes (~50KB/frame for MCAP with compressed video).",
+        "webdataset": "Frame counts estimated from file sizes assuming ~5 Mbps video bitrate at 30 fps.",
+        "video": "Frame counts estimated from file sizes assuming ~5 Mbps video bitrate at 30 fps.",
+        "lerobot": "Frame counts estimated from Parquet file sizes (~200 bytes/row).",
+        "hdf5": "Frame counts estimated from file sizes (~20KB/frame for HDF5).",
+    }
+    base = notes.get(fmt, "Frame counts estimated from file sizes.")
+    return f"{base} A well-curated dataset should approximate a normal distribution."
+
+
+# --- LeRobot/Parquet Signal Extraction ---
+
+async def _download_parquet(
+    client: httpx.AsyncClient,
+    repo_id: str,
+    file_path: str,
+    headers: Dict[str, str],
+) -> pd.DataFrame:
+    """Download a single Parquet file from HuggingFace and return as DataFrame."""
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+    response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+    response.raise_for_status()
+    return pd.read_parquet(io.BytesIO(response.content))
+
+
+async def _extract_lerobot_episodes(
+    client: httpx.AsyncClient,
+    repo_id: str,
+    parquet_files: List[Dict[str, Any]],
+    headers: Dict[str, str],
+    max_episodes: int,
+) -> List[Dict[str, Any]]:
+    """
+    Download LeRobot Parquet files and extract per-episode action data.
+
+    Parquet files are tiny (~50KB, no images) so this is fast.
+    Groups rows by episode_index and returns action vectors per episode.
+    Downloads incrementally — stops once enough episodes are collected.
+    """
+    all_dfs = []
+    unique_episodes = set()
+
+    for pf in parquet_files:
+        try:
+            df = await _download_parquet(client, repo_id, pf["path"], headers)
+            all_dfs.append(df)
+
+            # Track unique episodes seen so far
+            ep_col = "episode_index" if "episode_index" in df.columns else "episode_id"
+            if ep_col in df.columns:
+                unique_episodes.update(df[ep_col].unique())
+
+            # Stop downloading once we have enough episodes
+            if len(unique_episodes) >= max_episodes:
+                logger.info(f"Downloaded {len(all_dfs)} parquet files, found {len(unique_episodes)} episodes (need {max_episodes})")
+                break
+
+        except Exception as e:
+            logger.warning(f"Failed to download {pf['path']}: {e}")
+
+    if not all_dfs:
+        return []
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    # Group by episode_index
+    episode_col = "episode_index" if "episode_index" in combined.columns else None
+    if episode_col is None:
+        # Try episode_id
+        if "episode_id" in combined.columns:
+            episode_col = "episode_id"
+        else:
+            logger.error(f"No episode column found. Columns: {list(combined.columns)}")
+            return []
+
+    # Sort by episode and frame index
+    sort_cols = [episode_col]
+    if "frame_index" in combined.columns:
+        sort_cols.append("frame_index")
+    elif "index" in combined.columns:
+        sort_cols.append("index")
+    combined = combined.sort_values(sort_cols)
+
+    episodes = []
+    for ep_idx, group in combined.groupby(episode_col):
+        if len(episodes) >= max_episodes:
+            break
+
+        episode_id = f"episode_{int(ep_idx)}"
+
+        # Extract timestamps
+        timestamps = []
+        if "timestamp" in group.columns:
+            timestamps = group["timestamp"].tolist()
+        elif "frame_index" in group.columns:
+            # Synthesize timestamps from frame index (assume 10Hz default for LeRobot)
+            timestamps = (group["frame_index"] / 10.0).tolist()
+        else:
+            timestamps = [i / 10.0 for i in range(len(group))]
+
+        # Extract actions
+        actions_data: Dict[str, Any] = {"timestamps": [], "actions": [], "dimension_labels": None}
+        if "action" in group.columns:
+            action_list = group["action"].tolist()
+            # Convert numpy arrays to lists
+            actions = []
+            for a in action_list:
+                if isinstance(a, np.ndarray):
+                    actions.append(a.tolist())
+                elif isinstance(a, (list, tuple)):
+                    actions.append(list(a))
+                else:
+                    actions.append([float(a)])
+            actions_data["timestamps"] = timestamps
+            actions_data["actions"] = actions
+
+            # Infer dimension labels
+            if actions:
+                num_dims = len(actions[0])
+                if num_dims == 7:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+                elif num_dims == 6:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
+                elif num_dims == 3:
+                    actions_data["dimension_labels"] = ["x", "y", "z"]
+        else:
+            actions_data = {"error": "No 'action' column in Parquet data"}
+
+        episodes.append({
+            "episode_id": episode_id,
+            "episode_index": len(episodes),
+            "actions": actions_data,
+            "imu": None,  # LeRobot datasets don't have IMU
+        })
+
+    return episodes
+
+
+# --- Episode Collection ---
 
 async def _collect_episode_files(
     client: httpx.AsyncClient,
@@ -181,6 +449,23 @@ def _compute_statistics(
 
 # --- Endpoints ---
 
+@router.get("/{dataset_id}/analysis/capabilities")
+async def get_dataset_capabilities(dataset_id: str):
+    """
+    Get analysis capabilities for a dataset.
+
+    Returns what types of analysis are supported based on format and file sizes.
+    """
+    from downloaders.manager import get_all_datasets
+
+    all_datasets = get_all_datasets()
+    dataset_info = all_datasets.get(dataset_id)
+    if not dataset_info:
+        return {"error": f"Dataset '{dataset_id}' not found"}
+
+    return _get_capabilities(dataset_info)
+
+
 @router.get("/{dataset_id}/analysis/frame-counts")
 async def get_frame_count_distribution(
     dataset_id: str,
@@ -189,7 +474,7 @@ async def get_frame_count_distribution(
     """
     Get frame count distribution for all episodes in a task.
 
-    Zero download required — uses HF tree API file sizes with heuristic estimation.
+    Zero download required — uses HF tree API file sizes with format-specific heuristics.
     """
     from downloaders.manager import get_all_datasets
 
@@ -207,11 +492,14 @@ async def get_frame_count_distribution(
     async with httpx.AsyncClient() as client:
         raw_episodes = await _collect_episode_files(client, repo_id, task_name, headers)
 
-    # Estimate frame counts from file sizes
+    # Detect format for appropriate heuristic
+    fmt = _detect_format(dataset_info, raw_episodes)
+
+    # Estimate frame counts using format-specific heuristic
     episode_counts = []
     for ep in raw_episodes:
         size = ep["size_bytes"]
-        estimated = max(1, size // MCAP_BYTES_PER_FRAME) if size > 0 else 0
+        estimated = _estimate_frames(size, fmt)
         episode_counts.append(EpisodeFrameCount(
             episode_id=ep["episode_id"],
             estimated_frames=estimated,
@@ -220,12 +508,14 @@ async def get_frame_count_distribution(
         ))
 
     stats = _compute_statistics(episode_counts)
+    source_note = _get_source_note(fmt)
 
     return FrameCountDistribution(
         task_name=task_name,
         episodes=episode_counts,
         total_episodes=len(episode_counts),
         source="file_size_estimate",
+        source_note=source_note,
         **stats,
     )
 
@@ -240,7 +530,10 @@ async def get_signals_comparison(
     """
     Stream actions and IMU data for multiple episodes via SSE.
 
-    Downloads MCAP files in parallel (no video decode) and streams results progressively.
+    Checks dataset capabilities first; sends no_signals event for unsupported formats.
+    Supports:
+    - MCAP (RealOmni): Downloads MCAP files, extracts actions + IMU
+    - LeRobot/Parquet (Libero, etc.): Downloads tiny Parquet files, extracts actions
     """
     from downloaders.manager import get_all_datasets
 
@@ -251,63 +544,84 @@ async def get_signals_comparison(
             yield f"data: {json.dumps({'type': 'error', 'message': f'Dataset {dataset_id} not found'})}\n\n"
         return StreamingResponse(error_gen(), media_type="text/event-stream")
 
+    # Check capabilities before attempting extraction
+    capabilities = _get_capabilities(dataset_info)
+    if not capabilities.supports_signal_comparison:
+        async def no_signals_gen():
+            yield f"data: {json.dumps({'type': 'no_signals', 'reason': capabilities.signal_comparison_note})}\n\n"
+        return StreamingResponse(no_signals_gen(), media_type="text/event-stream")
+
     repo_id = dataset_info.get("repo_id", "")
 
     async def signal_stream():
         try:
-            # First, get episode list from HF tree API
             headers = _get_hf_headers()
             async with httpx.AsyncClient() as client:
                 raw_episodes = await _collect_episode_files(client, repo_id, task_name, headers)
 
-            episodes_to_analyze = raw_episodes[:max_episodes]
-            total = len(episodes_to_analyze)
+            # Detect format
+            fmt = _detect_format(dataset_info, raw_episodes)
+            logger.info(f"Signal analysis for {dataset_id}: format={fmt}, {len(raw_episodes)} files found")
 
-            yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
+            if fmt == "lerobot":
+                # --- LeRobot/Parquet path ---
+                yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
-            # Import extractor
-            from loaders.streaming_extractor import StreamingFrameExtractor
-            extractor = StreamingFrameExtractor(repo_id)
+                async with httpx.AsyncClient() as client:
+                    episodes = await _extract_lerobot_episodes(
+                        client, repo_id, raw_episodes, headers, max_episodes
+                    )
 
-            # Semaphore for parallel downloads (limit concurrency)
-            semaphore = asyncio.Semaphore(3)
+                total = len(episodes)
+                yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
 
-            async def process_episode(idx: int, ep: Dict[str, Any]):
-                episode_id = ep["episode_id"]
-                episode_path = ep["path"]
-
-                async with semaphore:
-                    # Check for client disconnection
+                for ep in episodes:
                     if await request.is_disconnected():
-                        return None
+                        break
 
-                    yield_data = {
-                        "type": "progress",
-                        "phase": "downloading",
-                        "episode_index": idx,
-                        "total": total,
-                        "episode_id": episode_id,
+                    actions_data = _downsample_actions(ep["actions"], max_points=2000)
+                    result = {
+                        "type": "episode_data",
+                        "episode_id": ep["episode_id"],
+                        "episode_index": ep["episode_index"],
+                        "actions": actions_data,
+                        "imu": ep["imu"],
                     }
+                    yield f"data: {json.dumps(result)}\n\n"
 
-                    # Download + extract in thread pool (blocking I/O)
+            else:
+                # --- MCAP path (original) ---
+                episodes_to_analyze = raw_episodes[:max_episodes]
+                total = len(episodes_to_analyze)
+
+                yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
+
+                from loaders.streaming_extractor import StreamingFrameExtractor
+                extractor = StreamingFrameExtractor(repo_id)
+
+                for idx, ep in enumerate(episodes_to_analyze):
+                    if await request.is_disconnected():
+                        break
+
+                    episode_id = ep["episode_id"]
+                    episode_path = ep["path"]
+
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': idx, 'total': total, 'episode_id': episode_id})}\n\n"
+
                     try:
                         loop = asyncio.get_event_loop()
 
-                        # Extract actions
                         actions_data = await loop.run_in_executor(
                             None, extractor.extract_actions_data, episode_path
                         )
-
-                        # Extract IMU
                         imu_data = await loop.run_in_executor(
                             None, extractor.extract_imu_data, episode_path
                         )
 
-                        # Downsample if too many points (>2000 per episode)
                         actions_data = _downsample_actions(actions_data, max_points=2000)
                         imu_data = _downsample_imu(imu_data, max_points=2000)
 
-                        return {
+                        result = {
                             "type": "episode_data",
                             "episode_id": episode_id,
                             "episode_index": idx,
@@ -317,7 +631,7 @@ async def get_signals_comparison(
 
                     except Exception as e:
                         logger.error(f"Failed to process episode {episode_id}: {e}")
-                        return {
+                        result = {
                             "type": "episode_data",
                             "episode_id": episode_id,
                             "episode_index": idx,
@@ -325,55 +639,7 @@ async def get_signals_comparison(
                             "imu": {"error": str(e)},
                         }
 
-            # Process episodes with concurrency control
-            # We can't use asyncio.gather with the semaphore yielding pattern,
-            # so process sequentially but downloads are cached after first fetch
-            for idx, ep in enumerate(episodes_to_analyze):
-                if await request.is_disconnected():
-                    break
-
-                episode_id = ep["episode_id"]
-                episode_path = ep["path"]
-
-                # Send progress
-                yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': idx, 'total': total, 'episode_id': episode_id})}\n\n"
-
-                try:
-                    loop = asyncio.get_event_loop()
-
-                    # Extract actions (downloads MCAP if not cached, no video decode)
-                    actions_data = await loop.run_in_executor(
-                        None, extractor.extract_actions_data, episode_path
-                    )
-
-                    # Extract IMU (file already cached from actions extraction)
-                    imu_data = await loop.run_in_executor(
-                        None, extractor.extract_imu_data, episode_path
-                    )
-
-                    # Downsample if too many points
-                    actions_data = _downsample_actions(actions_data, max_points=2000)
-                    imu_data = _downsample_imu(imu_data, max_points=2000)
-
-                    result = {
-                        "type": "episode_data",
-                        "episode_id": episode_id,
-                        "episode_index": idx,
-                        "actions": actions_data,
-                        "imu": imu_data,
-                    }
-
-                except Exception as e:
-                    logger.error(f"Failed to process episode {episode_id}: {e}")
-                    result = {
-                        "type": "episode_data",
-                        "episode_id": episode_id,
-                        "episode_index": idx,
-                        "actions": {"error": str(e)},
-                        "imu": {"error": str(e)},
-                    }
-
-                yield f"data: {json.dumps(result)}\n\n"
+                    yield f"data: {json.dumps(result)}\n\n"
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 

@@ -117,6 +117,10 @@ DATASET_REGISTRY = {
         "repo_id": "builddotai/Egocentric-10K",
         "requires_auth": True,
         "streaming_recommended": True,
+        "format": "webdataset",
+        "has_actions": False,
+        "has_imu": False,
+        "max_episode_size_mb": None,
     },
     "realomni": {
         "name": "10Kh RealOmni-Open",
@@ -128,6 +132,10 @@ DATASET_REGISTRY = {
         "requires_auth": True,
         "streaming_recommended": True,
         "modalities": ["rgb", "depth", "imu", "actions"],
+        "format": "mcap",
+        "has_actions": True,
+        "has_imu": True,
+        "max_episode_size_mb": 200,
     },
     "ego4d": {
         "name": "Ego4D",
@@ -136,6 +144,10 @@ DATASET_REGISTRY = {
         "size_estimate_gb": 7000,  # ~7 TB
         "requires_auth": True,
         "requires_license": True,
+        "format": "video",
+        "has_actions": False,
+        "has_imu": False,
+        "max_episode_size_mb": None,
     },
     "microagi00": {
         "name": "MicroAGI00",
@@ -146,6 +158,10 @@ DATASET_REGISTRY = {
         "repo_id": "MicroAGI-Labs/MicroAGI00",
         "requires_auth": False,
         "streaming_recommended": True,
+        "format": "mcap",
+        "has_actions": True,
+        "has_imu": True,
+        "max_episode_size_mb": 57000,
     },
 }
 
