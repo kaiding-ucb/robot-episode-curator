@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from api.routes import datasets, episodes, downloads, quality, compare, rerun
+from api.routes import datasets, episodes, downloads, quality, compare, rerun, analysis
 
 # Configure logging
 logging.basicConfig(
@@ -57,6 +57,7 @@ app.include_router(downloads.router, prefix="/api/downloads", tags=["downloads"]
 app.include_router(quality.router, prefix="/api/quality", tags=["quality"])
 app.include_router(compare.router, prefix="/api/compare", tags=["compare"])
 app.include_router(rerun.router, prefix="/api", tags=["rerun"])
+app.include_router(analysis.router, prefix="/api/datasets", tags=["analysis"])
 
 
 @app.get("/")
