@@ -19,6 +19,7 @@ export interface FrameCountDistribution {
   max_frames: number;
   outlier_episode_ids: string[];
   source: string;
+  source_note?: string;
   error?: string;
 }
 
@@ -49,7 +50,17 @@ export interface EpisodeSignalData {
 
 export interface SignalAnalysisState {
   episodes: Map<string, EpisodeSignalData>;
-  phase: "idle" | "processing" | "complete" | "error";
+  phase: "idle" | "processing" | "complete" | "error" | "no_signals";
   progress: { current: number; total: number; currentEpisode: string };
   error: string | null;
+  noSignalsReason: string | null;
+}
+
+export interface DatasetCapabilities {
+  format: string;
+  has_actions: boolean;
+  has_imu: boolean;
+  supports_frame_counts: boolean;
+  supports_signal_comparison: boolean;
+  signal_comparison_note: string;
 }

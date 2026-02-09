@@ -1,14 +1,52 @@
 /**
- * Hook for dataset analysis — frame counts and signal comparison.
+ * Hook for dataset analysis — frame counts, signal comparison, and capabilities.
  */
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import type {
   FrameCountDistribution,
   EpisodeSignalData,
   SignalAnalysisState,
+  DatasetCapabilities,
 } from "@/types/analysis";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+
+/**
+ * Fetch dataset analysis capabilities (format, supported analyses).
+ */
+export function useDatasetCapabilities() {
+  const [capabilities, setCapabilities] = useState<DatasetCapabilities | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchCapabilities = useCallback(async (datasetId: string) => {
+    setLoading(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/datasets/${datasetId}/analysis/capabilities`
+      );
+      if (!res.ok) {
+        setCapabilities(null);
+        return;
+      }
+      const result = await res.json();
+      if (result.error) {
+        setCapabilities(null);
+      } else {
+        setCapabilities(result);
+      }
+    } catch {
+      setCapabilities(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    setCapabilities(null);
+  }, []);
+
+  return { capabilities, loading, fetchCapabilities, reset };
+}
 
 /**
  * Fetch frame count distribution for a task (zero download).
@@ -56,6 +94,7 @@ export function useSignalComparison() {
     phase: "idle",
     progress: { current: 0, total: 0, currentEpisode: "" },
     error: null,
+    noSignalsReason: null,
   });
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -71,6 +110,7 @@ export function useSignalComparison() {
         phase: "processing",
         progress: { current: 0, total: 0, currentEpisode: "" },
         error: null,
+        noSignalsReason: null,
       });
 
       const url = `${API_BASE}/datasets/${datasetId}/analysis/signals?task_name=${encodeURIComponent(taskName)}&max_episodes=${maxEpisodes}`;
@@ -117,6 +157,13 @@ export function useSignalComparison() {
           } else if (data.type === "done") {
             setState((prev) => ({ ...prev, phase: "complete" }));
             eventSource.close();
+          } else if (data.type === "no_signals") {
+            setState((prev) => ({
+              ...prev,
+              phase: "no_signals",
+              noSignalsReason: data.reason || "Signal comparison is not available for this dataset.",
+            }));
+            eventSource.close();
           } else if (data.type === "error") {
             setState((prev) => ({
               ...prev,
@@ -135,6 +182,10 @@ export function useSignalComparison() {
           // If we already got data, treat as complete
           if (prev.episodes.size > 0) {
             return { ...prev, phase: "complete" };
+          }
+          // If no_signals was already set, keep it
+          if (prev.phase === "no_signals") {
+            return prev;
           }
           return { ...prev, phase: "error", error: "Connection lost" };
         });
