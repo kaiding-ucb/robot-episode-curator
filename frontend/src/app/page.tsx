@@ -35,6 +35,7 @@ export default function Home() {
   const [showDataManager, setShowDataManager] = useState(false);
   const [showDatasetQuality, setShowDatasetQuality] = useState(false);
   const [showCompare, setShowCompare] = useState(false);
+  const [showDatasetAnalysis, setShowDatasetAnalysis] = useState(false);
 
   const handleSelectEpisode = (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => {
     setSelectedDataset(datasetId);
@@ -48,7 +49,9 @@ export default function Home() {
     <div className="flex h-screen bg-gray-100 dark:bg-gray-950" data-testid="app-layout">
       <LeftSidebar
         onSelectEpisode={handleSelectEpisode}
+        onSelectDataset={(id) => setSelectedDataset(id)}
         onOpenDataManager={() => setShowDataManager(true)}
+        onOpenAnalysis={() => setShowDatasetAnalysis(true)}
       />
       <MainContent
         selectedDataset={selectedDataset}
@@ -62,10 +65,12 @@ export default function Home() {
         showDataManager={showDataManager}
         showDatasetQuality={showDatasetQuality}
         showCompare={showCompare}
+        showDatasetAnalysis={showDatasetAnalysis}
         selectedDataset={selectedDataset}
         onCloseDataManager={() => setShowDataManager(false)}
         onCloseDatasetQuality={() => setShowDatasetQuality(false)}
         onCloseCompare={() => setShowCompare(false)}
+        onCloseDatasetAnalysis={() => setShowDatasetAnalysis(false)}
       />
     </div>
   );

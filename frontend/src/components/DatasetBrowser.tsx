@@ -48,9 +48,10 @@ function ModalityChip({ modality }: { modality: string }) {
 
 interface DatasetBrowserProps {
   onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => void;
+  onSelectDataset?: (datasetId: string | null) => void;
 }
 
-export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps) {
+export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: DatasetBrowserProps) {
   const { datasets, loading: loadingDatasets, error: datasetsError, refetch: refetchDatasets } = useDatasets();
   const [selectedDataset, setSelectedDataset] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
@@ -70,6 +71,7 @@ export default function DatasetBrowser({ onSelectEpisode }: DatasetBrowserProps)
   const handleSelectDataset = (datasetId: string) => {
     setSelectedDataset(datasetId);
     setSelectedTask(null); // Reset task selection when dataset changes
+    onSelectDataset?.(datasetId);
   };
 
   const handleBackToTasks = () => {
