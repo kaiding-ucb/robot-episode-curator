@@ -47,21 +47,27 @@ export default function DatasetAnalysis({
     loading: frameCountLoading,
     error: frameCountError,
     fetchFrameCounts,
+    reset: resetFrameCounts,
   } = useFrameCounts();
   const {
     state: signalState,
     startAnalysis,
     cancelAnalysis,
+    reset: resetSignals,
   } = useSignalComparison();
 
-  // Fetch capabilities when dataset changes
+  // Clear all stale data and fetch capabilities when dataset changes
   useEffect(() => {
     if (datasetId) {
+      resetFrameCounts();
+      resetSignals();
       fetchCapabilities(datasetId);
     } else {
       resetCapabilities();
+      resetFrameCounts();
+      resetSignals();
     }
-  }, [datasetId, fetchCapabilities, resetCapabilities]);
+  }, [datasetId, fetchCapabilities, resetCapabilities, resetFrameCounts, resetSignals]);
 
   // If signal comparison not supported, default to frame-counts tab
   useEffect(() => {

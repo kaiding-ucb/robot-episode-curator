@@ -16,6 +16,7 @@ export interface Dataset {
   id: string;
   name: string;
   type: "teleop" | "video";
+  format?: string | null; // "lerobot", "mcap", "webdataset", etc.
   description?: string;
   episode_count?: number;
   size_mb?: number;
@@ -29,6 +30,7 @@ export interface EpisodeMetadata {
   task_name?: string;
   num_frames: number;
   duration_sec?: number;
+  task_local_index?: number;
 }
 
 export interface Task {

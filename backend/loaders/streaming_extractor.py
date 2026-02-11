@@ -275,12 +275,13 @@ class StreamingFrameExtractor:
 
         return None
 
-    def download_file(self, file_path: str) -> Path:
+    def download_file(self, file_path: str, revision: Optional[str] = None) -> Path:
         """
         Download a file from HuggingFace if not already cached.
 
         Args:
             file_path: Path within the HuggingFace repo (e.g., "Cooking_and_Kitchen_Clean/clean_bowl/00001/00001.mcap")
+            revision: Branch/tag/commit to download from (e.g., "v2.0"). Defaults to "main".
 
         Returns:
             Local path to the downloaded file
@@ -295,7 +296,8 @@ class StreamingFrameExtractor:
         try:
             from huggingface_hub import hf_hub_download
 
-            logger.info(f"Downloading {file_path} from {self.repo_id}...")
+            branch_info = f" (revision={revision})" if revision and revision != "main" else ""
+            logger.info(f"Downloading {file_path} from {self.repo_id}{branch_info}...")
 
             # Create parent directory
             cached_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,14 +306,18 @@ class StreamingFrameExtractor:
             token = self._get_hf_token()
 
             # Download to cache
-            downloaded_path = hf_hub_download(
-                repo_id=self.repo_id,
-                filename=file_path,
-                repo_type="dataset",
-                local_dir=cached_path.parent,
-                local_dir_use_symlinks=False,
-                token=token,
-            )
+            download_kwargs = {
+                "repo_id": self.repo_id,
+                "filename": file_path,
+                "repo_type": "dataset",
+                "local_dir": cached_path.parent,
+                "local_dir_use_symlinks": False,
+                "token": token,
+            }
+            if revision and revision != "main":
+                download_kwargs["revision"] = revision
+
+            downloaded_path = hf_hub_download(**download_kwargs)
 
             # Move to our cache location if different
             downloaded = Path(downloaded_path)
@@ -1175,7 +1181,8 @@ class StreamingFrameExtractor:
         start: int = 0,
         end: int = 10,
         stream: str = "rgb",
-        depth_colormap: str = "viridis"
+        depth_colormap: str = "viridis",
+        revision: Optional[str] = None,
     ) -> Tuple[List[Tuple[int, float, np.ndarray]], int]:
         """
         Extract frames from an episode file and return total frame count.
@@ -1189,12 +1196,13 @@ class StreamingFrameExtractor:
             end: End frame index
             stream: Which stream to extract: "rgb" or "depth"
             depth_colormap: Colormap for depth visualization
+            revision: Branch/tag to download from (e.g., "v2.0")
 
         Returns:
             Tuple of (frames_list, total_frame_count)
         """
         # Download the file first
-        local_path = self.download_file(episode_path)
+        local_path = self.download_file(episode_path, revision=revision)
         suffix = local_path.suffix.lower()
 
         # Get total frame count

@@ -310,7 +310,7 @@ async def resolve_lerobot_episode(
     if cache_key in _lerobot_resolution_cache:
         return _lerobot_resolution_cache[cache_key]
 
-    from .datasets import fetch_lerobot_info, fetch_lerobot_episodes_meta
+    from .datasets import fetch_lerobot_info, fetch_lerobot_episodes_meta, detect_lerobot_data_branch
 
     # Parse episode index
     import re
@@ -321,21 +321,8 @@ async def resolve_lerobot_episode(
 
     # Fetch metadata
     info = await fetch_lerobot_info(repo_id)
-    episodes_df = await fetch_lerobot_episodes_meta(repo_id)
-
-    if info is None or episodes_df is None:
-        logger.warning(f"Could not fetch LeRobot metadata for {repo_id}")
-        return None
-
-    # Find this episode in metadata
-    ep_row = episodes_df[episodes_df["episode_index"] == target_ep_idx]
-    if len(ep_row) == 0:
-        logger.warning(f"Episode {target_ep_idx} not found in metadata for {repo_id}")
-        return None
-    ep_row = ep_row.iloc[0]
-
-    num_frames = int(ep_row["length"]) if "length" in ep_row.index else None
-    if num_frames is None:
+    if info is None:
+        logger.warning(f"Could not fetch LeRobot info.json for {repo_id}")
         return None
 
     fps = info.get("fps", 30)
@@ -349,61 +336,121 @@ async def resolve_lerobot_episode(
             video_key = feat_name
             break
 
-    if not video_key:
-        logger.warning(f"No video feature found in LeRobot info for {repo_id}")
+    if not video_key or not video_path_template:
+        logger.warning(f"No video feature or video_path template found in LeRobot info for {repo_id}")
         return None
 
-    # Get chunk_index and file_index from episode metadata
-    vid_chunk_col = f"videos/{video_key}/chunk_index"
-    vid_file_col = f"videos/{video_key}/file_index"
-    vid_from_ts_col = f"videos/{video_key}/from_timestamp"
-    vid_to_ts_col = f"videos/{video_key}/to_timestamp"
+    # Detect which branch has the actual data files
+    data_branch = await detect_lerobot_data_branch(repo_id)
 
-    chunk_index = int(ep_row[vid_chunk_col]) if vid_chunk_col in ep_row.index else target_ep_idx // info.get("chunks_size", 1000)
-    file_index = int(ep_row[vid_file_col]) if vid_file_col in ep_row.index else 0
+    episodes_df = await fetch_lerobot_episodes_meta(repo_id)
 
-    # Build the video path
-    video_path = video_path_template.format(
-        video_key=video_key,
-        chunk_index=chunk_index,
-        file_index=file_index,
-    )
+    if episodes_df is not None:
+        # v3 path: use episode metadata for chunk/file indices and timestamps
+        ep_row = episodes_df[episodes_df["episode_index"] == target_ep_idx]
+        if len(ep_row) == 0:
+            logger.warning(f"Episode {target_ep_idx} not found in metadata for {repo_id}")
+            return None
+        ep_row = ep_row.iloc[0]
 
-    # Compute frame range using timestamps and FPS
-    # Each episode has from_timestamp and to_timestamp within the video file
-    if vid_from_ts_col in ep_row.index and vid_to_ts_col in ep_row.index:
-        from_ts = float(ep_row[vid_from_ts_col])
-        to_ts = float(ep_row[vid_to_ts_col])
-        frame_start = round(from_ts * fps)
-        frame_end = round(to_ts * fps)
-    else:
-        # Fallback: compute from cumulative episode lengths in same chunk
-        chunks_size = info.get("chunks_size", 1000)
-        chunk_episodes = episodes_df[
-            (episodes_df["episode_index"] >= chunk_index * chunks_size) &
-            (episodes_df["episode_index"] < (chunk_index + 1) * chunks_size)
-        ].sort_values("episode_index")
+        num_frames = int(ep_row["length"]) if "length" in ep_row.index else None
+        if num_frames is None:
+            return None
 
-        frame_start = 0
-        for _, row in chunk_episodes.iterrows():
-            if int(row["episode_index"]) == target_ep_idx:
-                break
-            frame_start += int(row["length"])
-        frame_end = frame_start + num_frames
+        # Get chunk_index and file_index from episode metadata
+        vid_chunk_col = f"videos/{video_key}/chunk_index"
+        vid_file_col = f"videos/{video_key}/file_index"
+        vid_from_ts_col = f"videos/{video_key}/from_timestamp"
+        vid_to_ts_col = f"videos/{video_key}/to_timestamp"
+
+        chunk_index = int(ep_row[vid_chunk_col]) if vid_chunk_col in ep_row.index else target_ep_idx // info.get("chunks_size", 1000)
+        file_index = int(ep_row[vid_file_col]) if vid_file_col in ep_row.index else 0
+
+        # Build the video path - try template variables for both v3 and v2.1 naming
+        try:
+            video_path = video_path_template.format(
+                video_key=video_key,
+                chunk_index=chunk_index,
+                file_index=file_index,
+                episode_chunk=chunk_index,
+                episode_index=target_ep_idx,
+            )
+        except KeyError:
+            video_path = video_path_template.format(
+                video_key=video_key,
+                episode_chunk=chunk_index,
+                episode_index=target_ep_idx,
+            )
+
+        # Compute frame range using timestamps and FPS
+        if vid_from_ts_col in ep_row.index and vid_to_ts_col in ep_row.index:
+            from_ts = float(ep_row[vid_from_ts_col])
+            to_ts = float(ep_row[vid_to_ts_col])
+            frame_start = round(from_ts * fps)
+            frame_end = round(to_ts * fps)
+        else:
+            # Fallback: compute from cumulative episode lengths in same chunk
+            chunks_size = info.get("chunks_size", 1000)
+            chunk_episodes = episodes_df[
+                (episodes_df["episode_index"] >= chunk_index * chunks_size) &
+                (episodes_df["episode_index"] < (chunk_index + 1) * chunks_size)
+            ].sort_values("episode_index")
+
+            frame_start = 0
+            for _, row in chunk_episodes.iterrows():
+                if int(row["episode_index"]) == target_ep_idx:
+                    break
+                frame_start += int(row["length"])
+            frame_end = frame_start + num_frames
+
+        result = {
+            "video_path": video_path,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "num_frames": num_frames,
+            "fps": fps,
+            "video_key": video_key,
+            "data_branch": data_branch,
+        }
+
+        _lerobot_resolution_cache[cache_key] = result
+        logger.info(
+            f"Resolved LeRobot {episode_id} -> {video_path} "
+            f"frames [{frame_start}:{frame_end}] ({num_frames} frames)"
+        )
+        return result
+
+    # v2.1 fallback: no meta/episodes/ metadata, each episode is a separate video file
+    chunks_size = info.get("chunks_size", 1000)
+    episode_chunk = target_ep_idx // chunks_size
+
+    try:
+        video_path = video_path_template.format(
+            video_key=video_key,
+            episode_chunk=episode_chunk,
+            episode_index=target_ep_idx,
+            chunk_index=episode_chunk,
+            file_index=0,
+        )
+    except KeyError as e:
+        logger.warning(f"Failed to format video_path template for {repo_id}: {e}")
+        return None
 
     result = {
         "video_path": video_path,
-        "frame_start": frame_start,
-        "frame_end": frame_end,
-        "num_frames": num_frames,
+        "frame_start": 0,
+        "frame_end": None,
+        "num_frames": None,
         "fps": fps,
         "video_key": video_key,
+        "single_episode_video": True,
+        "data_branch": data_branch,
     }
 
     _lerobot_resolution_cache[cache_key] = result
     logger.info(
-        f"Resolved LeRobot {episode_id} -> {video_path} "
-        f"frames [{frame_start}:{frame_end}] ({num_frames} frames)"
+        f"Resolved LeRobot v2.1 {episode_id} -> {video_path} "
+        f"(single episode video, branch={data_branch})"
     )
     return result
 
@@ -447,6 +494,7 @@ async def get_streaming_frames(
     quality: int = 70,
     dataset_id: str = None,
     stream: str = "rgb",
+    revision: str = None,
 ) -> FramesResponse:
     """
     Get frames from a streaming HuggingFace episode.
@@ -462,6 +510,7 @@ async def get_streaming_frames(
         quality: JPEG quality (10-100)
         dataset_id: Dataset identifier for caching
         stream: Which stream to extract: "rgb" or "depth"
+        revision: Branch/tag to download from (e.g., "v2.0")
     """
     cache = get_encoded_frame_cache()
     effective_dataset_id = dataset_id or repo_id.replace("/", "_")
@@ -500,9 +549,9 @@ async def get_streaming_frames(
 
     try:
         # Extract ALL frames (from 0 to a large number to get everything)
-        logger.info(f"Decoding full episode for caching: {file_path} (stream={stream})")
+        logger.info(f"Decoding full episode for caching: {file_path} (stream={stream}, revision={revision})")
         raw_frames, total_frames = extractor.extract_frames_with_count(
-            file_path, 0, 999999, stream=stream
+            file_path, 0, 999999, stream=stream, revision=revision
         )
 
         # Log decode result
@@ -609,15 +658,25 @@ async def get_frames(
                 ]
                 return FramesResponse(frames=frames, total_frames=total_frames, from_cache=True)
 
-            # Not cached - extract from video chunk
+            # Not cached - extract from video
             video_path = resolution_info["video_path"]
+            fps = resolution_info["fps"]
+            data_branch = resolution_info.get("data_branch")
+
+            if resolution_info.get("single_episode_video"):
+                # v2.1: each episode is a separate video file, use streaming extraction
+                return await get_streaming_frames(
+                    repo_id, video_path, start, end, resolution, quality,
+                    dataset_id, stream, revision=data_branch,
+                )
+
+            # v3: extract from video chunk using frame offsets
             frame_start = resolution_info["frame_start"]
             frame_end = resolution_info["frame_end"]
             num_frames = resolution_info["num_frames"]
-            fps = resolution_info["fps"]
 
             extractor = StreamingFrameExtractor(repo_id)
-            local_path = extractor.download_file(video_path)
+            local_path = extractor.download_file(video_path, revision=data_branch)
 
             actual_start = frame_start + start
             actual_end_vid = min(frame_start + end, frame_end)
@@ -769,6 +828,7 @@ async def stream_frames_generator(
     stream: str,
     is_disconnected: callable = None,
     dataset_id: str = None,
+    revision: str = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generate Server-Sent Events for progressive frame streaming.
@@ -781,6 +841,7 @@ async def stream_frames_generator(
     Args:
         is_disconnected: Optional async callable to check if client disconnected
         dataset_id: Dataset ID for caching
+        revision: Branch/tag to download from (e.g., "v2.0")
     """
     import concurrent.futures
 
@@ -828,7 +889,7 @@ async def stream_frames_generator(
             return
 
         # Download the file in thread pool (allows disconnection checking)
-        local_path = await run_in_thread(extractor.download_file, file_path)
+        local_path = await run_in_thread(extractor.download_file, file_path, revision=revision)
         if local_path is None:
             return  # Client disconnected during download
         suffix = local_path.suffix.lower()
@@ -1024,8 +1085,11 @@ async def stream_lerobot_frames_generator(
         if await check_disconnected():
             return
 
-        # Download the video chunk file
-        local_path = await loop.run_in_executor(executor, extractor.download_file, video_path)
+        # Download the video chunk file (use data_branch for datasets on non-main branches)
+        data_branch = resolution_info.get("data_branch")
+        local_path = await loop.run_in_executor(
+            executor, lambda: extractor.download_file(video_path, revision=data_branch)
+        )
         if local_path is None:
             yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to download video'})}\n\n"
             return
@@ -1136,6 +1200,44 @@ async def stream_frames(
     if _is_lerobot_episode_id(episode_id):
         resolution_info = await resolve_lerobot_episode(repo_id, episode_id)
         if resolution_info:
+            data_branch = resolution_info.get("data_branch")
+
+            # v2.1 single-episode videos: use generic streaming with resolved video path
+            if resolution_info.get("single_episode_video"):
+                video_path = resolution_info["video_path"]
+                # Check cache using episode_id as key
+                cache = get_encoded_frame_cache()
+                effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+                cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+                episode_key = cache.get_episode_cache_key(
+                    effective_dataset_id, episode_id + cache_key_suffix, resolution, quality
+                )
+                cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+                if cached_episode:
+                    cached_frame_count = len(cached_episode['frames'])
+                    has_enough_frames = cached_frame_count >= end or cached_frame_count >= cached_episode.get('total', 0)
+                    if has_enough_frames and start < cached_frame_count:
+                        return StreamingResponse(
+                            serve_cached_frames_as_sse(cached_episode, start, end, episode_id),
+                            media_type="text/event-stream",
+                            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                        )
+
+                async def is_disconnected_v21():
+                    return await request.is_disconnected()
+
+                return StreamingResponse(
+                    stream_frames_generator(
+                        repo_id, video_path, start, end, resolution, quality, stream,
+                        is_disconnected=is_disconnected_v21,
+                        dataset_id=dataset_id,
+                        revision=data_branch,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                )
+
+            # v3: use episode metadata for chunk/frame-level extraction
             # Check cache first (keyed by episode_id, not video chunk path)
             cache = get_encoded_frame_cache()
             effective_dataset_id = dataset_id or repo_id.replace("/", "_")

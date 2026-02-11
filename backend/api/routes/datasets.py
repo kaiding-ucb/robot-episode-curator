@@ -49,6 +49,7 @@ class DatasetInfo(BaseModel):
     id: str
     name: str
     type: str  # "teleop" or "video"
+    format: Optional[str] = None  # "lerobot", "mcap", "webdataset", etc.
     description: Optional[str] = None
     status: str  # "ready", "not_downloaded", "downloading"
     size_mb: Optional[float] = None
@@ -63,6 +64,7 @@ class EpisodeInfo(BaseModel):
     description: Optional[str] = None
     num_frames: Optional[int] = None
     duration_seconds: Optional[float] = None
+    task_local_index: Optional[int] = None  # 0-based index within the task
 
 
 class TaskInfo(BaseModel):
@@ -119,12 +121,22 @@ OVERVIEW_CACHE_TTL_HOURS = 24
 _LEROBOT_INFO_CACHE: Dict[str, Tuple[dict, datetime]] = {}
 _LEROBOT_EPISODES_CACHE: Dict[str, Tuple[pd.DataFrame, datetime]] = {}
 _LEROBOT_TASKS_CACHE: Dict[str, Tuple[pd.DataFrame, datetime]] = {}
+_LEROBOT_DATA_BRANCH_CACHE: Dict[str, Optional[str]] = {}
 LEROBOT_CACHE_TTL_HOURS = 24
 
 
 def _get_hf_headers() -> dict:
     """Get HuggingFace auth headers if token is available."""
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        # Check file-based tokens (consistent with analysis.py)
+        for token_path in [
+            Path.home() / ".huggingface" / "token",
+            Path.home() / ".cache" / "huggingface" / "token",
+        ]:
+            if token_path.exists():
+                hf_token = token_path.read_text().strip()
+                break
     return {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
 
@@ -149,6 +161,69 @@ async def fetch_lerobot_info(repo_id: str) -> Optional[dict]:
                 return data
         except Exception as e:
             logger.warning(f"Failed to fetch LeRobot info.json for {repo_id}: {e}")
+    return None
+
+
+async def detect_lerobot_data_branch(repo_id: str) -> Optional[str]:
+    """
+    Detect which branch contains the actual data/video files for a LeRobot dataset.
+
+    Some LeRobot datasets have data on versioned branches (e.g., v2.0) while
+    main only contains metadata. This function probes branches to find one
+    with data/ or videos/ directories.
+
+    Returns the branch name (e.g., "main", "v2.0") or None if no data found.
+    """
+    if repo_id in _LEROBOT_DATA_BRANCH_CACHE:
+        return _LEROBOT_DATA_BRANCH_CACHE[repo_id]
+
+    headers = _get_hf_headers()
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # First check main branch
+        tree_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
+        try:
+            resp = await client.get(tree_url, headers=headers, timeout=15.0)
+            if resp.status_code == 200:
+                items = resp.json()
+                dir_names = {item["path"] for item in items if item.get("type") == "directory"}
+                if "data" in dir_names or "videos" in dir_names:
+                    _LEROBOT_DATA_BRANCH_CACHE[repo_id] = "main"
+                    return "main"
+        except Exception:
+            pass
+
+        # Main doesn't have data - check versioned branches
+        info = await fetch_lerobot_info(repo_id)
+        branches_to_try = []
+        if info:
+            cv = info.get("codebase_version", "")
+            if cv:
+                branches_to_try.append(cv)  # e.g., "v2.1"
+                # Also try without minor version
+                major = cv.rsplit(".", 1)[0] if "." in cv else cv
+                if major != cv:
+                    branches_to_try.append(major)  # e.g., "v2"
+
+        # Try common versioned branches
+        for branch in ["v2.0", "v1.6", "v1.5", "v1.4", "v1.3", "v1.0"]:
+            if branch not in branches_to_try:
+                branches_to_try.append(branch)
+
+        for branch in branches_to_try:
+            try:
+                tree_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{branch}"
+                resp = await client.get(tree_url, headers=headers, timeout=10.0)
+                if resp.status_code == 200:
+                    items = resp.json()
+                    dir_names = {item["path"] for item in items if item.get("type") == "directory"}
+                    if "data" in dir_names or "videos" in dir_names:
+                        logger.info(f"Found LeRobot data on branch '{branch}' for {repo_id}")
+                        _LEROBOT_DATA_BRANCH_CACHE[repo_id] = branch
+                        return branch
+            except Exception:
+                continue
+
+    _LEROBOT_DATA_BRANCH_CACHE[repo_id] = None
     return None
 
 
@@ -370,6 +445,7 @@ async def list_datasets(request: Request):
                 id=ds["id"],
                 name=ds["name"],
                 type=ds["type"],
+                format=ds.get("format"),
                 description=ds.get("description"),
                 status=ds.get("status", "unknown"),
                 size_mb=ds.get("size_mb"),
@@ -470,27 +546,31 @@ async def list_episodes(
     ]
 
 
+_NON_TASK_DIRS = {"meta", "data", "videos", ".cache", ".huggingface", "logs", "stats"}
+
+
 async def get_tasks_from_huggingface(repo_id: str) -> List[TaskInfo]:
     """
     Get task list from HuggingFace API by listing top-level directories.
 
     This works for datasets organized by task folders (like 10Kh-RealOmin-OpenData).
+    Filters out known non-task directories (meta, data, videos, etc.).
     """
     url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, timeout=30.0)
+            response = await client.get(url, headers=_get_hf_headers(), timeout=30.0)
             response.raise_for_status()
             items = response.json()
 
-            # Extract directories as tasks (exclude files like README.md, .gitattributes)
+            # Extract directories as tasks (exclude files and non-task dirs)
             tasks = []
             for item in items:
                 if item.get("type") == "directory":
                     task_name = item.get("path", "")
-                    # Skip hidden directories
-                    if not task_name.startswith("."):
+                    # Skip hidden directories and known non-task directories
+                    if not task_name.startswith(".") and task_name.lower() not in _NON_TASK_DIRS:
                         tasks.append(TaskInfo(
                             name=task_name,
                             episode_count=None,  # Unknown without scanning
@@ -625,42 +705,63 @@ async def list_tasks(dataset_id: str, request: Request):
 
     # For LeRobot streaming datasets, use metadata parquet for tasks
     if config.get("streaming_recommended") and config.get("repo_id"):
-        if await is_lerobot_dataset(config):
+        is_lerobot = await is_lerobot_dataset(config)
+        if is_lerobot:
             repo_id = config["repo_id"]
-            tasks_df = await fetch_lerobot_tasks_meta(repo_id)
-            episodes_df = await fetch_lerobot_episodes_meta(repo_id)
-            if tasks_df is not None:
-                # Use task_description column (or fallback to first non-task_index column)
-                task_col = "task_description"
-                if task_col not in tasks_df.columns:
-                    for col in tasks_df.columns:
-                        if col != "task_index":
-                            task_col = col
-                            break
+            try:
+                tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+                if tasks_df is not None:
+                    # Use task_description column (or fallback to first non-task_index column)
+                    task_col = "task_description"
+                    if task_col not in tasks_df.columns:
+                        for col in tasks_df.columns:
+                            if col != "task_index":
+                                task_col = col
+                                break
 
-                # Get episode-task mapping for counts
-                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
-                task_episode_counts: Dict[int, int] = {}
-                if ep_task_map:
-                    for _, task_idx in ep_task_map.items():
-                        task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
+                    # Get episode-task mapping for counts
+                    ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                    task_episode_counts: Dict[int, int] = {}
+                    if ep_task_map:
+                        for _, task_idx in ep_task_map.items():
+                            task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
 
-                tasks = []
-                for _, row in tasks_df.iterrows():
-                    task_idx = int(row["task_index"])
-                    task_name = str(row[task_col]).strip() if task_col in row.index else ""
-                    if not task_name:
-                        task_name = f"Untitled (task {task_idx})"
-                    ep_count = task_episode_counts.get(task_idx)
-                    tasks.append(TaskInfo(
-                        name=task_name,
-                        episode_count=ep_count,
-                    ))
-                return TaskListResponse(
-                    tasks=tasks,
-                    total_tasks=len(tasks),
-                    source="lerobot_metadata",
-                )
+                    tasks = []
+                    for _, row in tasks_df.iterrows():
+                        task_idx = int(row["task_index"])
+                        task_name = str(row[task_col]).strip() if task_col in row.index else ""
+                        if not task_name:
+                            task_name = f"Untitled (task {task_idx})"
+                        ep_count = task_episode_counts.get(task_idx)
+                        tasks.append(TaskInfo(
+                            name=task_name,
+                            episode_count=ep_count,
+                        ))
+                    return TaskListResponse(
+                        tasks=tasks,
+                        total_tasks=len(tasks),
+                        source="lerobot_metadata",
+                    )
+
+                # Fallback: tasks.parquet missing, use info.json
+                info = await fetch_lerobot_info(repo_id)
+                if info:
+                    total_tasks = info.get("total_tasks", 1)
+                    total_episodes = info.get("total_episodes", 0)
+                    tasks = []
+                    for t_idx in range(total_tasks):
+                        ep_count = total_episodes if total_tasks == 1 else None
+                        tasks.append(TaskInfo(
+                            name=f"Untitled (task {t_idx})",
+                            episode_count=ep_count,
+                        ))
+                    return TaskListResponse(
+                        tasks=tasks,
+                        total_tasks=len(tasks),
+                        source="lerobot_metadata",
+                    )
+            except Exception as e:
+                logger.warning(f"LeRobot task discovery failed for {dataset_id}: {e}")
 
     # Try HuggingFace API for other streaming datasets
     if config.get("streaming_recommended") and config.get("repo_id"):
@@ -752,7 +853,6 @@ async def list_task_episodes(
 
                 # Handle "Untitled (task N)" fallback names
                 if task_index is None:
-                    import re
                     untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
                     if untitled_match:
                         candidate_idx = int(untitled_match.group(1))
@@ -767,11 +867,14 @@ async def list_task_episodes(
                 if ep_task_map is None:
                     return []
 
-                # Filter episode indices belonging to this task
+                # Filter episode indices belonging to this task, sorted by global index
                 task_ep_indices = sorted([
                     ep_idx for ep_idx, t_idx in ep_task_map.items()
                     if t_idx == task_index
                 ])
+
+                # Build global->task-local index mapping (consistent with analysis.py)
+                global_to_local = {ep_idx: local_idx for local_idx, ep_idx in enumerate(task_ep_indices)}
 
                 # Get metadata for these episodes
                 task_episodes = episodes_df[episodes_df["episode_index"].isin(task_ep_indices)]
@@ -786,13 +889,63 @@ async def list_task_episodes(
                     ep_idx = int(row["episode_index"])
                     length = int(row["length"]) if "length" in row.index else None
                     duration = length / fps if length else None
+                    local_idx = global_to_local[ep_idx]
                     episodes.append(EpisodeInfo(
                         id=f"episode_{ep_idx}",
                         task_name=task_name,
                         num_frames=length,
                         duration_seconds=round(duration, 2) if duration else None,
+                        task_local_index=local_idx,
                     ))
                 return episodes
+
+            # LeRobot v2.1 fallback: no meta/episodes/ or meta/tasks.parquet
+            # Use info.json to generate episode listings
+            if info:
+                task_index = 0
+                untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
+                if untitled_match:
+                    task_index = int(untitled_match.group(1))
+
+                total_episodes = info.get("total_episodes", 0)
+                total_tasks = info.get("total_tasks", 1)
+                fps = info.get("fps", 30)
+
+                # For single-task datasets, all episodes belong to task 0
+                if total_tasks <= 1 and task_index == 0:
+                    # Apply pagination to the full episode range
+                    ep_start = offset
+                    ep_end = min(offset + limit, total_episodes)
+                    episodes = []
+                    for ep_idx in range(ep_start, ep_end):
+                        episodes.append(EpisodeInfo(
+                            id=f"episode_{ep_idx}",
+                            task_name=task_name,
+                            num_frames=None,
+                            duration_seconds=None,
+                            task_local_index=ep_idx,
+                        ))
+                    return episodes
+
+                # Multi-task without metadata: try datasets server API
+                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                if ep_task_map:
+                    task_ep_indices = sorted([
+                        ep_idx for ep_idx, t_idx in ep_task_map.items()
+                        if t_idx == task_index
+                    ])
+                    global_to_local = {ep_idx: local_idx for local_idx, ep_idx in enumerate(task_ep_indices)}
+                    page = task_ep_indices[offset:offset + limit]
+                    episodes = []
+                    for ep_idx in page:
+                        episodes.append(EpisodeInfo(
+                            id=f"episode_{ep_idx}",
+                            task_name=task_name,
+                            num_frames=None,
+                            duration_seconds=None,
+                            task_local_index=global_to_local[ep_idx],
+                        ))
+                    return episodes
 
     # For other streaming HuggingFace datasets, use API to list files in task folder
     if config.get("streaming_recommended") and config.get("repo_id"):
@@ -1335,6 +1488,15 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
         format_detected = "rlds"
     elif ".mp4" in extensions or ".webm" in extensions or ".avi" in extensions:
         format_detected = "video"
+
+    # If format still unknown, check for LeRobot via meta/info.json
+    # LeRobot v2.1 datasets may not have visible data/ directory in tree API
+    if format_detected is None and "meta" in directories:
+        info = await fetch_lerobot_info(repo_id)
+        if info and "codebase_version" in info:
+            format_detected = "lerobot"
+            has_tasks = info.get("total_tasks", 0) > 0
+            logger.info(f"Detected LeRobot {info['codebase_version']} format for {repo_id} via meta/info.json")
 
     return ProbeResponse(
         repo_id=repo_id,

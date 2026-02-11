@@ -228,7 +228,10 @@ def _get_source_note(fmt: str) -> str:
 
 # --- LeRobot/Parquet Signal Extraction ---
 
-_SIGNAL_COLUMNS = ["action", "episode_index", "frame_index", "timestamp", "index", "episode_id"]
+_SIGNAL_COLUMNS = [
+    "action", "observation.state", "end_pose", "start_pos", "gripper_width",
+    "episode_index", "frame_index", "timestamp", "index", "episode_id",
+]
 
 
 async def _download_parquet(
@@ -236,6 +239,7 @@ async def _download_parquet(
     repo_id: str,
     file_path: str,
     headers: Dict[str, str],
+    branch: str = "main",
 ) -> pd.DataFrame:
     """
     Download only signal-related columns from a HF Parquet file.
@@ -252,7 +256,11 @@ async def _download_parquet(
 
     def _read_columns():
         fs = HfFileSystem(token=token)
-        hf_path = f"datasets/{repo_id}/{file_path}"
+        # Use @revision syntax to specify branch for non-main branches
+        if branch and branch != "main":
+            hf_path = f"datasets/{repo_id}@{branch}/{file_path}"
+        else:
+            hf_path = f"datasets/{repo_id}/{file_path}"
         schema = pq.read_schema(hf_path, filesystem=fs)
         available = set(schema.names)
         cols = [c for c in _SIGNAL_COLUMNS if c in available]
@@ -265,7 +273,8 @@ async def _download_parquet(
         return await loop.run_in_executor(None, _read_columns)
     except Exception as e:
         logger.warning(f"Column-filtered read failed for {file_path}, falling back to full download: {e}")
-        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+        resolve_ref = branch or "main"
+        url = f"https://huggingface.co/datasets/{repo_id}/resolve/{resolve_ref}/{file_path}"
         response = await client.get(url, headers=headers, timeout=120.0, follow_redirects=True)
         response.raise_for_status()
         return pd.read_parquet(io.BytesIO(response.content))
@@ -278,6 +287,7 @@ async def _extract_lerobot_episodes(
     headers: Dict[str, str],
     max_episodes: int,
     filter_episodes: Optional[set] = None,
+    branch: str = "main",
 ) -> List[Dict[str, Any]]:
     """
     Download LeRobot Parquet files and extract per-episode action data.
@@ -294,7 +304,7 @@ async def _extract_lerobot_episodes(
 
     for pf in parquet_files:
         try:
-            df = await _download_parquet(client, repo_id, pf["path"], headers)
+            df = await _download_parquet(client, repo_id, pf["path"], headers, branch=branch)
             all_dfs.append(df)
 
             # Track unique episodes seen so far (only relevant ones)
@@ -360,10 +370,17 @@ async def _extract_lerobot_episodes(
         else:
             timestamps = [i / 10.0 for i in range(len(group))]
 
-        # Extract actions
+        # Extract actions - try 'action' first, then fall back to state columns
         actions_data: Dict[str, Any] = {"timestamps": [], "actions": [], "dimension_labels": None}
-        if "action" in group.columns:
-            action_list = group["action"].tolist()
+        # Find the best available action/state column
+        action_col = None
+        for candidate in ["action", "observation.state", "end_pose", "start_pos"]:
+            if candidate in group.columns:
+                action_col = candidate
+                break
+
+        if action_col is not None:
+            action_list = group[action_col].tolist()
             # Convert numpy arrays to lists
             actions = []
             for a in action_list:
@@ -373,6 +390,18 @@ async def _extract_lerobot_episodes(
                     actions.append(list(a))
                 else:
                     actions.append([float(a)])
+
+            # Append gripper_width if using a non-action column and gripper_width exists
+            if action_col != "action" and "gripper_width" in group.columns:
+                gripper_list = group["gripper_width"].tolist()
+                for i, g in enumerate(gripper_list):
+                    if isinstance(g, np.ndarray):
+                        actions[i] = actions[i] + g.tolist()
+                    elif isinstance(g, (list, tuple)):
+                        actions[i] = actions[i] + list(g)
+                    else:
+                        actions[i] = actions[i] + [float(g)]
+
             actions_data["timestamps"] = timestamps
             actions_data["actions"] = actions
 
@@ -381,12 +410,14 @@ async def _extract_lerobot_episodes(
                 num_dims = len(actions[0])
                 if num_dims == 7:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+                elif num_dims == 8:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "state", "gripper"]
                 elif num_dims == 6:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
                 elif num_dims == 3:
                     actions_data["dimension_labels"] = ["x", "y", "z"]
         else:
-            actions_data = {"error": "No 'action' column in Parquet data"}
+            actions_data = {"error": "No action or state column in Parquet data"}
 
         episodes.append({
             "episode_id": episode_id,
@@ -399,6 +430,43 @@ async def _extract_lerobot_episodes(
     return episodes
 
 
+def _build_lerobot_data_file_list(
+    info: Dict[str, Any],
+    episode_indices: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    Build data file list from info.json data_path template.
+
+    For LeRobot v2.1 datasets where the tree API doesn't list data/ files,
+    we construct the paths directly using the template from info.json.
+    """
+    data_path_template = info.get("data_path", "")
+    chunks_size = info.get("chunks_size", 1000)
+    if not data_path_template:
+        return []
+
+    files = []
+    for ep_idx in episode_indices:
+        ep_chunk = ep_idx // chunks_size
+        file_idx = ep_idx % chunks_size
+        try:
+            path = data_path_template.format(
+                chunk_index=ep_chunk,
+                file_index=file_idx,
+                episode_chunk=ep_chunk,
+                episode_index=ep_idx,
+            )
+        except (KeyError, IndexError):
+            path = f"data/chunk-{ep_chunk:03d}/episode_{ep_idx:06d}.parquet"
+        files.append({
+            "episode_id": f"data/{path.split('/')[-1]}",
+            "file_name": path.split("/")[-1],
+            "size_bytes": 0,
+            "path": path,
+        })
+    return files
+
+
 # --- Episode Collection ---
 
 async def _collect_episode_files(
@@ -406,18 +474,22 @@ async def _collect_episode_files(
     repo_id: str,
     task_folder: str,
     headers: Dict[str, str],
+    branch: str = "main",
 ) -> List[Dict[str, Any]]:
     """
     Recursively collect episode files from HF tree API, capturing file sizes.
     """
     encoded_path = urllib.parse.quote(task_folder, safe="")
-    url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{encoded_path}"
+    url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{branch}/{encoded_path}"
 
     episode_extensions = {".mcap", ".tar", ".mp4", ".hdf5", ".h5", ".parquet"}
     episodes = []
 
     try:
         response = await client.get(url, headers=headers, timeout=30.0)
+        if response.status_code == 404:
+            logger.info(f"Directory not found (404): {task_folder} in {repo_id}")
+            return []
         response.raise_for_status()
         items = response.json()
 
@@ -449,7 +521,7 @@ async def _collect_episode_files(
                     processed_dirs.add(item_path)
                     try:
                         sub_encoded = urllib.parse.quote(item_path, safe="")
-                        sub_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{sub_encoded}"
+                        sub_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{branch}/{sub_encoded}"
                         sub_response = await client.get(sub_url, headers=headers, timeout=15.0)
                         if sub_response.status_code == 200:
                             items_to_process.extend(sub_response.json())
@@ -479,7 +551,7 @@ def _compute_statistics(
 
     counts = [ep.estimated_frames for ep in episodes]
     mean = sum(counts) / len(counts)
-    variance = sum((c - mean) ** 2 for c in counts) / max(len(counts) - 1, 1)
+    variance = sum((c - mean) ** 2 for c in counts) / len(counts)
     std = math.sqrt(variance)
 
     # Outliers: episodes beyond 2 standard deviations from mean
@@ -509,11 +581,20 @@ async def get_dataset_capabilities(dataset_id: str):
     Returns what types of analysis are supported based on format and file sizes.
     """
     from downloaders.manager import get_all_datasets
+    from api.routes.datasets import is_lerobot_dataset
 
     all_datasets = get_all_datasets()
     dataset_info = all_datasets.get(dataset_id)
     if not dataset_info:
         return {"error": f"Dataset '{dataset_id}' not found"}
+
+    # Auto-detect LeRobot format for datasets with format=null
+    if not dataset_info.get("format") and dataset_info.get("streaming_recommended"):
+        try:
+            if await is_lerobot_dataset(dataset_info):
+                dataset_info = {**dataset_info, "format": "lerobot", "has_actions": True}
+        except Exception:
+            pass
 
     return _get_capabilities(dataset_info)
 
@@ -603,6 +684,124 @@ async def _lerobot_frame_counts_for_task(
     )
 
 
+async def _lerobot_frame_counts_from_api(
+    repo_id: str, task_name: str,
+) -> Optional[FrameCountDistribution]:
+    """
+    Get frame counts for a LeRobot dataset using info.json and HF datasets server API.
+
+    This is the fallback when meta/episodes/ and meta/tasks.parquet are not available
+    (e.g. LeRobot v2.1 datasets like umi_cup_in_the_wild).
+    """
+    from api.routes.datasets import fetch_lerobot_info
+    import re
+
+    info = await fetch_lerobot_info(repo_id)
+    if not info:
+        return None
+
+    total_episodes = info.get("total_episodes", 0)
+    total_tasks = info.get("total_tasks", 1)
+    fps = info.get("fps", 30)
+
+    if total_episodes == 0:
+        return None
+
+    # Resolve task index from task name
+    task_index = 0
+    untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
+    if untitled_match:
+        task_index = int(untitled_match.group(1))
+
+    # Use datasets server API to get per-episode frame counts
+    # Query first frames (frame_index=0) to enumerate episodes
+    episode_lengths: Dict[int, int] = {}
+    headers = _get_hf_headers()
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        offset = 0
+        page_size = 100
+        max_pages = min(50, (total_episodes // page_size) + 2)  # Cap for large datasets
+
+        for _ in range(max_pages):
+            url = (
+                f"https://datasets-server.huggingface.co/filter"
+                f"?dataset={repo_id}&config=default&split=train"
+                f"&where=frame_index=0&offset={offset}&length={page_size}"
+            )
+            try:
+                resp = await client.get(url, headers=headers, timeout=30.0)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    break
+                for row in rows:
+                    r = row.get("row", {})
+                    ep_idx = r.get("episode_index")
+                    t_idx = r.get("task_index", 0)
+                    if ep_idx is not None and t_idx == task_index:
+                        # frame count = episode_data_index_to - episode_data_index_from
+                        idx_from = r.get("episode_data_index_from")
+                        idx_to = r.get("episode_data_index_to")
+                        if idx_from is not None and idx_to is not None:
+                            episode_lengths[ep_idx] = idx_to - idx_from
+                        else:
+                            episode_lengths[ep_idx] = 0  # Will be filled later
+                offset += page_size
+                if len(rows) < page_size:
+                    break
+            except Exception as e:
+                logger.warning(f"Datasets server API failed at offset {offset}: {e}")
+                break
+
+    if not episode_lengths:
+        # Ultra-fallback: distribute total_frames evenly
+        total_frames = info.get("total_frames", 0)
+        if total_frames > 0 and total_episodes > 0:
+            avg_frames = total_frames // total_episodes
+            episode_counts = []
+            for i in range(min(total_episodes, 200)):  # Cap at 200 for display
+                episode_counts.append(EpisodeFrameCount(
+                    episode_id=f"episode_{i}",
+                    estimated_frames=avg_frames,
+                    size_bytes=0,
+                    file_name=f"episode_{i} (~{avg_frames} frames, ~{avg_frames/fps:.1f}s)",
+                ))
+            stats = _compute_statistics(episode_counts)
+            return FrameCountDistribution(
+                task_name=task_name,
+                episodes=episode_counts,
+                total_episodes=total_episodes,
+                source="metadata",
+                source_note=f"Approximate frame counts from info.json ({total_episodes} episodes, {total_frames} total frames). Individual episode lengths unavailable.",
+                **stats,
+            )
+        return None
+
+    # Build frame count distribution from API data
+    episode_counts = []
+    for local_idx, (ep_idx, length) in enumerate(sorted(episode_lengths.items())):
+        episode_counts.append(EpisodeFrameCount(
+            episode_id=f"episode_{local_idx}",
+            estimated_frames=length,
+            size_bytes=0,
+            file_name=f"episode_{local_idx} ({length} frames, {length/fps:.1f}s)",
+        ))
+
+    stats = _compute_statistics(episode_counts)
+
+    return FrameCountDistribution(
+        task_name=task_name,
+        episodes=episode_counts,
+        total_episodes=len(episode_counts),
+        source="metadata",
+        source_note="Frame counts from HuggingFace datasets server API.",
+        **stats,
+    )
+
+
 @router.get("/{dataset_id}/analysis/frame-counts")
 async def get_frame_count_distribution(
     dataset_id: str,
@@ -627,11 +826,30 @@ async def get_frame_count_distribution(
         return {"error": f"No repo_id for dataset '{dataset_id}'"}
 
     # For LeRobot datasets, use exact metadata instead of file-size estimation
-    if dataset_info.get("streaming_recommended") and await is_lerobot_dataset(dataset_info):
-        result = await _lerobot_frame_counts_for_task(repo_id, task_name)
-        if result is not None:
-            return result
-        logger.warning(f"LeRobot metadata unavailable for {dataset_id}, falling back to file-size estimation")
+    is_lerobot = False
+    try:
+        if dataset_info.get("streaming_recommended"):
+            is_lerobot = await is_lerobot_dataset(dataset_info)
+    except Exception as e:
+        logger.warning(f"LeRobot detection failed for {dataset_id}: {e}")
+
+    if is_lerobot:
+        try:
+            result = await _lerobot_frame_counts_for_task(repo_id, task_name)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning(f"LeRobot metadata frame counts failed for {dataset_id}: {e}")
+
+        # Fallback: use info.json + datasets server API for frame counts
+        try:
+            result = await _lerobot_frame_counts_from_api(repo_id, task_name)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning(f"LeRobot API frame counts failed for {dataset_id}: {e}")
+
+        logger.warning(f"All LeRobot frame count methods failed for {dataset_id}, falling back to file-size estimation")
 
     headers = _get_hf_headers()
 
@@ -697,8 +915,18 @@ async def get_signals_comparison(
             yield f"data: {json.dumps({'type': 'error', 'message': f'Dataset {dataset_id} not found'})}\n\n"
         return StreamingResponse(error_gen(), media_type="text/event-stream")
 
+    # Auto-detect LeRobot format for datasets with format=null
+    effective_info = dataset_info
+    if not dataset_info.get("format") and dataset_info.get("streaming_recommended"):
+        try:
+            from api.routes.datasets import is_lerobot_dataset
+            if await is_lerobot_dataset(dataset_info):
+                effective_info = {**dataset_info, "format": "lerobot", "has_actions": True}
+        except Exception:
+            pass
+
     # Check capabilities before attempting extraction
-    capabilities = _get_capabilities(dataset_info)
+    capabilities = _get_capabilities(effective_info)
     if not capabilities.supports_signal_comparison:
         async def no_signals_gen():
             yield f"data: {json.dumps({'type': 'no_signals', 'reason': capabilities.signal_comparison_note})}\n\n"
@@ -726,13 +954,18 @@ async def get_signals_comparison(
                     fetch_lerobot_tasks_meta,
                     fetch_lerobot_episode_task_map,
                     fetch_lerobot_episodes_meta,
+                    fetch_lerobot_info,
+                    detect_lerobot_data_branch,
                 )
                 import re as _re
 
+                info = await fetch_lerobot_info(repo_id)
                 tasks_df = await fetch_lerobot_tasks_meta(repo_id)
                 ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
 
                 task_ep_indices = None
+                task_index = 0  # Default to task 0
+
                 if tasks_df is not None and ep_task_map is not None:
                     task_col = "task_description"
                     if task_col not in tasks_df.columns:
@@ -741,23 +974,41 @@ async def get_signals_comparison(
                                 task_col = col
                                 break
 
-                    task_index = None
+                    resolved_task_index = None
                     if task_col in tasks_df.columns:
                         match = tasks_df[tasks_df[task_col] == task_name]
                         if len(match) > 0:
-                            task_index = int(match.iloc[0]["task_index"])
-                    if task_index is None:
+                            resolved_task_index = int(match.iloc[0]["task_index"])
+                    if resolved_task_index is None:
                         untitled_match = _re.match(r"^Untitled \(task (\d+)\)$", task_name)
                         if untitled_match:
                             candidate_idx = int(untitled_match.group(1))
                             if candidate_idx in tasks_df["task_index"].values:
-                                task_index = candidate_idx
+                                resolved_task_index = candidate_idx
 
-                    if task_index is not None:
+                    if resolved_task_index is not None:
+                        task_index = resolved_task_index
                         task_ep_indices = set(
                             ep_idx for ep_idx, t_idx in ep_task_map.items()
                             if t_idx == task_index
                         )
+                elif ep_task_map is not None:
+                    # tasks.parquet missing but ep_task_map available
+                    untitled_match = _re.match(r"^Untitled \(task (\d+)\)$", task_name)
+                    if untitled_match:
+                        task_index = int(untitled_match.group(1))
+                    task_ep_indices = set(
+                        ep_idx for ep_idx, t_idx in ep_task_map.items()
+                        if t_idx == task_index
+                    )
+                else:
+                    # No task metadata at all - use first N episodes
+                    untitled_match = _re.match(r"^Untitled \(task (\d+)\)$", task_name)
+                    if untitled_match:
+                        task_index = int(untitled_match.group(1))
+                    if info and task_index == 0:
+                        total_eps = info.get("total_episodes", max_episodes)
+                        task_ep_indices = set(range(min(total_eps, max_episodes)))
 
                 # Fetch episode metadata for true frame counts
                 episodes_meta_df = await fetch_lerobot_episodes_meta(repo_id)
@@ -766,20 +1017,42 @@ async def get_signals_comparison(
                     for _, row in episodes_meta_df.iterrows():
                         ep_frame_counts[int(row["episode_index"])] = int(row["length"])
 
-                # List data parquet files from data/ directory
+                # Determine which episodes to fetch: sorted by global index, capped
+                if task_ep_indices:
+                    target_ep_list = sorted(task_ep_indices)[:max_episodes]
+                else:
+                    total_eps = (info or {}).get("total_episodes", max_episodes)
+                    target_ep_list = list(range(min(total_eps, max_episodes)))
+                target_ep_set = set(target_ep_list)
+
+                # Detect which branch has data files (some datasets use v2.0, v2.1, etc.)
+                data_branch = await detect_lerobot_data_branch(repo_id) or "main"
+                logger.info(f"Using branch '{data_branch}' for data files of {repo_id}")
+
+                # List data parquet files - try tree API first, fall back to info.json template
                 yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    data_files = await _collect_episode_files(client, repo_id, "data", headers)
+                data_files = []
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        data_files = await _collect_episode_files(client, repo_id, "data", headers, branch=data_branch)
+                except Exception as e:
+                    logger.info(f"Tree API failed for data/ directory ({e}), using info.json template")
+
+                # Fallback: construct paths from info.json data_path template
+                if not data_files and info and info.get("data_path"):
+                    data_files = _build_lerobot_data_file_list(info, target_ep_list)
 
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     episodes = await _extract_lerobot_episodes(
                         client, repo_id, data_files, headers,
                         max_episodes=max_episodes,
-                        filter_episodes=task_ep_indices,
+                        filter_episodes=target_ep_set,
+                        branch=data_branch,
                     )
 
-                # Re-index to task-local indices, preserving true frame counts
+                # Sort by global index, then re-index to task-local indices
+                episodes.sort(key=lambda ep: ep.get("global_episode_index") or 0)
                 for i, ep in enumerate(episodes):
                     global_idx = ep.get("global_episode_index")
                     ep["total_frames"] = ep_frame_counts.get(global_idx) if global_idx is not None else None

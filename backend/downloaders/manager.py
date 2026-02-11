@@ -199,6 +199,7 @@ class DownloadManager:
                     "id": dataset_id,
                     "name": config["name"],
                     "type": config["type"],
+                    "format": config.get("format"),
                     "description": config.get("description", ""),
                     "size_estimate_gb": config.get("size_estimate_gb", 0),
                     "requires_auth": config.get("requires_auth", False),

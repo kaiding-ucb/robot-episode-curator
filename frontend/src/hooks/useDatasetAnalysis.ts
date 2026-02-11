@@ -1,7 +1,7 @@
 /**
  * Hook for dataset analysis — frame counts, signal comparison, and capabilities.
  */
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef } from "react";
 import type {
   FrameCountDistribution,
   EpisodeSignalData,
@@ -82,7 +82,13 @@ export function useFrameCounts() {
     []
   );
 
-  return { data, loading, error, fetchFrameCounts };
+  const reset = useCallback(() => {
+    setData(null);
+    setLoading(false);
+    setError(null);
+  }, []);
+
+  return { data, loading, error, fetchFrameCounts, reset };
 }
 
 /**
@@ -204,5 +210,19 @@ export function useSignalComparison() {
     setState((prev) => ({ ...prev, phase: "idle" }));
   }, []);
 
-  return { state, startAnalysis, cancelAnalysis };
+  const reset = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setState({
+      episodes: new Map(),
+      phase: "idle",
+      progress: { current: 0, total: 0, currentEpisode: "" },
+      error: null,
+      noSignalsReason: null,
+    });
+  }, []);
+
+  return { state, startAnalysis, cancelAnalysis, reset };
 }

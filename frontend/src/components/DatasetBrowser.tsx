@@ -196,15 +196,22 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                       </div>
                     )}
                   </div>
-                  <span
-                    className={`px-2 py-1 text-xs rounded-full flex-shrink-0 ${
-                      dataset.type === "teleop"
-                        ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
-                        : "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
-                    }`}
-                  >
-                    {dataset.type}
-                  </span>
+                  <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                    <span
+                      className={`px-2 py-0.5 text-xs rounded-full ${
+                        dataset.type === "teleop"
+                          ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
+                          : "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
+                      }`}
+                    >
+                      {dataset.type}
+                    </span>
+                    {(dataset.format === "lerobot" || dataset.description?.includes("lerobot/")) && (
+                      <span className="px-2 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
+                        lerobot
+                      </span>
+                    )}
+                  </div>
                 </div>
               </button>
               {/* Remove button - appears on hover */}
@@ -484,7 +491,9 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                 </div>
               )}
               <ul className="divide-y divide-gray-100 dark:divide-gray-800" data-testid="episode-list">
-                {episodes.map((episode, index) => (
+                {episodes.map((episode, index) => {
+                  const displayIndex = episode.task_local_index ?? index;
+                  return (
                   <li key={episode.id}>
                     <button
                       onClick={() => onSelectEpisode?.(
@@ -492,13 +501,13 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                         episode.id,
                         episode.num_frames || 0,
                         overview?.modalities as Modality[] | undefined,
-                        `episode_${index}`
+                        `episode_${displayIndex}`
                       )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
                       data-testid={`episode-item-${episode.id}`}
                     >
                       <p className="text-sm font-medium text-gray-900 dark:text-white">
-                        episode_{index}
+                        episode_{displayIndex}
                       </p>
                       <p className="text-xs text-gray-500">
                         {episode.num_frames != null ? `${episode.num_frames} frames` : 'frames'}
@@ -506,7 +515,8 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                       </p>
                     </button>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
 
               {/* Load More Button */}
