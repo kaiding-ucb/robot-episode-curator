@@ -141,6 +141,7 @@ export function useSignalComparison() {
               episode_index: data.episode_index,
               actions: data.actions,
               imu: data.imu,
+              total_frames: data.total_frames ?? null,
             };
             setState((prev) => {
               const newEpisodes = new Map(prev.episodes);

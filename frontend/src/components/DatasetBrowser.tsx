@@ -47,7 +47,7 @@ function ModalityChip({ modality }: { modality: string }) {
 }
 
 interface DatasetBrowserProps {
-  onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => void;
+  onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => void;
   onSelectDataset?: (datasetId: string | null) => void;
 }
 
@@ -491,7 +491,8 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                         selectedDataset,
                         episode.id,
                         episode.num_frames || 0,
-                        overview?.modalities as Modality[] | undefined
+                        overview?.modalities as Modality[] | undefined,
+                        `episode_${index}`
                       )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
                       data-testid={`episode-item-${episode.id}`}

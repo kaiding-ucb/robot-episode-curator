@@ -391,6 +391,7 @@ async def _extract_lerobot_episodes(
         episodes.append({
             "episode_id": episode_id,
             "episode_index": len(episodes),
+            "global_episode_index": ep_idx_int,
             "actions": actions_data,
             "imu": None,  # LeRobot datasets don't have IMU
         })
@@ -720,10 +721,11 @@ async def get_signals_comparison(
                 # --- LeRobot/Parquet path using metadata ---
                 fmt = "lerobot"
 
-                # Get task's episode indices
+                # Get task's episode indices and metadata
                 from api.routes.datasets import (
                     fetch_lerobot_tasks_meta,
                     fetch_lerobot_episode_task_map,
+                    fetch_lerobot_episodes_meta,
                 )
                 import re as _re
 
@@ -757,6 +759,13 @@ async def get_signals_comparison(
                             if t_idx == task_index
                         )
 
+                # Fetch episode metadata for true frame counts
+                episodes_meta_df = await fetch_lerobot_episodes_meta(repo_id)
+                ep_frame_counts: Dict[int, int] = {}
+                if episodes_meta_df is not None and "length" in episodes_meta_df.columns:
+                    for _, row in episodes_meta_df.iterrows():
+                        ep_frame_counts[int(row["episode_index"])] = int(row["length"])
+
                 # List data parquet files from data/ directory
                 yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
@@ -770,8 +779,10 @@ async def get_signals_comparison(
                         filter_episodes=task_ep_indices,
                     )
 
-                # Re-index to task-local indices
+                # Re-index to task-local indices, preserving true frame counts
                 for i, ep in enumerate(episodes):
+                    global_idx = ep.get("global_episode_index")
+                    ep["total_frames"] = ep_frame_counts.get(global_idx) if global_idx is not None else None
                     ep["episode_index"] = i
                     ep["episode_id"] = f"episode_{i}"
 
@@ -789,6 +800,7 @@ async def get_signals_comparison(
                         "episode_index": ep["episode_index"],
                         "actions": actions_data,
                         "imu": ep["imu"],
+                        "total_frames": ep.get("total_frames"),
                     }
                     yield f"data: {json.dumps(result)}\n\n"
 

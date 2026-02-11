@@ -6,6 +6,7 @@ import type { Modality } from "@/types/api";
 interface MainContentProps {
   selectedDataset: string | null;
   selectedEpisode: string | null;
+  selectedEpisodeDisplayName?: string | null;
   totalFrames: number;
   targetFrame: number | null;
   onFrameChange: () => void;
@@ -15,6 +16,7 @@ interface MainContentProps {
 export default function MainContent({
   selectedDataset,
   selectedEpisode,
+  selectedEpisodeDisplayName,
   totalFrames,
   targetFrame,
   onFrameChange,
@@ -30,7 +32,7 @@ export default function MainContent({
               <div>
                 <span className="text-sm text-gray-500">Viewing:</span>
                 <span className="ml-2 font-medium text-gray-900 dark:text-white">
-                  {selectedDataset} / {selectedEpisode}
+                  {selectedDataset} / {selectedEpisodeDisplayName || selectedEpisode}
                 </span>
               </div>
             </div>

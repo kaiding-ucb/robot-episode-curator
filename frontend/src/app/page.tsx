@@ -27,6 +27,7 @@ export default function Home() {
   // Shared state - both sidebars receive via props
   const [selectedDataset, setSelectedDataset] = useState<string | null>(null);
   const [selectedEpisode, setSelectedEpisode] = useState<string | null>(null);
+  const [selectedEpisodeDisplayName, setSelectedEpisodeDisplayName] = useState<string | null>(null);
   const [selectedEpisodeFrameCount, setSelectedEpisodeFrameCount] = useState<number>(0);
   const [selectedModalities, setSelectedModalities] = useState<Modality[]>(["rgb"]);
   const [targetFrame, setTargetFrame] = useState<number | null>(null);
@@ -37,9 +38,10 @@ export default function Home() {
   const [showCompare, setShowCompare] = useState(false);
   const [showDatasetAnalysis, setShowDatasetAnalysis] = useState(false);
 
-  const handleSelectEpisode = (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => {
+  const handleSelectEpisode = (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => {
     setSelectedDataset(datasetId);
     setSelectedEpisode(episodeId);
+    setSelectedEpisodeDisplayName(displayName || episodeId);
     setSelectedEpisodeFrameCount(numFrames);
     setSelectedModalities(modalities || ["rgb"]);
     setTargetFrame(null);
@@ -56,6 +58,7 @@ export default function Home() {
       <MainContent
         selectedDataset={selectedDataset}
         selectedEpisode={selectedEpisode}
+        selectedEpisodeDisplayName={selectedEpisodeDisplayName}
         totalFrames={selectedEpisodeFrameCount}
         targetFrame={targetFrame}
         onFrameChange={() => setTargetFrame(null)}

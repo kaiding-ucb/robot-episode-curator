@@ -4,7 +4,7 @@ import DatasetBrowser from "@/components/DatasetBrowser";
 import type { Modality } from "@/types/api";
 
 interface LeftSidebarProps {
-  onSelectEpisode: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[]) => void;
+  onSelectEpisode: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => void;
   onSelectDataset: (datasetId: string | null) => void;
   onOpenDataManager: () => void;
   onOpenAnalysis: () => void;

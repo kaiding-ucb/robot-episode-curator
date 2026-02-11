@@ -306,7 +306,7 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges }: EpisodeChartRo
   }, [episodeData, batchRanges]);
 
   const hasError = episodeData.actions?.error || episodeData.imu?.error;
-  const frameCount = episodeData.actions?.actions?.length ?? 0;
+  const frameCount = episodeData.total_frames ?? episodeData.actions?.actions?.length ?? 0;
 
   return (
     <div className="flex items-stretch gap-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-b-0">

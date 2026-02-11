@@ -46,6 +46,7 @@ export interface EpisodeSignalData {
   episode_index: number;
   actions: EpisodeActions;
   imu: EpisodeIMU;
+  total_frames?: number | null;
 }
 
 export interface SignalAnalysisState {
