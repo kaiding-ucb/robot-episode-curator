@@ -35,7 +35,7 @@ export default function DatasetAnalysis({
   const { datasets } = useDatasets();
 
   // Data hooks
-  const { tasks } = useTasks(datasetId);
+  const { tasks, loading: tasksLoading } = useTasks(datasetId);
   const {
     capabilities,
     loading: capabilitiesLoading,
@@ -70,19 +70,19 @@ export default function DatasetAnalysis({
     }
   }, [capabilities, activeTab]);
 
-  // Auto-select first task when tasks load
+  // Auto-select first task when tasks load (only after fetch completes)
   useEffect(() => {
-    if (tasks.length > 0 && !selectedTask) {
+    if (!tasksLoading && tasks.length > 0 && !selectedTask) {
       setSelectedTask(tasks[0].name);
     }
-  }, [tasks, selectedTask]);
+  }, [tasks, selectedTask, tasksLoading]);
 
-  // Fetch frame counts when task is selected
+  // Fetch frame counts when task is selected (only if task belongs to current dataset)
   useEffect(() => {
-    if (datasetId && selectedTask) {
+    if (datasetId && selectedTask && !tasksLoading && tasks.some(t => t.name === selectedTask)) {
       fetchFrameCounts(datasetId, selectedTask);
     }
-  }, [datasetId, selectedTask, fetchFrameCounts]);
+  }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts]);
 
   const handleStartSignalAnalysis = useCallback(() => {
     if (datasetId && selectedTask) {
@@ -148,8 +148,11 @@ export default function DatasetAnalysis({
           className="px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
           data-testid="task-selector"
         >
-          {tasks.length === 0 && (
+          {tasksLoading && (
             <option value="">Loading tasks...</option>
+          )}
+          {!tasksLoading && tasks.length === 0 && (
+            <option value="">No tasks found</option>
           )}
           {tasks.map((task) => (
             <option key={task.name} value={task.name}>

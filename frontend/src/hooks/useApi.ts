@@ -91,12 +91,21 @@ export function useTasks(datasetId: string | null) {
   const [source, setSource] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [prevDatasetId, setPrevDatasetId] = useState<string | null>(null);
+
+  // Immediately clear stale tasks during render when dataset changes
+  // (React's recommended pattern for derived state reset)
+  if (datasetId !== prevDatasetId) {
+    setPrevDatasetId(datasetId);
+    setTasks([]);
+    setTotalTasks(0);
+    setSource(null);
+    setLoading(!!datasetId);
+    setError(null);
+  }
 
   useEffect(() => {
     if (!datasetId) {
-      setTasks([]);
-      setTotalTasks(0);
-      setSource(null);
       return;
     }
 
