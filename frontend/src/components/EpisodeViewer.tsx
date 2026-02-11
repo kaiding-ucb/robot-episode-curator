@@ -39,6 +39,9 @@ export default function EpisodeViewer({
   }>({ status: null });
   const cachingTriggeredRef = useRef(false);
 
+  // Track if initial caching status check is done (to avoid starting SSE prematurely)
+  const [initialStatusChecked, setInitialStatusChecked] = useState(false);
+
   // Check available modalities
   const hasDepth = availableModalities.includes("depth");
   const hasImu = availableModalities.includes("imu");
@@ -86,8 +89,15 @@ export default function EpisodeViewer({
   }, [episodeId, datasetId, cachingStatus.status, streamingOptions, activeStream, API_BASE]);
 
   // Check caching status when episode loads (to resume showing progress for ongoing caching)
+  // IMPORTANT: This must complete BEFORE SSE starts to avoid redundant streaming
   useEffect(() => {
-    if (!episodeId || !datasetId) return;
+    if (!episodeId || !datasetId) {
+      setInitialStatusChecked(true);
+      return;
+    }
+
+    // Reset for new episode
+    setInitialStatusChecked(false);
 
     const checkInitialStatus = async () => {
       try {
@@ -117,6 +127,8 @@ export default function EpisodeViewer({
         console.error("Failed to check initial caching status:", err);
         setCachingStatus({ status: null });
         cachingTriggeredRef.current = false;
+      } finally {
+        setInitialStatusChecked(true);
       }
     };
 
@@ -162,6 +174,10 @@ export default function EpisodeViewer({
   // Frames appear as they're decoded (~2-3s for first frame) rather than waiting for full batch
   const batchSize = 750; // ~25 seconds at 30fps
   const batchStart = Math.floor(currentFrame / batchSize) * batchSize;
+
+  // Determine if episode is actively being cached in background
+  const isActivelyCaching = cachingStatus.status === "caching" || cachingStatus.status === "started";
+
   const {
     frames,
     totalFrames: apiTotalFrames,
@@ -175,7 +191,11 @@ export default function EpisodeViewer({
     datasetId,
     batchStart,
     batchStart + batchSize,
-    streamingOptions
+    {
+      ...streamingOptions,
+      // Don't start SSE until we know caching status, and skip if already caching
+      enabled: initialStatusChecked && !isActivelyCaching,
+    }
   );
 
   // Use API-provided total frames if prop is 0 or unknown
@@ -303,9 +323,31 @@ export default function EpisodeViewer({
     );
   }
 
-  // Only show full loading screen if we have NO frames at all
+  // Only show full loading screen if we have NO frames at all AND not actively caching
   // If we have previous frames, show them with a loading overlay instead
-  const showFullLoadingScreen = loading && frames.size === 0 && !frameToShow;
+  // Skip loading screen if episode is being cached - show caching progress instead
+  const showFullLoadingScreen = loading && frames.size === 0 && !frameToShow && !isActivelyCaching;
+
+  // Show caching progress screen when episode is being cached and no frames yet
+  if (isActivelyCaching && frames.size === 0 && !frameToShow) {
+    return (
+      <div
+        className="flex items-center justify-center h-full text-gray-500"
+        data-testid="caching-progress"
+      >
+        <div className="text-center">
+          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+          <p className="text-lg font-medium">Caching Episode...</p>
+          <p className="text-2xl font-bold text-blue-500 mt-1">{cachingStatus.progress || 0}%</p>
+          <p className="text-xs text-gray-400 mt-2">
+            {cachingStatus.totalFrames
+              ? `${Math.round((cachingStatus.progress || 0) * cachingStatus.totalFrames / 100)} / ${cachingStatus.totalFrames} frames`
+              : "Preparing..."}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (showFullLoadingScreen) {
     return (

@@ -9,6 +9,7 @@ Endpoints:
 """
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 from io import BytesIO
@@ -28,6 +29,24 @@ from cache import get_encoded_frame_cache
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Shared thread pool for CPU-bound operations (video decoding, encoding)
+# 8 workers provides headroom for 5 parallel caching + 3 for API calls
+_HEAVY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="heavy_ops"
+)
+
+# Dedicated thread pool for parallel frame encoding within batches
+# More workers = faster encoding (WebP encoding releases GIL)
+import multiprocessing
+_ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(8, multiprocessing.cpu_count()),
+    thread_name_prefix="encode"
+)
+
+# Semaphore to limit concurrent caching operations to prevent resource exhaustion
+_CACHING_SEMAPHORE = asyncio.Semaphore(5)
 
 # Background caching state - tracks which episodes are being cached
 # and their progress (0-100%)
@@ -234,18 +253,17 @@ def encode_image_with_options(
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
 
-        # Resize if needed
+        # Resize if needed - use INTER_LINEAR for speed (2x faster than INTER_AREA)
         target_size = RESOLUTION_MAP.get(resolution)
         if target_size and (image.shape[1] > target_size[0] or image.shape[0] > target_size[1]):
-            # Use cv2.resize with INTER_AREA for quality downsampling
-            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+            image = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
 
         # Convert to PIL Image
         pil_image = Image.fromarray(image)
 
-        # Encode to WebP with specified quality (40-50% smaller than JPEG)
+        # Encode to WebP with method=0 for fastest compression
         buffer = BytesIO()
-        pil_image.save(buffer, format="WEBP", quality=quality)
+        pil_image.save(buffer, format="WEBP", quality=quality, method=0)
         buffer.seek(0)
 
         return base64.b64encode(buffer.read()).decode("utf-8")
@@ -257,6 +275,137 @@ def encode_image_with_options(
 def encode_image_base64(image: np.ndarray) -> str:
     """Encode numpy image array to base64 JPEG (legacy compatibility)."""
     return encode_image_with_options(image, resolution="original", quality=85)
+
+
+def _is_lerobot_episode_id(episode_id: str) -> bool:
+    """Check if episode_id matches the LeRobot format: episode_N."""
+    import re
+    return bool(re.match(r'^episode_\d+$', episode_id))
+
+
+# Cache for LeRobot episode resolution (avoids repeated HF API calls)
+_lerobot_resolution_cache: Dict[str, Dict[str, Any]] = {}
+
+
+async def resolve_lerobot_episode(
+    repo_id: str,
+    episode_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolve a LeRobot episode_N ID to the video chunk path and frame range.
+
+    Uses episode metadata from meta/episodes/ which contains explicit
+    video chunk/file indices and from/to timestamps per episode.
+
+    Returns dict with:
+        - video_path: path to the MP4 file in the HF repo
+        - frame_start: start frame index within the video file
+        - frame_end: end frame index within the video file (exclusive)
+        - num_frames: number of frames in this episode
+        - fps: frames per second
+        - video_key: the observation key used for video
+    Or None if resolution fails.
+    """
+    cache_key = f"{repo_id}/{episode_id}"
+    if cache_key in _lerobot_resolution_cache:
+        return _lerobot_resolution_cache[cache_key]
+
+    from .datasets import fetch_lerobot_info, fetch_lerobot_episodes_meta
+
+    # Parse episode index
+    import re
+    match = re.match(r'^episode_(\d+)$', episode_id)
+    if not match:
+        return None
+    target_ep_idx = int(match.group(1))
+
+    # Fetch metadata
+    info = await fetch_lerobot_info(repo_id)
+    episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+
+    if info is None or episodes_df is None:
+        logger.warning(f"Could not fetch LeRobot metadata for {repo_id}")
+        return None
+
+    # Find this episode in metadata
+    ep_row = episodes_df[episodes_df["episode_index"] == target_ep_idx]
+    if len(ep_row) == 0:
+        logger.warning(f"Episode {target_ep_idx} not found in metadata for {repo_id}")
+        return None
+    ep_row = ep_row.iloc[0]
+
+    num_frames = int(ep_row["length"]) if "length" in ep_row.index else None
+    if num_frames is None:
+        return None
+
+    fps = info.get("fps", 30)
+    video_path_template = info.get("video_path", "")
+
+    # Determine the first video key from features
+    video_key = None
+    features = info.get("features", {})
+    for feat_name, feat_info in features.items():
+        if feat_info.get("dtype") == "video":
+            video_key = feat_name
+            break
+
+    if not video_key:
+        logger.warning(f"No video feature found in LeRobot info for {repo_id}")
+        return None
+
+    # Get chunk_index and file_index from episode metadata
+    vid_chunk_col = f"videos/{video_key}/chunk_index"
+    vid_file_col = f"videos/{video_key}/file_index"
+    vid_from_ts_col = f"videos/{video_key}/from_timestamp"
+    vid_to_ts_col = f"videos/{video_key}/to_timestamp"
+
+    chunk_index = int(ep_row[vid_chunk_col]) if vid_chunk_col in ep_row.index else target_ep_idx // info.get("chunks_size", 1000)
+    file_index = int(ep_row[vid_file_col]) if vid_file_col in ep_row.index else 0
+
+    # Build the video path
+    video_path = video_path_template.format(
+        video_key=video_key,
+        chunk_index=chunk_index,
+        file_index=file_index,
+    )
+
+    # Compute frame range using timestamps and FPS
+    # Each episode has from_timestamp and to_timestamp within the video file
+    if vid_from_ts_col in ep_row.index and vid_to_ts_col in ep_row.index:
+        from_ts = float(ep_row[vid_from_ts_col])
+        to_ts = float(ep_row[vid_to_ts_col])
+        frame_start = round(from_ts * fps)
+        frame_end = round(to_ts * fps)
+    else:
+        # Fallback: compute from cumulative episode lengths in same chunk
+        chunks_size = info.get("chunks_size", 1000)
+        chunk_episodes = episodes_df[
+            (episodes_df["episode_index"] >= chunk_index * chunks_size) &
+            (episodes_df["episode_index"] < (chunk_index + 1) * chunks_size)
+        ].sort_values("episode_index")
+
+        frame_start = 0
+        for _, row in chunk_episodes.iterrows():
+            if int(row["episode_index"]) == target_ep_idx:
+                break
+            frame_start += int(row["length"])
+        frame_end = frame_start + num_frames
+
+    result = {
+        "video_path": video_path,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "num_frames": num_frames,
+        "fps": fps,
+        "video_key": video_key,
+    }
+
+    _lerobot_resolution_cache[cache_key] = result
+    logger.info(
+        f"Resolved LeRobot {episode_id} -> {video_path} "
+        f"frames [{frame_start}:{frame_end}] ({num_frames} frames)"
+    )
+    return result
 
 
 def is_streaming_episode(episode_id: str, dataset_id: Optional[str]) -> tuple:
@@ -433,6 +582,57 @@ async def get_frames(
     """
     # Check if this is a streaming episode
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+
+    # Handle LeRobot episode_N format via video chunk extraction
+    if is_streaming and _is_lerobot_episode_id(episode_id):
+        resolution_info = await resolve_lerobot_episode(repo_id, episode_id)
+        if resolution_info:
+            cache = get_encoded_frame_cache()
+            effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+            cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+            episode_key = cache.get_episode_cache_key(
+                effective_dataset_id, episode_id + cache_key_suffix, resolution, quality
+            )
+            cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+            if cached_episode:
+                all_frames = cached_episode["frames"]
+                total_frames = cached_episode["total"]
+                actual_end = min(end, len(all_frames))
+                frames = [
+                    FrameData(
+                        frame_idx=f["frame_idx"],
+                        timestamp=f.get("timestamp"),
+                        image_base64=f.get("image_base64"),
+                        action=f.get("action"),
+                    )
+                    for f in all_frames[start:actual_end]
+                ]
+                return FramesResponse(frames=frames, total_frames=total_frames, from_cache=True)
+
+            # Not cached - extract from video chunk
+            video_path = resolution_info["video_path"]
+            frame_start = resolution_info["frame_start"]
+            frame_end = resolution_info["frame_end"]
+            num_frames = resolution_info["num_frames"]
+            fps = resolution_info["fps"]
+
+            extractor = StreamingFrameExtractor(repo_id)
+            local_path = extractor.download_file(video_path)
+
+            actual_start = frame_start + start
+            actual_end_vid = min(frame_start + end, frame_end)
+            raw_frames = extractor.extract_frames_from_video(local_path, actual_start, actual_end_vid)
+
+            frames = []
+            for abs_idx, _, image in raw_frames:
+                ep_idx = abs_idx - frame_start
+                image_base64 = encode_image_with_options(image, resolution, quality)
+                frames.append(FrameData(
+                    frame_idx=ep_idx,
+                    timestamp=ep_idx / fps,
+                    image_base64=image_base64,
+                ))
+            return FramesResponse(frames=frames, total_frames=num_frames, from_cache=False)
 
     if is_streaming:
         logger.info(f"Loading streaming episode from {repo_id}: {file_path} (res={resolution}, q={quality}, stream={stream})")
@@ -776,6 +976,117 @@ async def serve_cached_frames_as_sse(
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
+async def stream_lerobot_frames_generator(
+    repo_id: str,
+    episode_id: str,
+    resolution_info: Dict[str, Any],
+    start: int,
+    end: int,
+    resolution: str,
+    quality: int,
+    is_disconnected: callable = None,
+    dataset_id: str = None,
+) -> AsyncGenerator[str, None]:
+    """
+    SSE generator for LeRobot episodes.
+
+    Downloads the correct video chunk and extracts only the frames
+    belonging to the specific episode.
+    """
+    import concurrent.futures
+
+    video_path = resolution_info["video_path"]
+    frame_start = resolution_info["frame_start"]
+    frame_end = resolution_info["frame_end"]
+    num_frames = resolution_info["num_frames"]
+    fps = resolution_info["fps"]
+
+    extractor = StreamingFrameExtractor(repo_id)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+
+    frames_for_cache = []
+    cache = get_encoded_frame_cache()
+    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+
+    async def check_disconnected():
+        if is_disconnected:
+            try:
+                return await is_disconnected()
+            except Exception:
+                return False
+        return False
+
+    try:
+        # Send total frames first
+        yield f"data: {json.dumps({'type': 'total', 'total_frames': num_frames})}\n\n"
+
+        if await check_disconnected():
+            return
+
+        # Download the video chunk file
+        local_path = await loop.run_in_executor(executor, extractor.download_file, video_path)
+        if local_path is None:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to download video'})}\n\n"
+            return
+
+        if await check_disconnected():
+            return
+
+        # Extract only this episode's frames from the video chunk
+        # frame_start/frame_end are absolute positions within the video file
+        actual_start = frame_start + start
+        actual_end = min(frame_start + end, frame_end)
+
+        raw_frames = await loop.run_in_executor(
+            executor,
+            extractor.extract_frames_from_video,
+            local_path,
+            actual_start,
+            actual_end,
+        )
+
+        if raw_frames is None:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to extract frames'})}\n\n"
+            return
+
+        for abs_frame_idx, timestamp, image in raw_frames:
+            # Re-index to episode-relative (0-based within the episode)
+            ep_frame_idx = abs_frame_idx - frame_start
+
+            if ep_frame_idx % 10 == 0 and await check_disconnected():
+                logger.info(f"Client disconnected during LeRobot streaming: {episode_id} at frame {ep_frame_idx}")
+                return
+
+            image_base64 = encode_image_with_options(image, resolution, quality)
+            ep_timestamp = ep_frame_idx / fps
+
+            frame_data = {
+                'type': 'frame',
+                'index': ep_frame_idx,
+                'timestamp': ep_timestamp,
+                'data': image_base64,
+            }
+            frames_for_cache.append({
+                "frame_idx": ep_frame_idx,
+                "timestamp": ep_timestamp,
+                "image_base64": image_base64,
+                "action": None,
+            })
+            yield f"data: {json.dumps(frame_data)}\n\n"
+            await asyncio.sleep(0)
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    except GeneratorExit:
+        logger.info(f"Client closed connection (GeneratorExit): {episode_id}")
+    except Exception as e:
+        logger.error(f"LeRobot SSE streaming error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 @router.get("/{episode_id:path}/frames/stream")
 async def stream_frames(
     episode_id: str,
@@ -820,6 +1131,53 @@ async def stream_frames(
             status_code=400,
             detail="SSE streaming only available for HuggingFace streaming datasets"
         )
+
+    # Handle LeRobot episode_N format
+    if _is_lerobot_episode_id(episode_id):
+        resolution_info = await resolve_lerobot_episode(repo_id, episode_id)
+        if resolution_info:
+            # Check cache first (keyed by episode_id, not video chunk path)
+            cache = get_encoded_frame_cache()
+            effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+            cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+            episode_key = cache.get_episode_cache_key(
+                effective_dataset_id, episode_id + cache_key_suffix, resolution, quality
+            )
+
+            cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+            if cached_episode:
+                cached_frame_count = len(cached_episode['frames'])
+                has_enough_frames = cached_frame_count >= end or cached_frame_count >= cached_episode.get('total', 0)
+                if has_enough_frames and start < cached_frame_count:
+                    logger.info(f"SSE serving LeRobot from cache: {episode_id} ({cached_frame_count} frames)")
+                    return StreamingResponse(
+                        serve_cached_frames_as_sse(cached_episode, start, end, episode_id),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        }
+                    )
+
+            # Not cached - stream from video chunk
+            async def is_disconnected():
+                return await request.is_disconnected()
+
+            return StreamingResponse(
+                stream_lerobot_frames_generator(
+                    repo_id, episode_id, resolution_info,
+                    start, end, resolution, quality,
+                    is_disconnected=is_disconnected,
+                    dataset_id=dataset_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
 
     # Check cache FIRST - serve from cache if available (much faster!)
     cache = get_encoded_frame_cache()
@@ -1119,21 +1477,33 @@ async def start_background_caching(
             for batch_start in range(0, total_frames, BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, total_frames)
 
-                # Define batch extraction function
+                # Define batch extraction function with parallel encoding
                 def extract_batch(start, end):
-                    batch_frames = []
-                    raw_frames = extractor.extract_frames(
+                    # First extract all raw frames
+                    raw_frames = list(extractor.extract_frames(
                         file_path, start=start, end=end, stream=stream,
                         force_full_extraction=True
-                    )
-                    for frame_idx, timestamp, image in raw_frames:
+                    ))
+
+                    if not raw_frames:
+                        return []
+
+                    # Encode frames in parallel using thread pool
+                    def encode_single_frame(frame_data):
+                        frame_idx, timestamp, image = frame_data
                         image_base64 = encode_image_with_options(image, resolution, quality)
-                        batch_frames.append({
+                        return {
                             "frame_idx": frame_idx,
                             "timestamp": timestamp,
                             "image_base64": image_base64,
                             "action": None,
-                        })
+                        }
+
+                    # Submit all encoding tasks in parallel
+                    futures = [_ENCODE_EXECUTOR.submit(encode_single_frame, f) for f in raw_frames]
+
+                    # Collect results in order
+                    batch_frames = [future.result() for future in futures]
                     return batch_frames
 
                 # Run batch extraction in thread pool

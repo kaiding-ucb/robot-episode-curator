@@ -12,6 +12,7 @@ Endpoints:
 - POST /api/datasets - Add a new dataset from HuggingFace URL
 - DELETE /api/datasets/{id} - Remove a dynamically added dataset
 """
+import io
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import httpx
+import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -34,7 +36,7 @@ from downloaders.manager import (
 )
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.base import Modality
-from loaders.mcap_utils import detect_mcap_modalities, list_mcap_channels
+from loaders.mcap_utils import detect_mcap_modalities
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,214 @@ class DatasetOverview(BaseModel):
 # Overview cache with TTL
 _OVERVIEW_CACHE: Dict[str, Tuple[DatasetOverview, datetime]] = {}
 OVERVIEW_CACHE_TTL_HOURS = 24
+
+# LeRobot metadata cache: {repo_id: (data, fetched_at)}
+_LEROBOT_INFO_CACHE: Dict[str, Tuple[dict, datetime]] = {}
+_LEROBOT_EPISODES_CACHE: Dict[str, Tuple[pd.DataFrame, datetime]] = {}
+_LEROBOT_TASKS_CACHE: Dict[str, Tuple[pd.DataFrame, datetime]] = {}
+LEROBOT_CACHE_TTL_HOURS = 24
+
+
+def _get_hf_headers() -> dict:
+    """Get HuggingFace auth headers if token is available."""
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    return {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+
+async def fetch_lerobot_info(repo_id: str) -> Optional[dict]:
+    """
+    Fetch and cache meta/info.json from a LeRobot HuggingFace dataset.
+
+    Returns dataset info including fps, total_episodes, chunks_size, video path template, etc.
+    """
+    if repo_id in _LEROBOT_INFO_CACHE:
+        cached, fetched_at = _LEROBOT_INFO_CACHE[repo_id]
+        if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
+            return cached
+
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/info.json"
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            resp = await client.get(url, headers=_get_hf_headers(), timeout=30.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                _LEROBOT_INFO_CACHE[repo_id] = (data, datetime.utcnow())
+                return data
+        except Exception as e:
+            logger.warning(f"Failed to fetch LeRobot info.json for {repo_id}: {e}")
+    return None
+
+
+async def fetch_lerobot_episodes_meta(repo_id: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch and cache episode metadata parquet from a LeRobot HuggingFace dataset.
+
+    Returns DataFrame with episode_index, length (frame count), task_index, and
+    video frame range columns.
+    """
+    if repo_id in _LEROBOT_EPISODES_CACHE:
+        cached, fetched_at = _LEROBOT_EPISODES_CACHE[repo_id]
+        if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
+            return cached
+
+    # LeRobot v3 stores episode metadata under meta/episodes/chunk-{N}/file-{N}.parquet
+    # Discover chunks by listing meta/episodes/
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        headers = _get_hf_headers()
+        dfs = []
+
+        # List chunk directories
+        tree_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/meta/episodes"
+        try:
+            resp = await client.get(tree_url, headers=headers, timeout=30.0)
+            if resp.status_code != 200:
+                logger.warning(f"Could not list LeRobot episodes metadata for {repo_id}")
+                return None
+            items = resp.json()
+        except Exception as e:
+            logger.warning(f"Failed to list LeRobot episodes metadata for {repo_id}: {e}")
+            return None
+
+        # For each chunk directory, list and download parquet files
+        for item in items:
+            if item.get("type") != "directory":
+                continue
+            chunk_path = item["path"]
+
+            # List files in this chunk
+            try:
+                chunk_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{chunk_path}"
+                chunk_resp = await client.get(chunk_url, headers=headers, timeout=15.0)
+                if chunk_resp.status_code != 200:
+                    continue
+                chunk_items = chunk_resp.json()
+            except Exception:
+                continue
+
+            for file_item in chunk_items:
+                if file_item.get("type") != "file" or not file_item["path"].endswith(".parquet"):
+                    continue
+                file_path = file_item["path"]
+
+                # Download parquet file
+                try:
+                    dl_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+                    dl_resp = await client.get(dl_url, headers=headers, timeout=60.0)
+                    if dl_resp.status_code == 200:
+                        df = pd.read_parquet(io.BytesIO(dl_resp.content))
+                        dfs.append(df)
+                except Exception as e:
+                    logger.warning(f"Failed to download {file_path}: {e}")
+
+    if not dfs:
+        return None
+
+    combined = pd.concat(dfs, ignore_index=True)
+    combined = combined.sort_values("episode_index").reset_index(drop=True)
+    _LEROBOT_EPISODES_CACHE[repo_id] = (combined, datetime.utcnow())
+    logger.info(f"Cached LeRobot episodes metadata for {repo_id}: {len(combined)} episodes")
+    return combined
+
+
+async def fetch_lerobot_tasks_meta(repo_id: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch and cache meta/tasks.parquet from a LeRobot HuggingFace dataset.
+
+    Returns DataFrame with task_index and task descriptions.
+    """
+    if repo_id in _LEROBOT_TASKS_CACHE:
+        cached, fetched_at = _LEROBOT_TASKS_CACHE[repo_id]
+        if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
+            return cached
+
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/tasks.parquet"
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            resp = await client.get(url, headers=_get_hf_headers(), timeout=30.0)
+            if resp.status_code == 200:
+                df = pd.read_parquet(io.BytesIO(resp.content))
+                # In LeRobot v3 tasks.parquet, the task description is the DataFrame
+                # index and task_index is a column. Normalize to have both as columns.
+                if df.index.name is None and "task_index" in df.columns:
+                    df = df.reset_index()
+                    df = df.rename(columns={"index": "task_description"})
+                _LEROBOT_TASKS_CACHE[repo_id] = (df, datetime.utcnow())
+                logger.info(f"Cached LeRobot tasks metadata for {repo_id}: {len(df)} tasks")
+                return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch LeRobot tasks.parquet for {repo_id}: {e}")
+    return None
+
+
+_LEROBOT_EP_TASK_MAP_CACHE: Dict[str, Tuple[Dict[int, int], datetime]] = {}
+
+
+async def fetch_lerobot_episode_task_map(repo_id: str) -> Optional[Dict[int, int]]:
+    """
+    Fetch the episode_index -> task_index mapping for a LeRobot dataset.
+
+    Uses the HuggingFace datasets server filter API to efficiently get only
+    the first frame of each episode (frame_index=0), extracting episode_index
+    and task_index columns.
+
+    Returns dict mapping episode_index -> task_index, or None on failure.
+    """
+    if repo_id in _LEROBOT_EP_TASK_MAP_CACHE:
+        cached, fetched_at = _LEROBOT_EP_TASK_MAP_CACHE[repo_id]
+        if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
+            return cached
+
+    mapping: Dict[int, int] = {}
+    offset = 0
+    page_size = 100
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        headers = _get_hf_headers()
+        while True:
+            url = (
+                f"https://datasets-server.huggingface.co/filter"
+                f"?dataset={repo_id}&config=default&split=train"
+                f"&where=frame_index=0&offset={offset}&length={page_size}"
+            )
+            try:
+                resp = await client.get(url, headers=headers, timeout=30.0)
+                if resp.status_code != 200:
+                    logger.warning(f"HF filter API returned {resp.status_code} for {repo_id}")
+                    break
+                data = resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    break
+                for row in rows:
+                    r = row["row"]
+                    ep_idx = r.get("episode_index")
+                    task_idx = r.get("task_index")
+                    if ep_idx is not None and task_idx is not None:
+                        mapping[int(ep_idx)] = int(task_idx)
+                offset += len(rows)
+                total = data.get("num_rows_total", 0)
+                if offset >= total:
+                    break
+            except Exception as e:
+                logger.warning(f"Failed to fetch episode-task mapping at offset {offset}: {e}")
+                break
+
+    if mapping:
+        _LEROBOT_EP_TASK_MAP_CACHE[repo_id] = (mapping, datetime.utcnow())
+        logger.info(f"Cached episode-task mapping for {repo_id}: {len(mapping)} episodes")
+        return mapping
+    return None
+
+
+async def is_lerobot_dataset(config: dict) -> bool:
+    """Check if a streaming dataset is in LeRobot v3 format by probing meta/info.json."""
+    if config.get("format") == "lerobot":
+        return True
+    repo_id = config.get("repo_id")
+    if not repo_id:
+        return False
+    info = await fetch_lerobot_info(repo_id)
+    return info is not None and "codebase_version" in info
 
 
 def get_data_root(request: Request) -> Path:
@@ -413,7 +623,46 @@ async def list_tasks(dataset_id: str, request: Request):
     config = all_datasets[dataset_id]
     data_root = get_data_root(request)
 
-    # Try HuggingFace API first for streaming datasets
+    # For LeRobot streaming datasets, use metadata parquet for tasks
+    if config.get("streaming_recommended") and config.get("repo_id"):
+        if await is_lerobot_dataset(config):
+            repo_id = config["repo_id"]
+            tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+            episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+            if tasks_df is not None:
+                # Use task_description column (or fallback to first non-task_index column)
+                task_col = "task_description"
+                if task_col not in tasks_df.columns:
+                    for col in tasks_df.columns:
+                        if col != "task_index":
+                            task_col = col
+                            break
+
+                # Get episode-task mapping for counts
+                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                task_episode_counts: Dict[int, int] = {}
+                if ep_task_map:
+                    for _, task_idx in ep_task_map.items():
+                        task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
+
+                tasks = []
+                for _, row in tasks_df.iterrows():
+                    task_idx = int(row["task_index"])
+                    task_name = str(row[task_col]).strip() if task_col in row.index else ""
+                    if not task_name:
+                        task_name = f"Untitled (task {task_idx})"
+                    ep_count = task_episode_counts.get(task_idx)
+                    tasks.append(TaskInfo(
+                        name=task_name,
+                        episode_count=ep_count,
+                    ))
+                return TaskListResponse(
+                    tasks=tasks,
+                    total_tasks=len(tasks),
+                    source="lerobot_metadata",
+                )
+
+    # Try HuggingFace API for other streaming datasets
     if config.get("streaming_recommended") and config.get("repo_id"):
         try:
             tasks = await get_tasks_from_huggingface(config["repo_id"])
@@ -478,7 +727,74 @@ async def list_task_episodes(
     config = all_datasets[dataset_id]
     data_root = get_data_root(request)
 
-    # For streaming HuggingFace datasets, use API to list files in task folder
+    # For LeRobot streaming datasets, use metadata for episode listing
+    if config.get("streaming_recommended") and config.get("repo_id"):
+        if await is_lerobot_dataset(config):
+            repo_id = config["repo_id"]
+            episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+            tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+            info = await fetch_lerobot_info(repo_id)
+
+            if episodes_df is not None and tasks_df is not None:
+                # Map task_name to task_index
+                task_col = "task_description"
+                if task_col not in tasks_df.columns:
+                    for col in tasks_df.columns:
+                        if col != "task_index":
+                            task_col = col
+                            break
+
+                task_index = None
+                if task_col in tasks_df.columns:
+                    match = tasks_df[tasks_df[task_col] == task_name]
+                    if len(match) > 0:
+                        task_index = int(match.iloc[0]["task_index"])
+
+                # Handle "Untitled (task N)" fallback names
+                if task_index is None:
+                    import re
+                    untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
+                    if untitled_match:
+                        candidate_idx = int(untitled_match.group(1))
+                        if candidate_idx in tasks_df["task_index"].values:
+                            task_index = candidate_idx
+
+                if task_index is None:
+                    return []
+
+                # Get episode->task mapping to filter episodes for this task
+                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                if ep_task_map is None:
+                    return []
+
+                # Filter episode indices belonging to this task
+                task_ep_indices = sorted([
+                    ep_idx for ep_idx, t_idx in ep_task_map.items()
+                    if t_idx == task_index
+                ])
+
+                # Get metadata for these episodes
+                task_episodes = episodes_df[episodes_df["episode_index"].isin(task_ep_indices)]
+                task_episodes = task_episodes.sort_values("episode_index")
+
+                # Apply pagination
+                page = task_episodes.iloc[offset:offset + limit]
+
+                fps = info.get("fps", 30) if info else 30
+                episodes = []
+                for _, row in page.iterrows():
+                    ep_idx = int(row["episode_index"])
+                    length = int(row["length"]) if "length" in row.index else None
+                    duration = length / fps if length else None
+                    episodes.append(EpisodeInfo(
+                        id=f"episode_{ep_idx}",
+                        task_name=task_name,
+                        num_frames=length,
+                        duration_seconds=round(duration, 2) if duration else None,
+                    ))
+                return episodes
+
+    # For other streaming HuggingFace datasets, use API to list files in task folder
     if config.get("streaming_recommended") and config.get("repo_id"):
         try:
             episodes = await get_episodes_from_huggingface(
@@ -489,7 +805,6 @@ async def list_task_episodes(
             )
             if episodes:
                 return episodes
-            # If no episodes found via API, fall through to loader
             logger.info(f"No episodes found via HF API for {task_name}, trying loader")
         except Exception as e:
             logger.warning(f"HuggingFace API failed for episodes, falling back to loader: {e}")

@@ -752,6 +752,26 @@ class EncodedFrameCache:
             "batch_count": total_batches,
         }
 
+    async def list_cached_episodes_async(self) -> list:
+        """
+        Async version of list_cached_episodes that runs in executor.
+        Use this from async endpoints to avoid blocking the event loop.
+        """
+        import asyncio
+        from api.routes.episodes import _HEAVY_EXECUTOR
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_HEAVY_EXECUTOR, self.list_cached_episodes)
+
+    async def get_cache_stats_async(self) -> dict:
+        """
+        Async version of get_cache_stats that runs in executor.
+        Use this from async endpoints to avoid blocking the event loop.
+        """
+        import asyncio
+        from api.routes.episodes import _HEAVY_EXECUTOR
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_HEAVY_EXECUTOR, self.get_cache_stats)
+
 
 # Global encoded frame cache instance
 _encoded_frame_cache: Optional[EncodedFrameCache] = None

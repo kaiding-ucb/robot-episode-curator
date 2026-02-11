@@ -497,10 +497,10 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                       data-testid={`episode-item-${episode.id}`}
                     >
                       <p className="text-sm font-medium text-gray-900 dark:text-white">
-                        Episode {index + 1}
+                        {episode.id.startsWith('episode_') ? episode.id : `episode_${index}`}
                       </p>
                       <p className="text-xs text-gray-500">
-                        {episode.num_frames} frames
+                        {episode.num_frames != null ? `${episode.num_frames} frames` : 'frames'}
                         {episode.duration_sec && ` • ${episode.duration_sec.toFixed(1)}s`}
                       </p>
                     </button>
