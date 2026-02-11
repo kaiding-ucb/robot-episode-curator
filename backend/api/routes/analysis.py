@@ -139,7 +139,7 @@ def _get_format_metadata(dataset_info: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns: {format, has_actions, has_imu, max_file_size_mb}
     """
-    fmt = dataset_info.get("format", "unknown")
+    fmt = dataset_info.get("format") or "unknown"
     return {
         "format": fmt,
         "has_actions": dataset_info.get("has_actions", fmt in ("mcap", "lerobot")),
@@ -160,7 +160,7 @@ def _get_capabilities(dataset_info: Dict[str, Any]) -> DatasetCapabilities:
     supports_signals = True
     note = ""
 
-    if not has_actions:
+    if not has_actions and fmt != "unknown":
         supports_signals = False
         if fmt in ("webdataset", "video"):
             note = "Video-only dataset — no robot action or IMU signals available"
@@ -221,17 +221,47 @@ def _get_source_note(fmt: str) -> str:
 
 # --- LeRobot/Parquet Signal Extraction ---
 
+_SIGNAL_COLUMNS = ["action", "episode_index", "frame_index", "timestamp", "index", "episode_id"]
+
+
 async def _download_parquet(
     client: httpx.AsyncClient,
     repo_id: str,
     file_path: str,
     headers: Dict[str, str],
 ) -> pd.DataFrame:
-    """Download a single Parquet file from HuggingFace and return as DataFrame."""
-    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
-    response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
-    response.raise_for_status()
-    return pd.read_parquet(io.BytesIO(response.content))
+    """
+    Download only signal-related columns from a HF Parquet file.
+
+    Uses pyarrow with HfFileSystem to fetch only needed columns via HTTP range
+    requests, reducing downloads from ~60MB (with images) to ~1-2MB.
+    Falls back to full download for small files or on error.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    token = _get_hf_token()
+    loop = asyncio.get_event_loop()
+
+    def _read_columns():
+        fs = HfFileSystem(token=token)
+        hf_path = f"datasets/{repo_id}/{file_path}"
+        schema = pq.read_schema(hf_path, filesystem=fs)
+        available = set(schema.names)
+        cols = [c for c in _SIGNAL_COLUMNS if c in available]
+        if not cols:
+            return pd.DataFrame()
+        table = pq.read_table(hf_path, filesystem=fs, columns=cols)
+        return table.to_pandas()
+
+    try:
+        return await loop.run_in_executor(None, _read_columns)
+    except Exception as e:
+        logger.warning(f"Column-filtered read failed for {file_path}, falling back to full download: {e}")
+        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+        response = await client.get(url, headers=headers, timeout=120.0, follow_redirects=True)
+        response.raise_for_status()
+        return pd.read_parquet(io.BytesIO(response.content))
 
 
 async def _extract_lerobot_episodes(
@@ -556,7 +586,7 @@ async def get_signals_comparison(
     async def signal_stream():
         try:
             headers = _get_hf_headers()
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 raw_episodes = await _collect_episode_files(client, repo_id, task_name, headers)
 
             # Detect format
@@ -567,7 +597,7 @@ async def get_signals_comparison(
                 # --- LeRobot/Parquet path ---
                 yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=60.0) as client:
                     episodes = await _extract_lerobot_episodes(
                         client, repo_id, raw_episodes, headers, max_episodes
                     )
@@ -589,7 +619,7 @@ async def get_signals_comparison(
                     }
                     yield f"data: {json.dumps(result)}\n\n"
 
-            else:
+            elif fmt == "mcap":
                 # --- MCAP path (original) ---
                 episodes_to_analyze = raw_episodes[:max_episodes]
                 total = len(episodes_to_analyze)
@@ -640,6 +670,10 @@ async def get_signals_comparison(
                         }
 
                     yield f"data: {json.dumps(result)}\n\n"
+
+            else:
+                yield f"data: {json.dumps({'type': 'no_signals', 'reason': f'Signal comparison is not supported for {fmt} format'})}\n\n"
+                return
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 

@@ -88,6 +88,62 @@ function getBatchRange(arrays: number[][]): { min: number; max: number } {
   return { min, max };
 }
 
+// Resample a data array to a fixed length using linear interpolation
+function resampleToLength(data: number[], targetLen: number): number[] {
+  if (data.length === 0) return [];
+  if (data.length === 1) return new Array(targetLen).fill(data[0]);
+  const result: number[] = [];
+  for (let i = 0; i < targetLen; i++) {
+    const t = (i / (targetLen - 1)) * (data.length - 1);
+    const lo = Math.floor(t);
+    const hi = Math.min(lo + 1, data.length - 1);
+    const frac = t - lo;
+    result.push(data[lo] * (1 - frac) + data[hi] * frac);
+  }
+  return result;
+}
+
+// Compute mean ± 2std envelope from multiple resampled traces
+function computeEnvelope(traces: number[][]): {
+  mean: number[];
+  upper: number[];
+  lower: number[];
+} {
+  if (traces.length === 0) return { mean: [], upper: [], lower: [] };
+  const len = traces[0].length;
+  const mean: number[] = [];
+  const upper: number[] = [];
+  const lower: number[] = [];
+  for (let i = 0; i < len; i++) {
+    let sum = 0;
+    for (const t of traces) sum += t[i];
+    const mu = sum / traces.length;
+    let sqSum = 0;
+    for (const t of traces) sqSum += (t[i] - mu) * (t[i] - mu);
+    const std = Math.sqrt(sqSum / traces.length);
+    mean.push(mu);
+    upper.push(mu + 2 * std);
+    lower.push(mu - 2 * std);
+  }
+  return { mean, upper, lower };
+}
+
+// Compute fraction of resampled trace timesteps outside the envelope
+function computeOutlierFraction(
+  trace: number[],
+  upper: number[],
+  lower: number[]
+): number {
+  if (trace.length === 0) return 0;
+  let outside = 0;
+  for (let i = 0; i < trace.length; i++) {
+    if (trace[i] > upper[i] || trace[i] < lower[i]) outside++;
+  }
+  return outside / trace.length;
+}
+
+const RESAMPLE_LEN = 200;
+
 // Colors for different episodes in overlay view
 const EPISODE_COLORS = [
   "#3b82f6", // blue
@@ -277,6 +333,7 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges }: EpisodeChartRo
 
 // Overlay panel: all episodes on one chart, each a different color
 // Uses batch normalization so all traces share the same scale
+// Renders a mean ± 2std shaded envelope to highlight outliers
 function OverlayPanel({
   title,
   traces,
@@ -287,6 +344,27 @@ function OverlayPanel({
   batchRange: { min: number; max: number };
 }) {
   const validTraces = traces.filter((t) => t.data.length > 0);
+
+  // Compute envelope and outlier info
+  const { envelope, outliers } = useMemo(() => {
+    if (validTraces.length < 2) return { envelope: null, outliers: [] };
+
+    // Resample raw data to common length
+    const resampled = validTraces.map((t) => resampleToLength(t.data, RESAMPLE_LEN));
+    const env = computeEnvelope(resampled);
+
+    // Find outlier episodes (>5% of timesteps outside band)
+    const outliers: { label: string; pct: number }[] = [];
+    for (let i = 0; i < resampled.length; i++) {
+      const frac = computeOutlierFraction(resampled[i], env.upper, env.lower);
+      if (frac > 0.05) {
+        outliers.push({ label: validTraces[i].label, pct: Math.round(frac * 100) });
+      }
+    }
+
+    return { envelope: env, outliers };
+  }, [validTraces]);
+
   if (validTraces.length === 0) {
     return (
       <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
@@ -298,16 +376,65 @@ function OverlayPanel({
 
   const h = 80;
   const w = 300;
+  const yPadding = 2;
+  const usableHeight = h - yPadding * 2;
+
+  // Build SVG path for the shaded envelope band (upper forward, lower backward)
+  let bandPath = "";
+  let meanPath = "";
+  if (envelope) {
+    const normUpper = normalizeBatch(envelope.upper, batchRange.min, batchRange.max);
+    const normLower = normalizeBatch(envelope.lower, batchRange.min, batchRange.max);
+    const normMean = normalizeBatch(envelope.mean, batchRange.min, batchRange.max);
+    const xStep = w / Math.max(RESAMPLE_LEN - 1, 1);
+
+    const toY = (v: number) => {
+      const clamped = Math.max(0, Math.min(1, v));
+      return yPadding + usableHeight - clamped * usableHeight;
+    };
+
+    // Upper boundary forward
+    const upperParts = normUpper.map(
+      (v, i) => `${i === 0 ? "M" : "L"} ${i * xStep} ${toY(v)}`
+    );
+    // Lower boundary backward
+    const lowerParts = normLower
+      .map((v, i) => `L ${i * xStep} ${toY(v)}`)
+      .reverse();
+    bandPath = upperParts.join(" ") + " " + lowerParts.join(" ") + " Z";
+
+    // Mean line
+    meanPath = normMean
+      .map((v, i) => `${i === 0 ? "M" : "L"} ${i * xStep} ${toY(v)}`)
+      .join(" ");
+  }
 
   return (
     <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
       <div className="text-xs text-gray-500 mb-1">{title}</div>
+      {outliers.length > 0 && (
+        <div className="mb-1">
+          {outliers.map((o) => (
+            <div
+              key={o.label}
+              className="text-[10px] text-amber-500 dark:text-amber-400 font-mono"
+            >
+              {o.label}: outlier ({o.pct}% outside band)
+            </div>
+          ))}
+        </div>
+      )}
       <svg
         viewBox={`0 0 ${w} ${h}`}
         className="w-full bg-gray-100 dark:bg-gray-700 rounded"
         style={{ height: 80 }}
         preserveAspectRatio="none"
       >
+        {/* Shaded ±2std band */}
+        {bandPath && (
+          <path d={bandPath} fill="#94a3b8" opacity="0.25" stroke="none" />
+        )}
+        {/* Individual episode traces (faded) */}
         {validTraces.map((trace, i) => (
           <path
             key={`${trace.label}-${i}`}
@@ -316,9 +443,20 @@ function OverlayPanel({
             stroke={trace.color}
             strokeWidth="0.8"
             vectorEffect="non-scaling-stroke"
-            opacity="0.8"
+            opacity="0.5"
           />
         ))}
+        {/* Mean line */}
+        {meanPath && (
+          <path
+            d={meanPath}
+            fill="none"
+            stroke="#e2e8f0"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+            opacity="0.9"
+          />
+        )}
       </svg>
     </div>
   );
