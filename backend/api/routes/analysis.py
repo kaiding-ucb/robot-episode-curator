@@ -1078,6 +1078,7 @@ async def get_signals_comparison(
                         "actions": actions_data,
                         "imu": ep["imu"],
                         "total_frames": ep.get("total_frames"),
+                        "global_episode_index": ep.get("global_episode_index"),
                     }
                     yield f"data: {json.dumps(result)}\n\n"
 

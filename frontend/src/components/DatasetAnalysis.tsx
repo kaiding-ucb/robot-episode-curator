@@ -319,7 +319,7 @@ export default function DatasetAnalysis({
 
             {/* Charts */}
             {signalState.episodes.size > 0 && (
-              <SignalComparisonChart episodes={signalState.episodes} />
+              <SignalComparisonChart episodes={signalState.episodes} datasetId={datasetId} />
             )}
 
             {/* Idle state */}

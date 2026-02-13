@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState, useEffect } from "react";
 import type { EpisodeSignalData } from "@/types/analysis";
 
 interface SignalComparisonChartProps {
   episodes: Map<string, EpisodeSignalData>;
+  datasetId: string | null;
 }
 
 function getEpisodeLabel(episodeId: string): string {
@@ -587,14 +588,150 @@ function OverlayPanel({
   );
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+
+function useFirstFrames(
+  episodeList: [string, EpisodeSignalData][],
+  datasetId: string | null
+) {
+  const [frameData, setFrameData] = useState<Map<string, string>>(new Map());
+  const [loading, setLoading] = useState(false);
+  const [errors, setErrors] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!datasetId || episodeList.length === 0) {
+      setFrameData(new Map());
+      setErrors(new Set());
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    setFrameData(new Map());
+    setErrors(new Set());
+
+    const fetchFrames = async () => {
+      const results = await Promise.all(
+        episodeList.map(async ([episodeId, episodeData]) => {
+          try {
+            const frameEpisodeId =
+              episodeData.global_episode_index != null
+                ? `episode_${episodeData.global_episode_index}`
+                : episodeId;
+            const res = await fetch(
+              `${API_BASE}/episodes/${encodeURIComponent(frameEpisodeId)}/frames?start=0&end=1&dataset_id=${encodeURIComponent(datasetId)}&resolution=low&quality=70`
+            );
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const frame = data.frames?.[0]?.image_base64;
+            return { episodeId, frame: frame || null, error: !frame };
+          } catch {
+            return { episodeId, frame: null, error: true };
+          }
+        })
+      );
+
+      if (cancelled) return;
+
+      const newFrameData = new Map<string, string>();
+      const newErrors = new Set<string>();
+      for (const r of results) {
+        if (r.frame) {
+          newFrameData.set(r.episodeId, r.frame);
+        } else if (r.error) {
+          newErrors.add(r.episodeId);
+        }
+      }
+      setFrameData(newFrameData);
+      setErrors(newErrors);
+      setLoading(false);
+    };
+
+    fetchFrames();
+    return () => { cancelled = true; };
+  }, [episodeList, datasetId]);
+
+  return { frameData, loading, errors };
+}
+
+function StartingPositionGrid({
+  episodeList,
+  frameData,
+  loading,
+  errors,
+}: {
+  episodeList: [string, EpisodeSignalData][];
+  frameData: Map<string, string>;
+  loading: boolean;
+  errors: Set<string>;
+}) {
+  if (loading) {
+    return (
+      <div className="mb-4">
+        <div className="text-xs font-medium text-gray-500 mb-2">Starting Position</div>
+        <div className="flex items-center gap-2 text-xs text-gray-400 py-4">
+          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+          </svg>
+          Loading first frames...
+        </div>
+      </div>
+    );
+  }
+
+  if (frameData.size === 0) return null;
+
+  return (
+    <div className="mb-4" data-testid="starting-position-grid">
+      <div className="text-xs font-medium text-gray-500 mb-2">Starting Position</div>
+      <div className="grid grid-cols-5 gap-3">
+        {episodeList.map(([id]) => {
+          const frame = frameData.get(id);
+          const hasError = errors.has(id);
+
+          return (
+            <div
+              key={id}
+              className="relative aspect-video rounded overflow-hidden border border-gray-200 dark:border-gray-700"
+            >
+              {frame ? (
+                <img
+                  src={`data:image/webp;base64,${frame}`}
+                  alt={getEpisodeLabel(id)}
+                  className="w-full h-full object-cover"
+                />
+              ) : hasError ? (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center">
+                  <span className="text-[10px] text-gray-400">No frame</span>
+                </div>
+              ) : (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700" />
+              )}
+              <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-1 py-0.5">
+                <span className="text-[10px] text-white font-mono truncate block">
+                  {getEpisodeLabel(id)}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function SignalComparisonChart({
   episodes,
+  datasetId,
 }: SignalComparisonChartProps) {
   const episodeList = useMemo(() => {
     return Array.from(episodes.entries()).sort(
       ([, a], [, b]) => a.episode_index - b.episode_index
     );
   }, [episodes]);
+
+  const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId);
 
   // Compute batch ranges: min/max per signal type across ALL episodes
   const batchRanges: BatchRanges = useMemo(() => {
@@ -680,6 +817,16 @@ export default function SignalComparisonChart({
 
   return (
     <div data-testid="signal-comparison-chart">
+      {/* Starting position thumbnails */}
+      {datasetId && (
+        <StartingPositionGrid
+          episodeList={episodeList}
+          frameData={frameData}
+          loading={framesLoading}
+          errors={frameErrors}
+        />
+      )}
+
       {/* Overlay section */}
       <div className="mb-4">
         <div className="flex flex-wrap gap-x-3 gap-y-1 mb-2">
