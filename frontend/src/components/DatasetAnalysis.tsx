@@ -83,12 +83,13 @@ export default function DatasetAnalysis({
     }
   }, [tasks, selectedTask, tasksLoading]);
 
-  // Fetch frame counts when task is selected (only if task belongs to current dataset)
+  // Reset signal state and fetch frame counts when task changes
   useEffect(() => {
     if (datasetId && selectedTask && !tasksLoading && tasks.some(t => t.name === selectedTask)) {
+      resetSignals();
       fetchFrameCounts(datasetId, selectedTask);
     }
-  }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts]);
+  }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts, resetSignals]);
 
   const handleStartSignalAnalysis = useCallback(() => {
     if (datasetId && selectedTask) {

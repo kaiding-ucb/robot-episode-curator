@@ -966,6 +966,8 @@ async def get_signals_comparison(
                 task_ep_indices = None
                 task_index = 0  # Default to task 0
 
+                logger.info(f"Signal analysis task resolution: task_name='{task_name}', tasks_df={'present' if tasks_df is not None else 'None'} ({len(tasks_df) if tasks_df is not None else 0} rows), ep_task_map={'present' if ep_task_map is not None else 'None'} ({len(ep_task_map) if ep_task_map is not None else 0} entries)")
+
                 if tasks_df is not None and ep_task_map is not None:
                     task_col = "task_description"
                     if task_col not in tasks_df.columns:
@@ -1018,12 +1020,14 @@ async def get_signals_comparison(
                         ep_frame_counts[int(row["episode_index"])] = int(row["length"])
 
                 # Determine which episodes to fetch: sorted by global index, capped
+                logger.info(f"Signal analysis: task_index={task_index}, task_ep_indices={task_ep_indices if task_ep_indices and len(task_ep_indices) < 20 else f'{len(task_ep_indices)} episodes' if task_ep_indices else 'None'}")
                 if task_ep_indices:
                     target_ep_list = sorted(task_ep_indices)[:max_episodes]
                 else:
                     total_eps = (info or {}).get("total_episodes", max_episodes)
                     target_ep_list = list(range(min(total_eps, max_episodes)))
                 target_ep_set = set(target_ep_list)
+                logger.info(f"Signal analysis: target_ep_list={target_ep_list}")
 
                 # Detect which branch has data files (some datasets use v2.0, v2.1, etc.)
                 data_branch = await detect_lerobot_data_branch(repo_id) or "main"

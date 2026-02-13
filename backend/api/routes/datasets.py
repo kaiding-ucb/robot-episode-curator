@@ -352,6 +352,9 @@ async def fetch_lerobot_episode_task_map(repo_id: str) -> Optional[Dict[int, int
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         headers = _get_hf_headers()
+
+        # Strategy 1: filter API (efficient — only fetches frame_index=0 rows)
+        filter_failed = False
         while True:
             url = (
                 f"https://datasets-server.huggingface.co/filter"
@@ -362,6 +365,7 @@ async def fetch_lerobot_episode_task_map(repo_id: str) -> Optional[Dict[int, int
                 resp = await client.get(url, headers=headers, timeout=30.0)
                 if resp.status_code != 200:
                     logger.warning(f"HF filter API returned {resp.status_code} for {repo_id}")
+                    filter_failed = True
                     break
                 data = resp.json()
                 rows = data.get("rows", [])
@@ -379,7 +383,48 @@ async def fetch_lerobot_episode_task_map(repo_id: str) -> Optional[Dict[int, int
                     break
             except Exception as e:
                 logger.warning(f"Failed to fetch episode-task mapping at offset {offset}: {e}")
+                filter_failed = True
                 break
+
+        # Strategy 2: rows API fallback (scans all rows, picks frame_index=0)
+        if not mapping and filter_failed:
+            logger.info(f"Falling back to rows API for episode-task mapping of {repo_id}")
+            # Get expected episode count so we can stop early
+            info = await fetch_lerobot_info(repo_id)
+            expected_episodes = info.get("total_episodes", 0) if info else 0
+            offset = 0
+            while True:
+                url = (
+                    f"https://datasets-server.huggingface.co/rows"
+                    f"?dataset={repo_id}&config=default&split=train"
+                    f"&offset={offset}&length={page_size}"
+                )
+                try:
+                    resp = await client.get(url, headers=headers, timeout=30.0)
+                    if resp.status_code != 200:
+                        logger.warning(f"HF rows API returned {resp.status_code} for {repo_id}")
+                        break
+                    data = resp.json()
+                    rows = data.get("rows", [])
+                    if not rows:
+                        break
+                    for row in rows:
+                        r = row["row"]
+                        ep_idx = r.get("episode_index")
+                        task_idx = r.get("task_index")
+                        fi = r.get("frame_index")
+                        if ep_idx is not None and task_idx is not None and fi == 0:
+                            mapping[int(ep_idx)] = int(task_idx)
+                    offset += len(rows)
+                    total = data.get("num_rows_total", 0)
+                    if offset >= total:
+                        break
+                    # Stop early once we've mapped all expected episodes
+                    if expected_episodes > 0 and len(mapping) >= expected_episodes:
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed rows API at offset {offset}: {e}")
+                    break
 
     if mapping:
         _LEROBOT_EP_TASK_MAP_CACHE[repo_id] = (mapping, datetime.utcnow())

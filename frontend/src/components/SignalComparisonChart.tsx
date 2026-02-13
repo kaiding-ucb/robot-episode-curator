@@ -108,24 +108,27 @@ function computeEnvelope(traces: number[][]): {
   mean: number[];
   upper: number[];
   lower: number[];
+  std: number[];
 } {
-  if (traces.length === 0) return { mean: [], upper: [], lower: [] };
+  if (traces.length === 0) return { mean: [], upper: [], lower: [], std: [] };
   const len = traces[0].length;
   const mean: number[] = [];
   const upper: number[] = [];
   const lower: number[] = [];
+  const stdArr: number[] = [];
   for (let i = 0; i < len; i++) {
     let sum = 0;
     for (const t of traces) sum += t[i];
     const mu = sum / traces.length;
     let sqSum = 0;
     for (const t of traces) sqSum += (t[i] - mu) * (t[i] - mu);
-    const std = Math.sqrt(sqSum / traces.length);
+    const sigma = Math.sqrt(sqSum / traces.length);
     mean.push(mu);
-    upper.push(mu + 2 * std);
-    lower.push(mu - 2 * std);
+    stdArr.push(sigma);
+    upper.push(mu + 2 * sigma);
+    lower.push(mu - 2 * sigma);
   }
-  return { mean, upper, lower };
+  return { mean, upper, lower, std: stdArr };
 }
 
 // Compute fraction of resampled trace timesteps outside the envelope
@@ -143,6 +146,69 @@ function computeOutlierFraction(
 }
 
 const RESAMPLE_LEN = 200;
+
+// Interpolate teal → yellow → red based on ratio 0-1
+function bandWidthColor(ratio: number): string {
+  const c = Math.max(0, Math.min(1, ratio));
+  let r: number, g: number, b: number;
+  if (c < 0.5) {
+    const t = c * 2;
+    r = Math.round(20 + t * (234 - 20));
+    g = Math.round(184 + t * (179 - 184));
+    b = Math.round(166 + t * (8 - 166));
+  } else {
+    const t = (c - 0.5) * 2;
+    r = Math.round(234 + t * (239 - 234));
+    g = Math.round(179 + t * (68 - 179));
+    b = Math.round(8 + t * (68 - 8));
+  }
+  return `rgb(${r},${g},${b})`;
+}
+
+interface BandMetrics {
+  bandCoverage: number;
+  cv: number;
+  label: "Tight" | "Moderate" | "Loose";
+  color: string;
+}
+
+function computeBandMetrics(
+  envelope: { mean: number[]; upper: number[]; lower: number[]; std: number[] },
+  batchRange: { min: number; max: number }
+): BandMetrics {
+  const len = envelope.mean.length;
+  if (len === 0) return { bandCoverage: 0, cv: 0, label: "Tight", color: "#22c55e" };
+
+  let bandWidthSum = 0;
+  let stdSum = 0;
+  let absMuSum = 0;
+  for (let i = 0; i < len; i++) {
+    bandWidthSum += envelope.upper[i] - envelope.lower[i];
+    stdSum += envelope.std[i];
+    absMuSum += Math.abs(envelope.mean[i]);
+  }
+  const meanBandWidth = bandWidthSum / len;
+  const rangeSpan = batchRange.max - batchRange.min || 1;
+  const bandCoverage = meanBandWidth / rangeSpan;
+
+  const meanAbsMu = absMuSum / len;
+  const cv = meanAbsMu > 0 ? (stdSum / len) / meanAbsMu : 0;
+
+  let label: "Tight" | "Moderate" | "Loose";
+  let color: string;
+  if (bandCoverage < 0.25) {
+    label = "Tight";
+    color = "#22c55e";
+  } else if (bandCoverage < 0.5) {
+    label = "Moderate";
+    color = "#eab308";
+  } else {
+    label = "Loose";
+    color = "#ef4444";
+  }
+
+  return { bandCoverage, cv, label, color };
+}
 
 // Colors for different episodes in overlay view
 const EPISODE_COLORS = [
@@ -345,9 +411,9 @@ function OverlayPanel({
 }) {
   const validTraces = traces.filter((t) => t.data.length > 0);
 
-  // Compute envelope and outlier info
-  const { envelope, outliers } = useMemo(() => {
-    if (validTraces.length < 2) return { envelope: null, outliers: [] };
+  // Compute envelope, outlier info, and band quality metrics
+  const { envelope, outliers, bandMetrics } = useMemo(() => {
+    if (validTraces.length < 2) return { envelope: null, outliers: [], bandMetrics: null };
 
     // Resample raw data to common length
     const resampled = validTraces.map((t) => resampleToLength(t.data, RESAMPLE_LEN));
@@ -362,8 +428,10 @@ function OverlayPanel({
       }
     }
 
-    return { envelope: env, outliers };
-  }, [validTraces]);
+    const bandMetrics = computeBandMetrics(env, batchRange);
+
+    return { envelope: env, outliers, bandMetrics };
+  }, [validTraces, batchRange]);
 
   if (validTraces.length === 0) {
     return (
@@ -379,39 +447,70 @@ function OverlayPanel({
   const yPadding = 2;
   const usableHeight = h - yPadding * 2;
 
-  // Build SVG path for the shaded envelope band (upper forward, lower backward)
-  let bandPath = "";
-  let meanPath = "";
-  if (envelope) {
+  // Pre-compute envelope rendering data: segment colors, trapezoid paths, mean path, sigma bar
+  const envelopeRender = useMemo(() => {
+    if (!envelope) return null;
     const normUpper = normalizeBatch(envelope.upper, batchRange.min, batchRange.max);
     const normLower = normalizeBatch(envelope.lower, batchRange.min, batchRange.max);
     const normMean = normalizeBatch(envelope.mean, batchRange.min, batchRange.max);
     const xStep = w / Math.max(RESAMPLE_LEN - 1, 1);
+    const rangeSpan = batchRange.max - batchRange.min || 1;
 
     const toY = (v: number) => {
       const clamped = Math.max(0, Math.min(1, v));
       return yPadding + usableHeight - clamped * usableHeight;
     };
 
-    // Upper boundary forward
-    const upperParts = normUpper.map(
-      (v, i) => `${i === 0 ? "M" : "L"} ${i * xStep} ${toY(v)}`
-    );
-    // Lower boundary backward
-    const lowerParts = normLower
-      .map((v, i) => `L ${i * xStep} ${toY(v)}`)
-      .reverse();
-    bandPath = upperParts.join(" ") + " " + lowerParts.join(" ") + " Z";
+    // Per-segment colors based on local band width
+    const segColors = envelope.std.map((sigma) => {
+      const localWidth = 4 * sigma;
+      return bandWidthColor(localWidth / rangeSpan);
+    });
+
+    // Gradient-colored trapezoid segments
+    const segments: { path: string; color: string }[] = [];
+    for (let i = 0; i < RESAMPLE_LEN - 1; i++) {
+      const x1 = i * xStep;
+      const x2 = (i + 1) * xStep;
+      segments.push({
+        path: `M ${x1} ${toY(normUpper[i])} L ${x2} ${toY(normUpper[i + 1])} L ${x2} ${toY(normLower[i + 1])} L ${x1} ${toY(normLower[i])} Z`,
+        color: segColors[i],
+      });
+    }
 
     // Mean line
-    meanPath = normMean
+    const meanPath = normMean
       .map((v, i) => `${i === 0 ? "M" : "L"} ${i * xStep} ${toY(v)}`)
       .join(" ");
-  }
+
+    // Sigma profile bar data (normalized to max sigma)
+    const maxSigma = Math.max(...envelope.std, 1e-10);
+    const sigmaBar = envelope.std.map((s) => s / maxSigma);
+
+    return { segments, meanPath, segColors, sigmaBar };
+  }, [envelope, batchRange, usableHeight]);
 
   return (
     <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
-      <div className="text-xs text-gray-500 mb-1">{title}</div>
+      <div className="flex items-center gap-2 mb-1">
+        <div className="text-xs text-gray-500">{title}</div>
+        {bandMetrics && (
+          <div className="flex items-center gap-1.5 ml-auto">
+            <span
+              className="text-[10px] font-semibold px-1.5 py-0.5 rounded"
+              style={{
+                color: bandMetrics.color,
+                backgroundColor: `${bandMetrics.color}15`,
+              }}
+            >
+              {bandMetrics.label}: {Math.round(bandMetrics.bandCoverage * 100)}%
+            </span>
+            <span className="text-[10px] text-gray-400 font-mono">
+              CV {bandMetrics.cv.toFixed(2)}
+            </span>
+          </div>
+        )}
+      </div>
       {outliers.length > 0 && (
         <div className="mb-1">
           {outliers.map((o) => (
@@ -426,14 +525,14 @@ function OverlayPanel({
       )}
       <svg
         viewBox={`0 0 ${w} ${h}`}
-        className="w-full bg-gray-100 dark:bg-gray-700 rounded"
+        className={`w-full bg-gray-100 dark:bg-gray-700 ${envelopeRender?.sigmaBar ? "rounded-t" : "rounded"}`}
         style={{ height: 80 }}
         preserveAspectRatio="none"
       >
-        {/* Shaded ±2std band */}
-        {bandPath && (
-          <path d={bandPath} fill="#94a3b8" opacity="0.25" stroke="none" />
-        )}
+        {/* Gradient-colored ±2std band (trapezoid segments) */}
+        {envelopeRender?.segments.map((seg, i) => (
+          <path key={`seg-${i}`} d={seg.path} fill={seg.color} opacity="0.3" />
+        ))}
         {/* Individual episode traces (faded) */}
         {validTraces.map((trace, i) => (
           <path
@@ -447,9 +546,9 @@ function OverlayPanel({
           />
         ))}
         {/* Mean line */}
-        {meanPath && (
+        {envelopeRender?.meanPath && (
           <path
-            d={meanPath}
+            d={envelopeRender.meanPath}
             fill="none"
             stroke="#e2e8f0"
             strokeWidth="1.5"
@@ -458,6 +557,32 @@ function OverlayPanel({
           />
         )}
       </svg>
+      {/* Sigma profile bar */}
+      {envelopeRender?.sigmaBar && (
+        <svg
+          viewBox={`0 0 ${w} 20`}
+          className="w-full bg-gray-100 dark:bg-gray-700 rounded-b"
+          style={{ height: 20 }}
+          preserveAspectRatio="none"
+        >
+          {envelopeRender.sigmaBar.map((normSigma, i) => {
+            const barX = (i / RESAMPLE_LEN) * w;
+            const barW = w / RESAMPLE_LEN + 0.5;
+            const barH = normSigma * 18;
+            return (
+              <rect
+                key={`sb-${i}`}
+                x={barX}
+                y={20 - barH}
+                width={barW}
+                height={barH}
+                fill={envelopeRender.segColors[i]}
+                opacity="0.7"
+              />
+            );
+          })}
+        </svg>
+      )}
     </div>
   );
 }
