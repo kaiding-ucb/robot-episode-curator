@@ -1179,6 +1179,39 @@ def parse_readme_metadata(content: str) -> Dict[str, Any]:
     return result
 
 
+def _detect_lerobot_modalities(info: dict) -> List[str]:
+    """Detect modalities from LeRobot info.json features dict."""
+    modalities = []
+    features = info.get("features", {})
+
+    for feat_name, feat_info in features.items():
+        if not isinstance(feat_info, dict):
+            continue
+        name_lower = feat_name.lower()
+        dtype = feat_info.get("dtype", "")
+
+        if dtype in ("video", "image"):
+            # Use video.is_depth_map if available, fall back to name matching
+            feat_sub_info = feat_info.get("info", {})
+            is_depth = feat_sub_info.get("video.is_depth_map", False)
+            if not is_depth:
+                is_depth = "depth" in name_lower
+
+            if is_depth:
+                if "depth" not in modalities:
+                    modalities.append("depth")
+            else:
+                if "rgb" not in modalities:
+                    modalities.append("rgb")
+
+        # Actions
+        if feat_name == "action":
+            if "actions" not in modalities:
+                modalities.append("actions")
+
+    return modalities if modalities else ["rgb"]
+
+
 def parse_yaml_front_matter(content: str) -> Dict[str, Any]:
     """Extract YAML front matter from README."""
     result: Dict[str, Any] = {}
@@ -1273,6 +1306,13 @@ async def get_dataset_overview(
         modalities=config.get("modalities", ["rgb"]),
     )
 
+    # For LeRobot datasets, detect modalities from info.json features
+    # Also try info.json when format is unknown (older dynamic registrations)
+    if repo_id and (config.get("format") in ("lerobot", "LeRobot", None)):
+        info = await fetch_lerobot_info(repo_id)
+        if info and info.get("features"):
+            overview.modalities = _detect_lerobot_modalities(info)
+
     # If no repo_id, return basic info from registry
     if not repo_id:
         overview.cached_at = datetime.utcnow().isoformat()
@@ -1316,7 +1356,10 @@ async def get_dataset_overview(
         if parsed.get("estimated_clips"):
             overview.estimated_clips = parsed["estimated_clips"]
         if parsed.get("modalities"):
-            overview.modalities = parsed["modalities"]
+            # Only use README modalities as fallback when no better source has set modalities
+            # (i.e., still at default ["rgb"] and not updated by info.json or probe)
+            if overview.modalities == ["rgb"]:
+                overview.modalities = parsed["modalities"]
 
     # Get file size
     size_bytes = await fetch_repo_files_size(repo_id)
@@ -1527,6 +1570,12 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
         format_detected = "webdataset"
     elif ".parquet" in extensions:
         format_detected = "lerobot"
+        # Detect modalities from info.json features
+        info = await fetch_lerobot_info(repo_id)
+        if info:
+            modalities = _detect_lerobot_modalities(info)
+            if info.get("total_tasks", 0) > 0:
+                has_tasks = True
     elif ".hdf5" in extensions or ".h5" in extensions:
         format_detected = "hdf5"
     elif ".tfrecord" in extensions:
@@ -1541,6 +1590,7 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
         if info and "codebase_version" in info:
             format_detected = "lerobot"
             has_tasks = info.get("total_tasks", 0) > 0
+            modalities = _detect_lerobot_modalities(info)
             logger.info(f"Detected LeRobot {info['codebase_version']} format for {repo_id} via meta/info.json")
 
     return ProbeResponse(

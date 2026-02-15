@@ -147,7 +147,11 @@ export default function ActionsChart({
   }
 
   if (error || !actionsData || actionsData.actions.length === 0) {
-    return null;
+    return (
+      <div className="h-24 flex items-center justify-center text-gray-500 text-sm">
+        {error || "No action data available"}
+      </div>
+    );
   }
 
   const chartHeight = 50;

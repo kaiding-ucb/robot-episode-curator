@@ -1399,6 +1399,114 @@ async def get_imu_data(
         return IMUData(error=str(e))
 
 
+async def _get_lerobot_actions(
+    repo_id: str,
+    episode_id: str,
+    dataset_id: Optional[str] = None,
+) -> ActionsData:
+    """
+    Extract action data from a streaming LeRobot dataset's parquet files.
+
+    Uses the same parquet download infrastructure as signal analysis.
+    """
+    import re
+    import httpx
+
+    from .datasets import fetch_lerobot_info, detect_lerobot_data_branch
+    from .analysis import _build_lerobot_data_file_list, _download_parquet, _get_hf_token as get_hf_token
+
+    match = re.match(r'^episode_(\d+)$', episode_id)
+    if not match:
+        return ActionsData(error=f"Invalid LeRobot episode ID: {episode_id}")
+    target_ep_idx = int(match.group(1))
+
+    info = await fetch_lerobot_info(repo_id)
+    if info is None:
+        return ActionsData(error=f"Could not fetch info.json for {repo_id}")
+
+    data_branch = await detect_lerobot_data_branch(repo_id) or "main"
+    data_files = _build_lerobot_data_file_list(info, [target_ep_idx])
+    if not data_files:
+        return ActionsData(error="Could not determine parquet file path for episode")
+
+    token = None
+    try:
+        token = get_hf_token()
+    except Exception:
+        pass
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            df = await _download_parquet(client, repo_id, data_files[0]["path"], headers, branch=data_branch)
+    except Exception as e:
+        logger.error(f"Failed to download parquet for LeRobot actions: {e}")
+        return ActionsData(error=f"Failed to download episode data: {e}")
+
+    if df.empty:
+        return ActionsData(error="No data in parquet file")
+
+    # Filter to target episode
+    ep_col = "episode_index" if "episode_index" in df.columns else "episode_id"
+    if ep_col not in df.columns:
+        return ActionsData(error=f"No episode column found in parquet data")
+    episode_df = df[df[ep_col] == target_ep_idx]
+    if episode_df.empty:
+        return ActionsData(error=f"Episode {target_ep_idx} not found in parquet data")
+
+    sort_col = "frame_index" if "frame_index" in episode_df.columns else "index"
+    if sort_col in episode_df.columns:
+        episode_df = episode_df.sort_values(sort_col)
+
+    # Extract timestamps
+    fps = info.get("fps", 30)
+    if "timestamp" in episode_df.columns:
+        timestamps = episode_df["timestamp"].tolist()
+    elif "frame_index" in episode_df.columns:
+        timestamps = (episode_df["frame_index"] / fps).tolist()
+    else:
+        timestamps = [i / fps for i in range(len(episode_df))]
+
+    # Extract actions
+    action_col = None
+    for candidate in ["action", "observation.state", "end_pose", "start_pos"]:
+        if candidate in episode_df.columns:
+            action_col = candidate
+            break
+
+    if action_col is None:
+        return ActionsData(error="No action or state column in parquet data")
+
+    action_list = episode_df[action_col].tolist()
+    actions = []
+    for a in action_list:
+        if isinstance(a, np.ndarray):
+            actions.append(a.tolist())
+        elif isinstance(a, (list, tuple)):
+            actions.append(list(a))
+        else:
+            actions.append([float(a)])
+
+    # Infer dimension labels
+    dimension_labels = None
+    if actions:
+        num_dims = len(actions[0])
+        if num_dims == 7:
+            dimension_labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        elif num_dims == 8:
+            dimension_labels = ["x", "y", "z", "rx", "ry", "rz", "state", "gripper"]
+        elif num_dims == 6:
+            dimension_labels = ["x", "y", "z", "rx", "ry", "rz"]
+        elif num_dims == 3:
+            dimension_labels = ["x", "y", "z"]
+
+    return ActionsData(
+        timestamps=timestamps,
+        actions=actions,
+        dimension_labels=dimension_labels,
+    )
+
+
 @router.get("/{episode_id:path}/actions", response_model=ActionsData)
 async def get_actions_data(
     episode_id: str,
@@ -1422,6 +1530,10 @@ async def get_actions_data(
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
 
     if is_streaming:
+        # Handle LeRobot parquet-based episodes
+        if _is_lerobot_episode_id(episode_id):
+            return await _get_lerobot_actions(repo_id, episode_id, dataset_id)
+
         # Only MCAP files have action data via topic extraction
         if not file_path.endswith(".mcap"):
             return ActionsData(error="Action data only available for MCAP files")
