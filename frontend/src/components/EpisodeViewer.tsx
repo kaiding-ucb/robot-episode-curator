@@ -181,6 +181,7 @@ export default function EpisodeViewer({
   const {
     frames,
     totalFrames: apiTotalFrames,
+    stride,
     progress,
     isLoading: loading,
     isComplete,
@@ -394,6 +395,16 @@ export default function EpisodeViewer({
         <div className="absolute top-2 left-2 bg-black/50 text-white text-xs px-2 py-1 rounded">
           Frame {currentFrame + 1} / {effectiveTotalFrames}
         </div>
+
+        {/* Subsampled indicator */}
+        {stride > 1 && (
+          <div
+            className="absolute top-2 right-2 bg-yellow-500/90 text-white text-xs font-medium px-3 py-1 rounded-full"
+            data-testid="subsampled-indicator"
+          >
+            Subsampled {stride}x
+          </div>
+        )}
 
         {/* Streaming progress indicator */}
         {loading && frames.size > 0 && (

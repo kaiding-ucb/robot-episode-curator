@@ -227,12 +227,12 @@ class TestStreamingFrameExtractor:
     @pytest.mark.slow
     def test_extract_frames_with_count(self, realomni_extractor):
         """
-        extract_frames_with_count returns both frames and total count.
+        extract_frames_with_count returns frames, total count, and stride.
         """
         episode_path = "Cooking_and_Kitchen_Clean/clean_bowl/00001/00001.mcap"
 
         try:
-            frames, total = realomni_extractor.extract_frames_with_count(
+            frames, total, stride_used = realomni_extractor.extract_frames_with_count(
                 episode_path,
                 start=0,
                 end=5
@@ -240,6 +240,8 @@ class TestStreamingFrameExtractor:
 
             assert isinstance(frames, list)
             assert isinstance(total, int)
+            assert isinstance(stride_used, int)
+            assert stride_used >= 1
 
             if total > 0:
                 assert len(frames) <= total

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback } from "react";
 import type { EpisodeSignalData } from "@/types/analysis";
 
 interface SignalComparisonChartProps {
@@ -598,58 +598,103 @@ function useFirstFrames(
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState<Set<string>>(new Set());
 
+  // Persist accumulated results across re-renders so we don't re-fetch
+  // episodes that already have frames when episodeList grows incrementally.
+  const accumulatedRef = useRef<Map<string, string>>(new Map());
+  const errorsRef = useRef<Set<string>>(new Set());
+  const controllerRef = useRef<AbortController | null>(null);
+  const fetchingRef = useRef<Set<string>>(new Set());
+  const prevDatasetRef = useRef<string | null>(null);
+
+  const fetchSingleFrame = useCallback(async (
+    episodeId: string,
+    episodeData: EpisodeSignalData,
+    dsId: string,
+    signal: AbortSignal,
+  ) => {
+    try {
+      const frameEpisodeId =
+        episodeData.global_episode_index != null
+          ? `episode_${episodeData.global_episode_index}`
+          : episodeId;
+      const res = await fetch(
+        `${API_BASE}/episodes/${encodeURIComponent(frameEpisodeId)}/frames?start=0&end=1&dataset_id=${encodeURIComponent(dsId)}&resolution=low&quality=70`,
+        { signal }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const frame = data.frames?.[0]?.image_base64;
+      if (frame) {
+        accumulatedRef.current.set(episodeId, frame);
+      } else {
+        errorsRef.current.add(episodeId);
+      }
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      errorsRef.current.add(episodeId);
+    } finally {
+      fetchingRef.current.delete(episodeId);
+    }
+    if (!signal.aborted) {
+      setFrameData(new Map(accumulatedRef.current));
+      setErrors(new Set(errorsRef.current));
+    }
+  }, []);
+
   useEffect(() => {
     if (!datasetId || episodeList.length === 0) {
+      accumulatedRef.current.clear();
+      errorsRef.current.clear();
+      fetchingRef.current.clear();
       setFrameData(new Map());
       setErrors(new Set());
+      setLoading(false);
       return;
     }
 
-    let cancelled = false;
-    setLoading(true);
-    setFrameData(new Map());
-    setErrors(new Set());
+    // Reset everything when dataset changes
+    if (prevDatasetRef.current !== datasetId) {
+      controllerRef.current?.abort();
+      accumulatedRef.current.clear();
+      errorsRef.current.clear();
+      fetchingRef.current.clear();
+      prevDatasetRef.current = datasetId;
+    }
 
-    const fetchFrames = async () => {
-      const results = await Promise.all(
-        episodeList.map(async ([episodeId, episodeData]) => {
-          try {
-            const frameEpisodeId =
-              episodeData.global_episode_index != null
-                ? `episode_${episodeData.global_episode_index}`
-                : episodeId;
-            const res = await fetch(
-              `${API_BASE}/episodes/${encodeURIComponent(frameEpisodeId)}/frames?start=0&end=1&dataset_id=${encodeURIComponent(datasetId)}&resolution=low&quality=70`
-            );
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            const frame = data.frames?.[0]?.image_base64;
-            return { episodeId, frame: frame || null, error: !frame };
-          } catch {
-            return { episodeId, frame: null, error: true };
-          }
-        })
-      );
+    // Abort only the previous fetch sequence, not already-completed results
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
 
-      if (cancelled) return;
+    // Find episodes that need fetching (not already loaded or in-flight)
+    const toFetch = episodeList.filter(([id]) =>
+      !accumulatedRef.current.has(id) &&
+      !errorsRef.current.has(id) &&
+      !fetchingRef.current.has(id)
+    );
 
-      const newFrameData = new Map<string, string>();
-      const newErrors = new Set<string>();
-      for (const r of results) {
-        if (r.frame) {
-          newFrameData.set(r.episodeId, r.frame);
-        } else if (r.error) {
-          newErrors.add(r.episodeId);
-        }
-      }
-      setFrameData(newFrameData);
-      setErrors(newErrors);
+    if (toFetch.length === 0) {
       setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+
+    // Fetch new episodes sequentially to avoid thread pool starvation
+    const fetchNewFrames = async () => {
+      for (const [episodeId, episodeData] of toFetch) {
+        if (controller.signal.aborted) return;
+        fetchingRef.current.add(episodeId);
+        await fetchSingleFrame(episodeId, episodeData, datasetId, controller.signal);
+      }
+      if (!controller.signal.aborted) {
+        setLoading(false);
+      }
     };
 
-    fetchFrames();
-    return () => { cancelled = true; };
-  }, [episodeList, datasetId]);
+    fetchNewFrames();
+    return () => { controller.abort(); };
+  }, [episodeList, datasetId, fetchSingleFrame]);
 
   return { frameData, loading, errors };
 }
@@ -665,30 +710,25 @@ function StartingPositionGrid({
   loading: boolean;
   errors: Set<string>;
 }) {
-  if (loading) {
-    return (
-      <div className="mb-4">
-        <div className="text-xs font-medium text-gray-500 mb-2">Starting Position</div>
-        <div className="flex items-center gap-2 text-xs text-gray-400 py-4">
-          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-          </svg>
-          Loading first frames...
-        </div>
-      </div>
-    );
-  }
-
-  if (frameData.size === 0) return null;
+  // Show nothing only if loading hasn't produced any frames yet AND no episodes listed
+  if (!loading && frameData.size === 0 && errors.size === 0) return null;
 
   return (
     <div className="mb-4" data-testid="starting-position-grid">
-      <div className="text-xs font-medium text-gray-500 mb-2">Starting Position</div>
+      <div className="text-xs font-medium text-gray-500 mb-2 flex items-center gap-2">
+        Starting Position
+        {loading && (
+          <svg className="animate-spin h-3 w-3 text-gray-400" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+          </svg>
+        )}
+      </div>
       <div className="grid grid-cols-5 gap-3">
         {episodeList.map(([id]) => {
           const frame = frameData.get(id);
           const hasError = errors.has(id);
+          const isPending = !frame && !hasError && loading;
 
           return (
             <div
@@ -704,6 +744,13 @@ function StartingPositionGrid({
               ) : hasError ? (
                 <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center">
                   <span className="text-[10px] text-gray-400">No frame</span>
+                </div>
+              ) : isPending ? (
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center">
+                  <svg className="animate-spin h-4 w-4 text-gray-400" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
                 </div>
               ) : (
                 <div className="w-full h-full bg-gray-200 dark:bg-gray-700" />

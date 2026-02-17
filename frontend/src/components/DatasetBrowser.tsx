@@ -61,7 +61,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
   const [removeError, setRemoveError] = useState<string | null>(null);
 
   const { overview, loading: loadingOverview, error: overviewError, refresh: refreshOverview } = useDatasetOverview(selectedDataset);
-  const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError } = useTasks(selectedDataset);
+  const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError, hasMore: hasMoreTasks, loadMore: loadMoreTasks, searchQuery: taskSearchQuery, updateSearch: updateTaskSearch } = useTasks(selectedDataset);
   const { episodes, loading: loadingEpisodes, error: episodesError, hasMore, loadMore } = useTaskEpisodes(
     selectedDataset,
     selectedTask,
@@ -389,11 +389,30 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
       {selectedDataset && !selectedTask && (
         <div className="flex-1 overflow-auto">
           <h2 className="px-4 py-2 text-sm font-semibold text-gray-500 uppercase tracking-wider sticky top-0 bg-white dark:bg-gray-900 z-10 flex items-center justify-between">
-            <span>Tasks {totalTasks > 0 && `(${totalTasks})`}</span>
+            <span>{taskSource === "multi_subdataset" ? "Subdatasets" : "Tasks"} {totalTasks > 0 && `(${hasMoreTasks ? `${tasks.length} of ` : ""}${totalTasks.toLocaleString()})`}</span>
             {taskSource === "huggingface_api" && (
               <span className="text-xs font-normal text-blue-500">via HF API</span>
             )}
+            {taskSource === "adapter" && (
+              <span className="text-xs font-normal text-green-500">via adapter</span>
+            )}
+            {taskSource === "multi_subdataset" && (
+              <span className="text-xs font-normal text-purple-500">multi-dataset</span>
+            )}
           </h2>
+
+          {totalTasks > 50 && (
+            <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
+              <input
+                type="text"
+                value={taskSearchQuery}
+                onChange={(e) => updateTaskSearch(e.target.value)}
+                placeholder="Search tasks..."
+                data-testid="task-search-input"
+                className="w-full px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
+          )}
 
           {loadingTasks ? (
             <div className="p-4 text-gray-500" data-testid="loading-tasks">
@@ -443,6 +462,15 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                 </li>
               ))}
             </ul>
+          )}
+          {hasMoreTasks && !loadingTasks && (
+            <button
+              onClick={loadMoreTasks}
+              data-testid="load-more-tasks"
+              className="w-full px-4 py-2 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-50 dark:hover:bg-gray-800 border-t border-gray-200 dark:border-gray-700 transition-colors"
+            >
+              Load more tasks ({totalTasks - tasks.length} remaining)
+            </button>
           )}
         </div>
       )}

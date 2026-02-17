@@ -16,6 +16,7 @@ interface UseStreamingFramesOptions extends StreamingOptions {
 interface UseStreamingFramesResult {
   frames: Map<number, Frame>;
   totalFrames: number | null;
+  stride: number;
   progress: number;
   isLoading: boolean;
   isComplete: boolean;
@@ -38,6 +39,7 @@ export function useStreamingFrames(
 ): UseStreamingFramesResult {
   const [frames, setFrames] = useState<Map<number, Frame>>(new Map());
   const [totalFrames, setTotalFrames] = useState<number | null>(null);
+  const [stride, setStride] = useState<number>(1);
   const [isLoading, setIsLoading] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,9 +50,12 @@ export function useStreamingFrames(
 
   const { resolution = "low", quality = 70, stream = "rgb", enabled = true } = options;
 
-  // Calculate progress
-  const progress = totalFrames && totalFrames > 0
-    ? frames.size / totalFrames
+  // Calculate progress (account for stride: fewer frames expected)
+  const expectedFrames = totalFrames && totalFrames > 0
+    ? Math.ceil(totalFrames / stride)
+    : 0;
+  const progress = expectedFrames > 0
+    ? Math.min(frames.size / expectedFrames, 1)
     : 0;
 
   const cancel = useCallback(() => {
@@ -103,6 +108,7 @@ export function useStreamingFrames(
     if (episodeChanged) {
       setFrames(new Map());
       setTotalFrames(null);
+      setStride(1);
       prevEpisodeIdRef.current = episodeId;
     }
 
@@ -134,6 +140,9 @@ export function useStreamingFrames(
         switch (data.type) {
           case "total":
             setTotalFrames(data.total_frames);
+            if (data.stride && data.stride > 1) {
+              setStride(data.stride);
+            }
             break;
 
           case "frame":
@@ -243,6 +252,7 @@ export function useStreamingFrames(
   return {
     frames,
     totalFrames,
+    stride,
     progress,
     isLoading,
     isComplete,
@@ -259,8 +269,25 @@ export function framesToArray(frames: Map<number, Frame>): Frame[] {
 }
 
 /**
- * Get a specific frame from the map, or undefined if not yet loaded
+ * Get a specific frame from the map, or the nearest frame for strided data.
+ * When stride > 1, exact frame indices may not exist in the map,
+ * so we find the closest available frame.
  */
 export function getFrame(frames: Map<number, Frame>, index: number): Frame | undefined {
-  return frames.get(index);
+  const exact = frames.get(index);
+  if (exact) return exact;
+
+  // Nearest-frame lookup for strided data
+  if (frames.size === 0) return undefined;
+
+  let best: Frame | undefined;
+  let bestDist = Infinity;
+  for (const [idx, frame] of frames) {
+    const dist = Math.abs(idx - index);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = frame;
+    }
+  }
+  return best;
 }

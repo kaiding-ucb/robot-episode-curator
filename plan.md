@@ -598,3 +598,230 @@ pytest tests/integration/test_functionality.py -v
 | 3 | Playwright: Compare panel works, streaming datasets accessible |
 
 **All tests verify FUNCTIONALITY. No tests verify data properties.**
+
+---
+---
+
+# Scale Data Viewer to All HuggingFace Robotics Datasets
+
+## Context
+
+The adapter pattern infrastructure is **already built** (`backend/adapters/`):
+- `StreamingAdapter` ABC with `list_tasks()`, `list_episodes()`, `resolve_episode()`, `get_capabilities()`
+- `FormatRegistry` with auto-detection and caching
+- `LeRobotAdapter`, `MCAPAdapter`, `RawVideoAdapter`, `MultiSubdatasetAdapter` all functional
+
+**What's missing**: The adapters have shallow traversal limits, hardcoded FPS/frame estimates, no pagination for large episode lists (droid has 92K episodes), no stride for large episodes (1000+ frames), duplicate utility code, and the frontend lacks format-awareness.
+
+This plan merges the original adapter improvements with the co-worker's pagination + stride approach.
+
+---
+
+## Phase 1: Robustify Adapters & Shared Utils (Steps 1-4, parallelizable)
+
+### Step 1: Extract Shared Utilities
+**New file**: `backend/adapters/utils.py`
+
+- Extract `_get_hf_headers()` (duplicated in mcap_adapter.py, raw_video_adapter.py, lerobot_adapter.py, registry.py) into shared module
+- Add `async fetch_hf_tree(repo_id, path, headers, recursive=False)` helper with **pagination support** (HF API paginates at 1000 entries -- critical for droid_lerobot's 92K episodes)
+- All 4 adapter files + registry.py import from `utils.py`
+
+### Step 2: MCAP Adapter -- Deeper Traversal & Metadata
+**File**: `backend/adapters/mcap_adapter.py`
+
+| Change | Current | New |
+|--------|---------|-----|
+| Depth limit in `list_episodes()` | 3 (line 162) | Configurable via `config.get("mcap_max_depth", 5)` |
+| Task probing depth | 1 level | 2 levels deep -- after finding sub_dirs, make a second API call for each (limit 5) to find `Category/Skill/` structures |
+| FPS in `resolve_episode()` | Hardcoded 30 (line 203) | Detect from MCAP summary metadata timestamps; fall back to 30 |
+| `get_capabilities()` cameras | Reads from config, defaults to generic list | Detect actual camera topics from first MCAP file's channel list (cache result) |
+| Frame estimation | Flat 50KB/frame (line 259) | Codec-aware: H.264 ~20KB/frame@480p, ~80KB/frame@1080p; JPEG ~50KB/frame |
+
+### Step 3: Raw Video Adapter -- Depth & Metadata
+**File**: `backend/adapters/raw_video_adapter.py`
+
+| Change | Current | New |
+|--------|---------|-----|
+| Depth limit in `list_episodes()` | 2 (line 142) | Configurable via `config.get("video_max_depth", 4)` |
+| Metadata detection | None | Detect sidecar files (`metadata.json`, `annotations.json`, `info.parquet`) alongside videos; parse for task names, episode mappings |
+| FPS in `resolve_episode()` | Hardcoded 30 | Detect from MP4 headers via HTTP range request (first 4KB moov atom) with fallback to 30 |
+| Frame estimation | Flat 30KB/frame (line 186) | Codec-aware: H.264@480p ~20KB/frame, @1080p ~100KB/frame; AV1 ~15KB/frame |
+
+### Step 4: Registry -- Deeper BFS Auto-Detection
+**File**: `backend/adapters/registry.py`
+
+| Change | Current | New |
+|--------|---------|-----|
+| Subdirectory probing | Single level, 3 dirs (line 188) | BFS up to depth 4 |
+| API call budget | Unbounded | Hard cap at 15 API calls per detection |
+| Probing breadth | 3 dirs, no sub-probe | 5 dirs per level, 3 subdirs per dir |
+| Cache | No TTL | Add tree-result cache per repo_id (5 min TTL) to avoid redundant probing |
+
+---
+
+## Phase 2: Large Dataset Handling (Steps 5-7)
+
+### Step 5: Fix Parquet Misclassification
+**File**: `backend/api/routes/datasets.py`
+
+- In `probe_huggingface_dataset()` (line 1618-1625): Currently classifies any `.parquet` file as `"lerobot"`. **Fix**: Require `meta/info.json` with `codebase_version` field before labeling as LeRobot. Otherwise return `format_detected: "unknown"` with a note
+- Reduce MCAP modality probe download from 50MB to 5MB (line ~1690) -- MCAP summary/header data is in the first few MB
+- **New skeleton**: `backend/adapters/hf_native_adapter.py` -- placeholder for non-LeRobot parquet datasets (just raises `NotImplementedError` with helpful message)
+
+### Step 6: Episode List Pagination
+**Files**: `backend/api/routes/datasets.py`, `frontend/src/types/api.ts`, `frontend/src/components/DatasetBrowser.tsx`
+
+**Backend** -- Add `offset` and `limit` query params to episode listing endpoints:
+- `GET /api/datasets/{id}/tasks/{task}/episodes?limit=50&offset=0`
+- Response shape: `{ episodes: [...], total: 92000, offset: 0, limit: 50, has_more: true }`
+- Adapter `list_episodes()` already accepts `limit` and `offset` -- wire them through the route
+- Default limit=50 for HF streaming datasets, no limit for local datasets
+
+**Frontend**:
+- Add `PaginatedEpisodesResponse` type to `api.ts`: `{ episodes, total, offset, limit, has_more }`
+- Add "Load More" button in `DatasetBrowser.tsx` episode list when `has_more === true`
+- Show total count: "Showing 50 of 92,000 episodes"
+- Accumulate episodes client-side as user clicks "Load More"
+
+### Step 7: Auto-Stride for Large Episodes
+**Files**: `backend/api/routes/episodes.py`, `backend/loaders/streaming_extractor.py`, `frontend/src/hooks/useStreamingFrames.ts`, `frontend/src/components/EpisodeViewer.tsx`
+
+**Backend** (`episodes.py`):
+- In `stream_frames()` (line ~1165-1197): Implement auto-stride computation:
+  ```python
+  if stride == 1 and num_frames > 1000:
+      stride = math.ceil(num_frames / 500)  # Target ~500 frames for initial load
+  ```
+- Pass computed `stride` through to `stream_frames_generator()` and extractors
+- Include `stride` field in SSE `total` event: `{"total": 4500, "stride": 9, "effective_frames": 500}`
+- For MCAP `extract_frames_from_mcap()` (line 336): Skip every Nth message for JPEG; for H.264, decode all then subsample (inter-frame compression requires sequential decode)
+- For video `extract_frames_from_video()`: Use OpenCV seek (`CAP_PROP_POS_FRAMES`) to jump by stride
+
+**Cache limit increases**:
+| Cache | Current | New |
+|-------|---------|-----|
+| Persistent cache frame limit | 2000 (streaming_extractor.py:167) | 5000 |
+| In-memory frames per episode | 500 (streaming_extractor.py:103) | 1000 |
+
+**Frontend** (`useStreamingFrames.ts`):
+- Parse `stride` from SSE `total` event, expose in hook return value
+- When stride > 1, advance playback timer by `stride` frames per tick instead of 1
+- Add nearest-frame lookup: when exact frame index isn't loaded, show closest loaded frame
+- Show "Subsampled (every Nth frame)" indicator text when stride > 1
+
+**Frontend** (`EpisodeViewer.tsx`):
+- When stride > 1, show badge: "Showing every {stride}th frame ({effective_frames} of {total})"
+- Timeline slider maps to actual frame indices (0 to total-1), snaps to nearest loaded frame
+
+---
+
+## Phase 3: Frontend Format-Aware UI (Step 8)
+
+**Files**: `frontend/src/components/DatasetBrowser.tsx`, `frontend/src/components/EpisodeViewer.tsx`, `frontend/src/types/api.ts`
+
+### Types (`api.ts`)
+- Add to `Dataset` interface: `cameras?: string[]`, `fps?: number`, `total_episodes?: number`
+- Add `PaginatedEpisodesResponse` type (from Step 6)
+
+### Dataset Browser (`DatasetBrowser.tsx`)
+- Color-coded format badges next to dataset names:
+  - Orange badge: "MCAP" for `format === "mcap"`
+  - Purple badge: "Video" for `format === "video"` or `"mp4"` or `"raw_video"`
+  - Yellow badge: "LeRobot" for `format === "lerobot"` (and variants)
+  - Blue badge: "Multi" for `format === "multi-subdataset"`
+- Show camera count: "(3 cameras)" when `cameras` array available
+- Show total episodes: "92K episodes" with abbreviation for large numbers
+- Show "Large episode (N frames)" indicator when episode `num_frames > 1000`
+
+### Episode Viewer (`EpisodeViewer.tsx`)
+- Hide action chart tabs when dataset capabilities indicate `has_actions: false` (video-only)
+- Show FPS when non-default: "@ 15 fps" next to frame counter (when fps !== 30)
+- Stride indicator from Step 7
+
+---
+
+## Phase 4: Playwright E2E Verification (Step 9)
+
+**New file**: `frontend/e2e/universal-format-support.spec.ts`
+
+### Prerequisites
+- Backend running on port 8000, frontend on port 3000 (main branch)
+- HF token configured in environment
+
+### Test Suite 1: MCAP Deep Nesting (10Kh-RealOmni)
+Using `genrobot2025/10Kh-RealOmin-OpenData`:
+1. POST `/api/datasets/probe` -- verify `format_detected === "mcap"`, `modalities` includes `"rgb"`, `has_tasks === true`
+2. Add dataset, GET tasks -- verify nested paths like `"Cooking_and_Kitchen_Clean/clean_bowl"` exist
+3. List episodes for a task -- verify `.mcap` file IDs returned
+4. SSE stream one MCAP episode -- verify frames arrive with valid base64 images
+5. Verify MCAP format badge (orange) visible in sidebar
+
+### Test Suite 2: Raw MP4 Video Datasets
+Using a public MP4-based HF dataset:
+1. Verify `format_detected === "video"`
+2. Directories become tasks, MP4 files become episodes
+3. SSE stream delivers frames from MP4
+4. No action chart tabs visible, only "rgb" modality shown
+5. Verify Video format badge (purple) visible
+
+### Test Suite 3: Large Episode Handling (droid_lerobot)
+Using `IPEC-COMMUNITY/droid_lerobot`:
+1. Add dataset, verify probe completes in <30s
+2. Episode list shows pagination: "Showing 50 of N episodes", "Load More" button visible
+3. Click "Load More" -- verify more episodes loaded, count increases
+4. Navigate to large episode (>1000 frames): SSE `total` event includes `stride > 1`
+5. Playback works with stride -- verify smooth advancement
+6. No memory/timeout issues -- SSE stream completes without error
+7. Performance: tasks API < 10s, episodes API with limit=50 < 5s
+
+### Test Suite 4: Multi-Subdataset (GR00T)
+Using `nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim`:
+1. Probe detects multi-subdataset format
+2. Subdataset selector appears with ~122 options
+3. Select subdataset -> see its tasks
+4. Play episode from subdataset -> frames load correctly
+5. Switch subdatasets -> different task list loads
+
+### Test Suite 5: LeRobot Regression
+1. Rerun existing `user-flows.spec.ts` -- all must pass
+2. LIBERO: full flow (dataset -> task -> episode -> frames -> actions chart)
+3. Verify LeRobot format badge (yellow) visible
+
+### Verification approach with Playwright MCP:
+- Navigate to `http://localhost:3000`
+- Use `browser_snapshot` for accessibility tree verification
+- Use `browser_click` / `browser_type` for UI interaction
+- Use `browser_wait_for` for async loading
+- Use `browser_evaluate` to check JS state (frame counts, stride, pagination)
+- Use `browser_take_screenshot` for visual evidence
+
+---
+
+## Implementation Order
+
+| Step | Phase | What | Files | Depends On |
+|------|-------|------|-------|------------|
+| 1 | 1 | Shared utils module | New `adapters/utils.py` + update 4 adapters + registry | -- |
+| 2 | 1 | MCAP adapter improvements | `mcap_adapter.py` | Step 1 |
+| 3 | 1 | RawVideo adapter improvements | `raw_video_adapter.py` | Step 1 |
+| 4 | 1 | Registry deeper BFS | `registry.py` | Step 1 |
+| 5 | 2 | Fix parquet misclassification | `datasets.py`, new `hf_native_adapter.py` | -- |
+| 6 | 2 | Episode list pagination | `datasets.py`, `api.ts`, `DatasetBrowser.tsx` | -- |
+| 7 | 2 | Auto-stride (large episodes) | `episodes.py`, `streaming_extractor.py`, `useStreamingFrames.ts`, `EpisodeViewer.tsx` | -- |
+| 8 | 3 | Format-aware UI | `DatasetBrowser.tsx`, `EpisodeViewer.tsx`, `api.ts` | Steps 6-7 |
+| 9 | 4 | Playwright E2E tests | New `universal-format-support.spec.ts` | All above |
+
+**Parallelization**: Steps 1-5 can run in parallel. Steps 6-7 can run in parallel. Step 8 after 6-7. Step 9 last.
+
+---
+
+## Risks & Mitigations
+
+| Risk | Mitigation |
+|------|-----------|
+| HF API rate limiting from deeper probing | Hard cap of 15 API calls per detection; cache tree results per-repo (5 min TTL); exponential backoff on 429 |
+| H.264 in MCAP requires sequential decode | Decode all frames then subsample post-decode; persistent cache for subsequent requests |
+| Memory from large episodes (5000+ frames) | Auto-stride caps initial load at ~500 frames; configurable cache limits |
+| 92K episode list overwhelms frontend | Pagination (limit=50 default) with "Load More"; never load full list |
+| Regression for existing LeRobot datasets | Run `user-flows.spec.ts` before and after; adapter-first path falls through to existing code if no adapter |
+| MCAP modality probe too slow (50MB download) | Reduce to 5MB -- header/summary is sufficient |

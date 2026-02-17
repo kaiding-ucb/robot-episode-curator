@@ -51,7 +51,12 @@ export default function Home() {
     <div className="flex h-screen bg-gray-100 dark:bg-gray-950" data-testid="app-layout">
       <LeftSidebar
         onSelectEpisode={handleSelectEpisode}
-        onSelectDataset={(id) => setSelectedDataset(id)}
+        onSelectDataset={(id) => {
+          setSelectedDataset(id);
+          setSelectedEpisode(null);
+          setSelectedEpisodeDisplayName(null);
+          setSelectedEpisodeFrameCount(0);
+        }}
         onOpenDataManager={() => setShowDataManager(true)}
         onOpenAnalysis={() => setShowDatasetAnalysis(true)}
       />

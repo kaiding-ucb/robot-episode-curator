@@ -8,6 +8,7 @@ Includes persistent caching to avoid re-downloading and re-decoding on subsequen
 Supports multiple modalities: RGB, depth, IMU.
 """
 import logging
+import math
 import os
 import pickle
 import tempfile
@@ -244,6 +245,14 @@ class StreamingFrameExtractor:
     - WebDataset TAR files (Egocentric-10K with video.mp4)
     - Direct video files (MP4, etc.)
     """
+
+    # Topic pattern constants for MCAP signal extraction
+    _ACTION_TOPIC_PATTERNS = [
+        "action", "command", "control", "cmd", "joint",
+        "gripper", "target", "eef_pose", "end_effector",
+    ]
+    _IMU_TOPIC_PATTERNS = ["imu", "accelerometer", "gyroscope", "accel", "gyro"]
+    _SKIP_TOPIC_PATTERNS = ["camera", "image", "rgb", "depth", "compressed"]
 
     def __init__(self, repo_id: str, cache_dir: Optional[Path] = None):
         self.repo_id = repo_id
@@ -696,6 +705,7 @@ class StreamingFrameExtractor:
         file_path: Path,
         start: int = 0,
         end: int = 10,
+        stride: int = 1,
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from a video file (MP4, etc.).
@@ -704,16 +714,19 @@ class StreamingFrameExtractor:
             file_path: Path to the video file
             start: Start frame index
             end: End frame index
+            stride: Extract every Nth frame (1 = all frames, 2 = every other frame, etc.)
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
         """
+        stride = max(1, stride)
         try:
             import cv2
 
             cap = cv2.VideoCapture(str(file_path))
             if not cap.isOpened():
-                raise ValueError(f"Could not open video: {file_path}")
+                # Try PyAV as fallback (handles AV1 and other codecs)
+                return self._extract_frames_pyav(file_path, start, end, stride)
 
             fps = cap.get(cv2.CAP_PROP_FPS) or 30
             frames = []
@@ -729,13 +742,20 @@ class StreamingFrameExtractor:
                 if not ret:
                     break
 
-                # Convert BGR to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                timestamp = frame_idx / fps
-                frames.append((frame_idx, timestamp, frame_rgb))
+                if (frame_idx - start) % stride == 0:
+                    # Convert BGR to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    timestamp = frame_idx / fps
+                    frames.append((frame_idx, timestamp, frame_rgb))
                 frame_idx += 1
 
             cap.release()
+
+            # If no frames extracted, video might use a codec OpenCV can't decode (e.g. AV1)
+            if not frames and start < end:
+                logger.info(f"OpenCV extracted 0 frames, trying PyAV fallback for {file_path}")
+                return self._extract_frames_pyav(file_path, start, end, stride)
+
             return frames
 
         except ImportError:
@@ -745,11 +765,52 @@ class StreamingFrameExtractor:
             logger.error(f"Failed to extract frames from video: {e}")
             raise
 
+    def _extract_frames_pyav(
+        self,
+        file_path: Path,
+        start: int = 0,
+        end: int = 10,
+        stride: int = 1,
+    ) -> List[Tuple[int, float, np.ndarray]]:
+        """
+        PyAV fallback for extracting frames from videos with codecs
+        that OpenCV can't handle (e.g., AV1).
+        """
+        try:
+            import av
+
+            container = av.open(str(file_path))
+            stream = container.streams.video[0]
+            fps = float(stream.average_rate) if stream.average_rate else 30.0
+
+            frames = []
+            frame_idx = 0
+
+            for frame in container.decode(stream):
+                if frame_idx >= end:
+                    break
+                if frame_idx >= start and (frame_idx - start) % stride == 0:
+                    img = frame.to_ndarray(format="rgb24")
+                    timestamp = frame_idx / fps
+                    frames.append((frame_idx, timestamp, img))
+                frame_idx += 1
+
+            container.close()
+            return frames
+
+        except ImportError:
+            logger.error("PyAV not installed. Install with: pip install av")
+            return []
+        except Exception as e:
+            logger.error(f"PyAV fallback failed for {file_path}: {e}")
+            return []
+
     def extract_frames_from_tar(
         self,
         file_path: Path,
         start: int = 0,
         end: int = 10,
+        stride: int = 1,
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from a WebDataset TAR file containing video.
@@ -758,6 +819,7 @@ class StreamingFrameExtractor:
             file_path: Path to the TAR file
             start: Start frame index
             end: End frame index
+            stride: Extract every Nth frame (1 = all frames)
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
@@ -788,7 +850,7 @@ class StreamingFrameExtractor:
 
                 try:
                     # Extract frames from video
-                    return self.extract_frames_from_video(tmp_path, start, end)
+                    return self.extract_frames_from_video(tmp_path, start, end, stride)
                 finally:
                     # Clean up temp file
                     tmp_path.unlink(missing_ok=True)
@@ -886,15 +948,12 @@ class StreamingFrameExtractor:
                 "gyro_z": [],
             }
 
-            # IMU topic patterns
-            imu_patterns = ["imu", "accelerometer", "gyroscope", "accel", "gyro"]
-
             with open(local_path, "rb") as f:
                 reader = make_reader(f, decoder_factories=[DecoderFactory()])
 
                 for schema, channel, message, decoded_message in reader.iter_decoded_messages():
                     topic_lower = channel.topic.lower()
-                    if any(p in topic_lower for p in imu_patterns):
+                    if any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
                         timestamp = message.log_time / 1e9
 
                         # Try to extract IMU data from decoded message
@@ -986,10 +1045,6 @@ class StreamingFrameExtractor:
                 "dimension_labels": None,
             }
 
-            # Action topic patterns (common conventions)
-            # Include eef_pose for end-effector pose data (RealOmni)
-            action_patterns = ["action", "command", "control", "cmd", "joint", "gripper", "target", "eef_pose", "end_effector"]
-
             with open(local_path, "rb") as f:
                 reader = make_reader(f, decoder_factories=decoder_factories)
 
@@ -997,11 +1052,11 @@ class StreamingFrameExtractor:
                     topic_lower = channel.topic.lower()
 
                     # Skip camera/image topics
-                    if any(p in topic_lower for p in ["camera", "image", "rgb", "depth", "compressed"]):
+                    if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
                         continue
 
                     # Check if this looks like an action topic
-                    if any(p in topic_lower for p in action_patterns):
+                    if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
                         timestamp = message.log_time / 1e9
 
                         # Try to extract action data from decoded message
@@ -1112,6 +1167,232 @@ class StreamingFrameExtractor:
 
         return None
 
+    def _extract_imu_sample(
+        self, decoded_message, timestamp: float, imu_data: Dict[str, List]
+    ) -> bool:
+        """
+        Extract a single IMU sample from a decoded MCAP message into imu_data.
+
+        Handles both ROS sensor_msgs/Imu and Foxglove IMUMeasurement formats.
+
+        Returns:
+            True if a sample was extracted, False otherwise.
+        """
+        # ROS sensor_msgs/Imu format
+        if hasattr(decoded_message, 'linear_acceleration'):
+            accel = decoded_message.linear_acceleration
+            imu_data["timestamps"].append(timestamp)
+            imu_data["accel_x"].append(getattr(accel, 'x', 0.0))
+            imu_data["accel_y"].append(getattr(accel, 'y', 0.0))
+            imu_data["accel_z"].append(getattr(accel, 'z', 0.0))
+
+            if hasattr(decoded_message, 'angular_velocity'):
+                gyro = decoded_message.angular_velocity
+                imu_data["gyro_x"].append(getattr(gyro, 'x', 0.0))
+                imu_data["gyro_y"].append(getattr(gyro, 'y', 0.0))
+                imu_data["gyro_z"].append(getattr(gyro, 'z', 0.0))
+            else:
+                imu_data["gyro_x"].append(0.0)
+                imu_data["gyro_y"].append(0.0)
+                imu_data["gyro_z"].append(0.0)
+            return True
+
+        # Foxglove IMUMeasurement format (used by RealOmni)
+        elif hasattr(decoded_message, 'linear_acceleration_x'):
+            imu_data["timestamps"].append(timestamp)
+            imu_data["accel_x"].append(getattr(decoded_message, 'linear_acceleration_x', 0.0))
+            imu_data["accel_y"].append(getattr(decoded_message, 'linear_acceleration_y', 0.0))
+            imu_data["accel_z"].append(getattr(decoded_message, 'linear_acceleration_z', 0.0))
+            imu_data["gyro_x"].append(getattr(decoded_message, 'angular_velocity_x', 0.0))
+            imu_data["gyro_y"].append(getattr(decoded_message, 'angular_velocity_y', 0.0))
+            imu_data["gyro_z"].append(getattr(decoded_message, 'angular_velocity_z', 0.0))
+            return True
+
+        return False
+
+    def _count_signal_messages(self, local_path: Path) -> Tuple[int, int]:
+        """
+        Cheap counting pass over MCAP messages (no decode) to determine
+        action and IMU message counts for stride calculation.
+
+        Returns:
+            Tuple of (action_count, imu_count)
+        """
+        from mcap.reader import make_reader
+
+        action_count = 0
+        imu_count = 0
+
+        with open(local_path, "rb") as f:
+            reader = make_reader(f)
+            for _, channel, _, in reader.iter_messages():
+                topic_lower = channel.topic.lower()
+                if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
+                    continue
+                if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
+                    action_count += 1
+                elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
+                    imu_count += 1
+
+        return action_count, imu_count
+
+    def extract_signals_data(
+        self,
+        episode_path: str,
+        max_actions: int = 500,
+        max_imu: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Extract both action and IMU signal data from an MCAP episode in a
+        single stride-aware pass.
+
+        Pass 1: Count messages (no decode) to compute per-signal strides.
+        Pass 2: Decode only the messages that survive the stride filter.
+
+        Args:
+            episode_path: Path within the HuggingFace repo
+            max_actions: Target maximum number of action samples
+            max_imu: Target maximum number of IMU samples
+
+        Returns:
+            {
+                "actions": {timestamps, actions, dimension_labels},
+                "imu": {timestamps, accel_x/y/z, gyro_x/y/z},
+                "action_stride": int,
+                "imu_stride": int,
+            }
+        """
+        local_path = self.download_file(episode_path)
+        suffix = local_path.suffix.lower()
+
+        if suffix != '.mcap':
+            return {
+                "actions": {"error": f"Signal extraction only supported for MCAP files, got {suffix}"},
+                "imu": {"error": f"Signal extraction only supported for MCAP files, got {suffix}"},
+                "action_stride": 1,
+                "imu_stride": 1,
+            }
+
+        try:
+            from mcap.reader import make_reader
+
+            # Import all available decoder factories
+            decoder_factories = []
+            try:
+                from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+                decoder_factories.append(Ros2DecoderFactory())
+            except ImportError:
+                pass
+            try:
+                from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
+                decoder_factories.append(ProtobufDecoderFactory())
+            except ImportError:
+                pass
+
+            if not decoder_factories:
+                return {
+                    "actions": {"error": "No MCAP decoder factories available"},
+                    "imu": {"error": "No MCAP decoder factories available"},
+                    "action_stride": 1,
+                    "imu_stride": 1,
+                }
+
+            # Pass 1: count messages to compute strides
+            action_count, imu_count = self._count_signal_messages(local_path)
+
+            action_stride = max(1, math.ceil(action_count / max_actions)) if action_count > max_actions else 1
+            imu_stride = max(1, math.ceil(imu_count / max_imu)) if imu_count > max_imu else 1
+
+            logger.info(
+                f"Signal extraction: {action_count} action msgs (stride={action_stride}), "
+                f"{imu_count} IMU msgs (stride={imu_stride})"
+            )
+
+            # Pass 2: single decoded loop with stride filtering
+            actions_data = {
+                "timestamps": [],
+                "actions": [],
+                "dimension_labels": None,
+            }
+            imu_data = {
+                "timestamps": [],
+                "accel_x": [],
+                "accel_y": [],
+                "accel_z": [],
+                "gyro_x": [],
+                "gyro_y": [],
+                "gyro_z": [],
+            }
+
+            action_idx = 0
+            imu_idx = 0
+
+            with open(local_path, "rb") as f:
+                reader = make_reader(f, decoder_factories=decoder_factories)
+
+                for schema, channel, message, decoded_message in reader.iter_decoded_messages():
+                    topic_lower = channel.topic.lower()
+
+                    # Skip camera/image topics
+                    if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
+                        continue
+
+                    # Action topics
+                    if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
+                        if action_idx % action_stride == 0:
+                            timestamp = message.log_time / 1e9
+                            action_vector = self._extract_action_vector(decoded_message)
+                            if action_vector is not None:
+                                actions_data["timestamps"].append(timestamp)
+                                actions_data["actions"].append(action_vector)
+                        action_idx += 1
+
+                    # IMU topics
+                    elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
+                        if imu_idx % imu_stride == 0:
+                            timestamp = message.log_time / 1e9
+                            self._extract_imu_sample(decoded_message, timestamp, imu_data)
+                        imu_idx += 1
+
+            # Infer dimension labels for actions
+            if actions_data["actions"]:
+                num_dims = len(actions_data["actions"][0])
+                if num_dims == 7:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+                elif num_dims == 6:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
+                elif num_dims == 3:
+                    actions_data["dimension_labels"] = ["x", "y", "z"]
+
+            logger.info(
+                f"Extracted {len(actions_data['timestamps'])} action samples, "
+                f"{len(imu_data['timestamps'])} IMU samples from {episode_path}"
+            )
+
+            return {
+                "actions": actions_data,
+                "imu": imu_data,
+                "action_stride": action_stride,
+                "imu_stride": imu_stride,
+            }
+
+        except ImportError as e:
+            logger.error(f"MCAP library not installed: {e}")
+            return {
+                "actions": {"error": "MCAP library not installed"},
+                "imu": {"error": "MCAP library not installed"},
+                "action_stride": 1,
+                "imu_stride": 1,
+            }
+        except Exception as e:
+            logger.error(f"Failed to extract signals data: {e}")
+            return {
+                "actions": {"error": str(e)},
+                "imu": {"error": str(e)},
+                "action_stride": 1,
+                "imu_stride": 1,
+            }
+
     def get_frame_count(self, episode_path: str) -> int:
         """
         Get the number of frames in an episode.
@@ -1183,7 +1464,8 @@ class StreamingFrameExtractor:
         stream: str = "rgb",
         depth_colormap: str = "viridis",
         revision: Optional[str] = None,
-    ) -> Tuple[List[Tuple[int, float, np.ndarray]], int]:
+        auto_stride_target: Optional[int] = None,
+    ) -> Tuple[List[Tuple[int, float, np.ndarray]], int, int]:
         """
         Extract frames from an episode file and return total frame count.
 
@@ -1197,9 +1479,12 @@ class StreamingFrameExtractor:
             stream: Which stream to extract: "rgb" or "depth"
             depth_colormap: Colormap for depth visualization
             revision: Branch/tag to download from (e.g., "v2.0")
+            auto_stride_target: If set, automatically compute stride to
+                keep frame count near this target. Stride is passed to
+                the video decoder so non-strided frames are never decoded.
 
         Returns:
-            Tuple of (frames_list, total_frame_count)
+            Tuple of (frames_list, total_frame_count, stride_used)
         """
         # Download the file first
         local_path = self.download_file(episode_path, revision=revision)
@@ -1207,6 +1492,11 @@ class StreamingFrameExtractor:
 
         # Get total frame count
         total_frames = self.get_frame_count(episode_path)
+
+        # Compute stride if auto_stride_target is set
+        stride = 1
+        if auto_stride_target and total_frames > auto_stride_target:
+            stride = math.ceil(total_frames / auto_stride_target)
 
         # Extract frames (with episode_path for persistent caching)
         if suffix == '.mcap':
@@ -1216,11 +1506,14 @@ class StreamingFrameExtractor:
                 stream=stream,
                 depth_colormap=depth_colormap
             )
+            # MCAP extractor doesn't support stride param; apply post-hoc
+            if stride > 1:
+                frames = [f for i, f in enumerate(frames) if i % stride == 0]
         elif suffix == '.tar':
-            frames = self.extract_frames_from_tar(local_path, start, end)
+            frames = self.extract_frames_from_tar(local_path, start, end, stride)
         elif suffix in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
-            frames = self.extract_frames_from_video(local_path, start, end)
+            frames = self.extract_frames_from_video(local_path, start, end, stride)
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
 
-        return frames, total_frames
+        return frames, total_frames, stride

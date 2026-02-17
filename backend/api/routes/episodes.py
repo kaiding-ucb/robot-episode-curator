@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import json
 import logging
+import math
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -25,6 +26,7 @@ from downloaders.manager import DATASET_REGISTRY, get_all_datasets
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.streaming_extractor import StreamingFrameExtractor, cleanup_decoded_frames
 from cache import get_encoded_frame_cache
+from adapters import FormatRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -278,9 +280,23 @@ def encode_image_base64(image: np.ndarray) -> str:
 
 
 def _is_lerobot_episode_id(episode_id: str) -> bool:
-    """Check if episode_id matches the LeRobot format: episode_N."""
+    """Check if episode_id matches the LeRobot format: episode_N or prefix/episode_N."""
     import re
-    return bool(re.match(r'^episode_\d+$', episode_id))
+    return bool(re.match(r'^(.+/)?episode_\d+$', episode_id))
+
+
+def _parse_lerobot_episode_id(episode_id: str) -> tuple:
+    """
+    Parse a LeRobot episode_id into (path_prefix, base_episode_id).
+
+    e.g., "subdir/episode_0" -> ("subdir", "episode_0")
+          "episode_0" -> ("", "episode_0")
+    """
+    import re
+    match = re.match(r'^(.+)/(episode_\d+)$', episode_id)
+    if match:
+        return match.group(1), match.group(2)
+    return "", episode_id
 
 
 # Cache for LeRobot episode resolution (avoids repeated HF API calls)
@@ -290,12 +306,16 @@ _lerobot_resolution_cache: Dict[str, Dict[str, Any]] = {}
 async def resolve_lerobot_episode(
     repo_id: str,
     episode_id: str,
+    path_prefix: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Resolve a LeRobot episode_N ID to the video chunk path and frame range.
 
     Uses episode metadata from meta/episodes/ which contains explicit
     video chunk/file indices and from/to timestamps per episode.
+
+    When path_prefix is set (for multi-subdataset repos), all paths are
+    scoped under the subdataset prefix.
 
     Returns dict with:
         - video_path: path to the MP4 file in the HF repo
@@ -306,7 +326,7 @@ async def resolve_lerobot_episode(
         - video_key: the observation key used for video
     Or None if resolution fails.
     """
-    cache_key = f"{repo_id}/{episode_id}"
+    cache_key = f"{repo_id}/{path_prefix}/{episode_id}" if path_prefix else f"{repo_id}/{episode_id}"
     if cache_key in _lerobot_resolution_cache:
         return _lerobot_resolution_cache[cache_key]
 
@@ -320,7 +340,7 @@ async def resolve_lerobot_episode(
     target_ep_idx = int(match.group(1))
 
     # Fetch metadata
-    info = await fetch_lerobot_info(repo_id)
+    info = await fetch_lerobot_info(repo_id, path_prefix=path_prefix)
     if info is None:
         logger.warning(f"Could not fetch LeRobot info.json for {repo_id}")
         return None
@@ -341,9 +361,9 @@ async def resolve_lerobot_episode(
         return None
 
     # Detect which branch has the actual data files
-    data_branch = await detect_lerobot_data_branch(repo_id)
+    data_branch = await detect_lerobot_data_branch(repo_id, path_prefix=path_prefix)
 
-    episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+    episodes_df = await fetch_lerobot_episodes_meta(repo_id, path_prefix=path_prefix)
 
     if episodes_df is not None:
         # v3 path: use episode metadata for chunk/file indices and timestamps
@@ -381,6 +401,10 @@ async def resolve_lerobot_episode(
                 episode_chunk=chunk_index,
                 episode_index=target_ep_idx,
             )
+
+        # Prepend subdataset prefix to video path for multi-subdataset repos
+        if path_prefix:
+            video_path = f"{path_prefix}/{video_path}"
 
         # Compute frame range using timestamps and FPS
         if vid_from_ts_col in ep_row.index and vid_to_ts_col in ep_row.index:
@@ -435,6 +459,10 @@ async def resolve_lerobot_episode(
     except KeyError as e:
         logger.warning(f"Failed to format video_path template for {repo_id}: {e}")
         return None
+
+    # Prepend subdataset prefix for multi-subdataset repos
+    if path_prefix:
+        video_path = f"{path_prefix}/{video_path}"
 
     result = {
         "video_path": video_path,
@@ -550,7 +578,7 @@ async def get_streaming_frames(
     try:
         # Extract ALL frames (from 0 to a large number to get everything)
         logger.info(f"Decoding full episode for caching: {file_path} (stream={stream}, revision={revision})")
-        raw_frames, total_frames = extractor.extract_frames_with_count(
+        raw_frames, total_frames, _ = extractor.extract_frames_with_count(
             file_path, 0, 999999, stream=stream, revision=revision
         )
 
@@ -634,7 +662,8 @@ async def get_frames(
 
     # Handle LeRobot episode_N format via video chunk extraction
     if is_streaming and _is_lerobot_episode_id(episode_id):
-        resolution_info = await resolve_lerobot_episode(repo_id, episode_id)
+        ep_path_prefix, base_episode_id = _parse_lerobot_episode_id(episode_id)
+        resolution_info = await resolve_lerobot_episode(repo_id, base_episode_id, path_prefix=ep_path_prefix)
         if resolution_info:
             cache = get_encoded_frame_cache()
             effective_dataset_id = dataset_id or repo_id.replace("/", "_")
@@ -826,6 +855,7 @@ async def stream_frames_generator(
     resolution: str,
     quality: int,
     stream: str,
+    stride: int = 1,
     is_disconnected: callable = None,
     dataset_id: str = None,
     revision: str = None,
@@ -839,6 +869,7 @@ async def stream_frames_generator(
     Also caches frames after streaming completes so they appear in "Cached Episodes".
 
     Args:
+        stride: Extract every Nth frame. If 1 and total_frames > 500, auto-computed.
         is_disconnected: Optional async callable to check if client disconnected
         dataset_id: Dataset ID for caching
         revision: Branch/tag to download from (e.g., "v2.0")
@@ -901,16 +932,28 @@ async def stream_frames_generator(
                 return
 
             # For non-MCAP files, fall back to batch decoding (in thread pool)
+            # When stride==1, let the decoder skip frames via auto_stride_target
             result = await run_in_thread(
                 extractor.extract_frames_with_count,
-                file_path, start, end, stream=stream
+                file_path, start, end, stream=stream,
+                auto_stride_target=500 if stride == 1 else None,
             )
             if result is None:
                 return  # Client disconnected during extraction
-            raw_frames, total_frames = result
+            raw_frames, total_frames, stride_used = result
+
+            # Use decoder-computed stride when auto_stride was applied
+            if stride_used > 1 and stride == 1:
+                stride = stride_used
+                logger.info(f"Auto-stride: {total_frames} frames -> stride={stride}")
 
             total_frames_count = total_frames
-            yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+            yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': stride})}\n\n"
+
+            # Apply post-hoc stride filtering only for explicit caller stride
+            # (auto_stride is already applied during decode)
+            if stride > 1 and stride_used == 1:
+                raw_frames = [(idx, ts, img) for idx, ts, img in raw_frames if idx % stride == 0]
 
             for frame_idx, timestamp, image in raw_frames:
                 # Check for disconnection periodically (every 10 frames)
@@ -953,7 +996,13 @@ async def stream_frames_generator(
         if total_frames is None:
             return  # Client disconnected
         total_frames_count = total_frames
-        yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+
+        # Auto-compute stride for large MCAP episodes
+        if stride == 1 and total_frames > 500:
+            stride = math.ceil(total_frames / 500)
+            logger.info(f"Auto-stride (MCAP): {total_frames} frames -> stride={stride}")
+
+        yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': stride})}\n\n"
 
         # Extract frames progressively (in thread pool)
         # For H.264, we still need to decode from the beginning, but we can yield as we go
@@ -965,6 +1014,10 @@ async def stream_frames_generator(
         )
         if raw_frames is None:
             return  # Client disconnected during extraction
+
+        # Apply stride filtering (MCAP decodes all frames, then we filter)
+        if stride > 1:
+            raw_frames = [(idx, ts, img) for i, (idx, ts, img) in enumerate(raw_frames) if i % stride == 0]
 
         for frame_idx, timestamp, image in raw_frames:
             # Check for disconnection periodically (every 10 frames)
@@ -1018,7 +1071,7 @@ async def serve_cached_frames_as_sse(
     all_frames = cached_episode["frames"]
     total_frames = cached_episode["total"]
 
-    yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames})}\n\n"
+    yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': 1})}\n\n"
 
     # Clamp range to available frames
     actual_end = min(end, len(all_frames))
@@ -1045,6 +1098,7 @@ async def stream_lerobot_frames_generator(
     end: int,
     resolution: str,
     quality: int,
+    stride: int = 1,
     is_disconnected: callable = None,
     dataset_id: str = None,
 ) -> AsyncGenerator[str, None]:
@@ -1053,6 +1107,9 @@ async def stream_lerobot_frames_generator(
 
     Downloads the correct video chunk and extracts only the frames
     belonging to the specific episode.
+
+    Args:
+        stride: Extract every Nth frame. If 1 and num_frames > 500, auto-computed.
     """
     import concurrent.futures
 
@@ -1079,8 +1136,13 @@ async def stream_lerobot_frames_generator(
         return False
 
     try:
-        # Send total frames first
-        yield f"data: {json.dumps({'type': 'total', 'total_frames': num_frames})}\n\n"
+        # Auto-compute stride for large episodes
+        if stride == 1 and num_frames and num_frames > 500:
+            stride = math.ceil(num_frames / 500)
+            logger.info(f"Auto-stride (LeRobot): {num_frames} frames -> stride={stride}")
+
+        # Send total frames first (with stride info)
+        yield f"data: {json.dumps({'type': 'total', 'total_frames': num_frames, 'stride': stride})}\n\n"
 
         if await check_disconnected():
             return
@@ -1113,6 +1175,10 @@ async def stream_lerobot_frames_generator(
         if raw_frames is None:
             yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to extract frames'})}\n\n"
             return
+
+        # Apply stride filtering for LeRobot frames
+        if stride > 1:
+            raw_frames = [(idx, ts, img) for idx, ts, img in raw_frames if (idx - frame_start) % stride == 0]
 
         for abs_frame_idx, timestamp, image in raw_frames:
             # Re-index to episode-relative (0-based within the episode)
@@ -1161,6 +1227,7 @@ async def stream_frames(
     resolution: str = Query("low", description="Image resolution"),
     quality: int = Query(70, ge=10, le=100, description="WebP quality"),
     stream: str = Query("rgb", description="Stream: rgb or depth"),
+    stride: int = Query(1, ge=1, description="Extract every Nth frame (for large episodes)"),
 ):
     """
     Stream frames using Server-Sent Events (SSE).
@@ -1186,6 +1253,7 @@ async def stream_frames(
         resolution: Image resolution (low/medium/high/original)
         quality: WebP quality (10-100)
         stream: Which stream to extract (rgb or depth)
+        stride: Extract every Nth frame (auto-computed for large episodes if set to 1)
     """
     # Check if this is a streaming episode
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
@@ -1196,9 +1264,10 @@ async def stream_frames(
             detail="SSE streaming only available for HuggingFace streaming datasets"
         )
 
-    # Handle LeRobot episode_N format
+    # Handle LeRobot episode_N format (including multi-subdataset prefix/episode_N)
     if _is_lerobot_episode_id(episode_id):
-        resolution_info = await resolve_lerobot_episode(repo_id, episode_id)
+        ep_path_prefix, base_episode_id = _parse_lerobot_episode_id(episode_id)
+        resolution_info = await resolve_lerobot_episode(repo_id, base_episode_id, path_prefix=ep_path_prefix)
         if resolution_info:
             data_branch = resolution_info.get("data_branch")
 
@@ -1229,6 +1298,7 @@ async def stream_frames(
                 return StreamingResponse(
                     stream_frames_generator(
                         repo_id, video_path, start, end, resolution, quality, stream,
+                        stride=stride,
                         is_disconnected=is_disconnected_v21,
                         dataset_id=dataset_id,
                         revision=data_branch,
@@ -1270,6 +1340,7 @@ async def stream_frames(
                 stream_lerobot_frames_generator(
                     repo_id, episode_id, resolution_info,
                     start, end, resolution, quality,
+                    stride=stride,
                     is_disconnected=is_disconnected,
                     dataset_id=dataset_id,
                 ),
@@ -1318,6 +1389,7 @@ async def stream_frames(
     return StreamingResponse(
         stream_frames_generator(
             repo_id, file_path, start, end, resolution, quality, stream,
+            stride=stride,
             is_disconnected=is_disconnected,
             dataset_id=dataset_id,
         ),
@@ -1403,11 +1475,13 @@ async def _get_lerobot_actions(
     repo_id: str,
     episode_id: str,
     dataset_id: Optional[str] = None,
+    path_prefix: str = "",
 ) -> ActionsData:
     """
     Extract action data from a streaming LeRobot dataset's parquet files.
 
     Uses the same parquet download infrastructure as signal analysis.
+    When path_prefix is set, scopes metadata and data paths under the subdataset prefix.
     """
     import re
     import httpx
@@ -1420,12 +1494,12 @@ async def _get_lerobot_actions(
         return ActionsData(error=f"Invalid LeRobot episode ID: {episode_id}")
     target_ep_idx = int(match.group(1))
 
-    info = await fetch_lerobot_info(repo_id)
+    info = await fetch_lerobot_info(repo_id, path_prefix=path_prefix)
     if info is None:
         return ActionsData(error=f"Could not fetch info.json for {repo_id}")
 
-    data_branch = await detect_lerobot_data_branch(repo_id) or "main"
-    data_files = _build_lerobot_data_file_list(info, [target_ep_idx])
+    data_branch = await detect_lerobot_data_branch(repo_id, path_prefix=path_prefix) or "main"
+    data_files = _build_lerobot_data_file_list(info, [target_ep_idx], path_prefix=path_prefix)
     if not data_files:
         return ActionsData(error="Could not determine parquet file path for episode")
 
@@ -1457,6 +1531,11 @@ async def _get_lerobot_actions(
     sort_col = "frame_index" if "frame_index" in episode_df.columns else "index"
     if sort_col in episode_df.columns:
         episode_df = episode_df.sort_values(sort_col)
+
+    # Auto-stride: subsample rows for large episodes (consistent with video streaming)
+    if len(episode_df) > 500:
+        signal_stride = math.ceil(len(episode_df) / 500)
+        episode_df = episode_df.iloc[::signal_stride].reset_index(drop=True)
 
     # Extract timestamps
     fps = info.get("fps", 30)
@@ -1532,7 +1611,8 @@ async def get_actions_data(
     if is_streaming:
         # Handle LeRobot parquet-based episodes
         if _is_lerobot_episode_id(episode_id):
-            return await _get_lerobot_actions(repo_id, episode_id, dataset_id)
+            ep_path_prefix, base_episode_id = _parse_lerobot_episode_id(episode_id)
+            return await _get_lerobot_actions(repo_id, base_episode_id, dataset_id, path_prefix=ep_path_prefix)
 
         # Only MCAP files have action data via topic extraction
         if not file_path.endswith(".mcap"):

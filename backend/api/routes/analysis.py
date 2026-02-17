@@ -288,6 +288,7 @@ async def _extract_lerobot_episodes(
     max_episodes: int,
     filter_episodes: Optional[set] = None,
     branch: str = "main",
+    max_frames_per_episode: int = 500,
 ) -> List[Dict[str, Any]]:
     """
     Download LeRobot Parquet files and extract per-episode action data.
@@ -298,6 +299,10 @@ async def _extract_lerobot_episodes(
 
     If filter_episodes is provided, only episodes with indices in that set
     are counted toward max_episodes and included in the result.
+
+    Auto-stride: episodes with more than max_frames_per_episode rows are
+    subsampled using stride = ceil(num_rows / max_frames_per_episode).
+    This keeps signal analysis fast for large episodes.
     """
     all_dfs = []
     relevant_episodes = set()
@@ -359,6 +364,12 @@ async def _extract_lerobot_episodes(
             continue
 
         episode_id = f"episode_{ep_idx_int}"
+
+        # Auto-stride: subsample rows for large episodes
+        signal_stride = 1
+        if len(group) > max_frames_per_episode:
+            signal_stride = math.ceil(len(group) / max_frames_per_episode)
+            group = group.iloc[::signal_stride].reset_index(drop=True)
 
         # Extract timestamps
         timestamps = []
@@ -425,6 +436,7 @@ async def _extract_lerobot_episodes(
             "global_episode_index": ep_idx_int,
             "actions": actions_data,
             "imu": None,  # LeRobot datasets don't have IMU
+            "signal_stride": signal_stride,
         })
 
     return episodes
@@ -433,12 +445,14 @@ async def _extract_lerobot_episodes(
 def _build_lerobot_data_file_list(
     info: Dict[str, Any],
     episode_indices: List[int],
+    path_prefix: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Build data file list from info.json data_path template.
 
     For LeRobot v2.1 datasets where the tree API doesn't list data/ files,
     we construct the paths directly using the template from info.json.
+    When path_prefix is set, prepends the subdataset prefix to all paths.
     """
     data_path_template = info.get("data_path", "")
     chunks_size = info.get("chunks_size", 1000)
@@ -458,6 +472,9 @@ def _build_lerobot_data_file_list(
             )
         except (KeyError, IndexError):
             path = f"data/chunk-{ep_chunk:03d}/episode_{ep_idx:06d}.parquet"
+        # Prepend subdataset prefix for multi-subdataset repos
+        if path_prefix:
+            path = f"{path_prefix}/{path}"
         files.append({
             "episode_id": f"data/{path.split('/')[-1]}",
             "file_name": path.split("/")[-1],
@@ -1079,6 +1096,7 @@ async def get_signals_comparison(
                         "imu": ep["imu"],
                         "total_frames": ep.get("total_frames"),
                         "global_episode_index": ep.get("global_episode_index"),
+                        "signal_stride": ep.get("signal_stride", 1),
                     }
                     yield f"data: {json.dumps(result)}\n\n"
 
@@ -1115,15 +1133,12 @@ async def get_signals_comparison(
                         try:
                             loop = asyncio.get_event_loop()
 
-                            actions_data = await loop.run_in_executor(
-                                None, extractor.extract_actions_data, episode_path
+                            # Single stride-aware pass for both actions and IMU
+                            signals = await loop.run_in_executor(
+                                None, extractor.extract_signals_data, episode_path, 500, 500
                             )
-                            imu_data = await loop.run_in_executor(
-                                None, extractor.extract_imu_data, episode_path
-                            )
-
-                            actions_data = _downsample_actions(actions_data, max_points=2000)
-                            imu_data = _downsample_imu(imu_data, max_points=2000)
+                            actions_data = signals["actions"]
+                            imu_data = signals["imu"]
 
                             result = {
                                 "type": "episode_data",
@@ -1131,6 +1146,7 @@ async def get_signals_comparison(
                                 "episode_index": idx,
                                 "actions": actions_data,
                                 "imu": imu_data,
+                                "signal_stride": signals.get("action_stride", 1),
                             }
 
                         except Exception as e:

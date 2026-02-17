@@ -83,18 +83,20 @@ export function useEpisodes(datasetId: string | null) {
 }
 
 /**
- * Fetch tasks for a dataset
+ * Fetch tasks for a dataset with pagination and search
  */
-export function useTasks(datasetId: string | null) {
+export function useTasks(datasetId: string | null, pageSize: number = 50) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
   const [source, setSource] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [prevDatasetId, setPrevDatasetId] = useState<string | null>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Immediately clear stale tasks during render when dataset changes
-  // (React's recommended pattern for derived state reset)
   if (datasetId !== prevDatasetId) {
     setPrevDatasetId(datasetId);
     setTasks([]);
@@ -102,33 +104,60 @@ export function useTasks(datasetId: string | null) {
     setSource(null);
     setLoading(!!datasetId);
     setError(null);
+    setHasMore(false);
+    setSearchQuery("");
   }
 
-  useEffect(() => {
-    if (!datasetId) {
-      return;
-    }
+  const fetchTasks = useCallback(async (newOffset: number = 0, search: string = "") => {
+    if (!datasetId) return;
 
-    async function fetchTasks() {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch(`${API_BASE}/datasets/${datasetId}/tasks`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data: TaskListResponse = await res.json();
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        limit: pageSize.toString(),
+        offset: newOffset.toString(),
+      });
+      if (search) params.set("search", search);
+      const res = await fetch(`${API_BASE}/datasets/${datasetId}/tasks?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: TaskListResponse = await res.json();
+      if (newOffset === 0) {
         setTasks(data.tasks);
-        setTotalTasks(data.total_tasks);
-        setSource(data.source);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to fetch tasks");
-      } finally {
-        setLoading(false);
+      } else {
+        setTasks(prev => [...prev, ...data.tasks]);
       }
+      setTotalTasks(data.total_tasks);
+      setHasMore(data.has_more);
+      setSource(data.source);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch tasks");
+    } finally {
+      setLoading(false);
     }
-    fetchTasks();
-  }, [datasetId]);
+  }, [datasetId, pageSize]);
 
-  return { tasks, totalTasks, source, loading, error };
+  // Initial fetch
+  useEffect(() => {
+    if (datasetId) {
+      fetchTasks(0, "");
+    }
+  }, [datasetId, fetchTasks]);
+
+  // Debounced search
+  const updateSearch = useCallback((query: string) => {
+    setSearchQuery(query);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      fetchTasks(0, query);
+    }, 300);
+  }, [fetchTasks]);
+
+  const loadMore = useCallback(() => {
+    fetchTasks(tasks.length, searchQuery);
+  }, [fetchTasks, tasks.length, searchQuery]);
+
+  return { tasks, totalTasks, source, loading, error, hasMore, loadMore, searchQuery, updateSearch };
 }
 
 /**

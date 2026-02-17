@@ -42,7 +42,10 @@ export interface Task {
 export interface TaskListResponse {
   tasks: Task[];
   total_tasks: number;
-  source: "huggingface_api" | "episode_scan" | "config";
+  source: "huggingface_api" | "episode_scan" | "config" | "adapter" | "multi_subdataset" | "lerobot_metadata";
+  has_more: boolean;
+  offset: number;
+  limit: number;
 }
 
 export interface Episode {
@@ -172,4 +175,21 @@ export interface DatasetOverview {
 
   // Cache metadata
   cached_at?: string;
+}
+
+// === MULTI-SUBDATASET TYPES (Phase 4) ===
+export interface SubdatasetInfo {
+  name: string;
+  description?: string;
+  task_count?: number;
+  episode_count?: number;
+}
+
+// === PAGINATED EPISODES RESPONSE (Phase 5) ===
+export interface PaginatedEpisodesResponse {
+  episodes: EpisodeMetadata[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
 }

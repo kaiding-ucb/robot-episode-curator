@@ -209,7 +209,7 @@ def load_streaming_episode_data(repo_id: str, episode_id: str, max_frames: int =
 
     # Extract frames (up to max_frames from the beginning for now)
     # TODO: Implement proper even sampling across the episode
-    frames, _ = extractor.extract_frames_with_count(episode_id, 0, sample_count)
+    frames, _, _ = extractor.extract_frames_with_count(episode_id, 0, sample_count)
 
     if not frames:
         return np.array([]), None, total_frames
