@@ -258,6 +258,7 @@ class StreamingFrameExtractor:
         self.repo_id = repo_id
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cached_decoder_factories = None
 
     def get_cached_path(self, file_path: str) -> Path:
         """Get the local cache path for a file."""
@@ -1481,8 +1482,12 @@ class StreamingFrameExtractor:
         Import and return all available MCAP decoder factories.
 
         Returns list of decoder factory instances (Protobuf, ROS2, etc.).
+        Cached on first call to avoid repeated imports.
         Raises ImportError if no factories are available.
         """
+        if self._cached_decoder_factories is not None:
+            return self._cached_decoder_factories
+
         decoder_factories = []
         try:
             from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
@@ -1500,6 +1505,7 @@ class StreamingFrameExtractor:
                 "No MCAP decoder factories available. "
                 "Install mcap-ros2-support or mcap-protobuf-support."
             )
+        self._cached_decoder_factories = decoder_factories
         return decoder_factories
 
     def extract_signals_remote(
@@ -1574,7 +1580,7 @@ class StreamingFrameExtractor:
                     imu_count += count
                     signal_topics.append(ch.topic)
 
-            # Re-open for message iteration
+            # Re-open for message iteration (separate connection avoids seek issues)
             remote_file = self._open_hf_remote(episode_path)
             reader = make_reader(remote_file, decoder_factories=decoder_factories)
 
