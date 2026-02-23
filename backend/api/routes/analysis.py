@@ -17,8 +17,9 @@ import logging
 import math
 import os
 import urllib.parse
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -30,6 +31,64 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# --- Signal extraction cache ---
+# Caches extracted signal data to avoid re-downloading on repeat analyses.
+# Key: "repo_id:episode_path:resolution", Value: (result_dict, fetched_at)
+_SIGNAL_CACHE: Dict[str, Tuple[dict, datetime]] = {}
+_SIGNAL_CACHE_TTL_HOURS = 1
+_SIGNAL_DISK_CACHE_TTL_HOURS = 24
+_SIGNAL_CACHE_DIR = Path.home() / ".cache" / "data_viewer" / "signals"
+
+
+def _signal_disk_path(repo_id: str, episode_path: str, resolution: int) -> Path:
+    """Build disk cache path for a signal extraction result."""
+    safe_repo = repo_id.replace("/", "__")
+    safe_ep = episode_path.replace("/", "__").replace(".", "_")
+    return _SIGNAL_CACHE_DIR / safe_repo / f"{safe_ep}_{resolution}.json"
+
+
+def _get_cached_signal(repo_id: str, episode_path: str, resolution: int) -> Optional[dict]:
+    """Return cached signal result or None. Checks memory first, then disk."""
+    key = f"{repo_id}:{episode_path}:{resolution}"
+
+    # 1. Check in-memory cache (fast path)
+    if key in _SIGNAL_CACHE:
+        result, fetched_at = _SIGNAL_CACHE[key]
+        if datetime.utcnow() - fetched_at < timedelta(hours=_SIGNAL_CACHE_TTL_HOURS):
+            return result
+        del _SIGNAL_CACHE[key]
+
+    # 2. Check disk cache (cold start path)
+    disk_path = _signal_disk_path(repo_id, episode_path, resolution)
+    if disk_path.exists():
+        try:
+            mtime = datetime.fromtimestamp(disk_path.stat().st_mtime)
+            if datetime.utcnow() - mtime < timedelta(hours=_SIGNAL_DISK_CACHE_TTL_HOURS):
+                result = json.loads(disk_path.read_text())
+                _SIGNAL_CACHE[key] = (result, datetime.utcnow())
+                return result
+            else:
+                disk_path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Disk cache read failed for {disk_path}: {e}")
+
+    return None
+
+
+def _set_cached_signal(repo_id: str, episode_path: str, resolution: int, result: dict):
+    """Cache a signal extraction result in memory and on disk."""
+    key = f"{repo_id}:{episode_path}:{resolution}"
+    _SIGNAL_CACHE[key] = (result, datetime.utcnow())
+
+    # Write to disk cache
+    disk_path = _signal_disk_path(repo_id, episode_path, resolution)
+    try:
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_text(json.dumps(result))
+    except Exception as e:
+        logger.warning(f"Disk cache write failed for {disk_path}: {e}")
 
 
 # --- Models ---
@@ -1170,19 +1229,23 @@ async def get_signals_comparison(
 
                 logger.info(f"Using branch '{data_branch}' for data files of {repo_id}")
 
-                # List data parquet files - try tree API first, fall back to info.json template
+                # List data parquet files - prefer info.json template (instant), fall back to tree API
                 yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
                 data_files = []
-                try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
-                        data_files = await _collect_episode_files(client, repo_id, "data", headers, branch=data_branch)
-                except Exception as e:
-                    logger.info(f"Tree API failed for data/ directory ({e}), using info.json template")
 
-                # Fallback: construct paths from info.json data_path template
-                if not data_files and info and info.get("data_path"):
+                # Fast path: construct paths from info.json data_path template (no network call)
+                if info and info.get("data_path"):
                     data_files = _build_lerobot_data_file_list(info, target_ep_list)
+                    logger.info(f"Built {len(data_files)} data file paths from info.json template")
+
+                # Slow path fallback: tree API discovery (for datasets without data_path)
+                if not data_files:
+                    try:
+                        async with httpx.AsyncClient(timeout=60.0) as client:
+                            data_files = await _collect_episode_files(client, repo_id, "data", headers, branch=data_branch)
+                    except Exception as e:
+                        logger.info(f"Tree API failed for data/ directory ({e}), no data files found")
 
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     episodes = await _extract_lerobot_episodes(
@@ -1233,55 +1296,85 @@ async def get_signals_comparison(
                 logger.info(f"Signal analysis for {dataset_id}: format={fmt}, {len(raw_episodes)} files found")
 
                 if fmt == "mcap":
-                    # --- MCAP path (remote range-request extraction) ---
+                    # --- MCAP path (parallel remote range-request extraction) ---
                     episodes_to_analyze = raw_episodes[:max_episodes]
                     total = len(episodes_to_analyze)
 
                     yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': total, 'episode_id': 'extracting signals in parallel...'})}\n\n"
 
                     from loaders.streaming_extractor import StreamingFrameExtractor
+                    import concurrent.futures
+
                     extractor = StreamingFrameExtractor(repo_id)
                     loop = asyncio.get_event_loop()
 
-                    # Extract signals per episode via remote range requests
-                    # (no pre-download needed — reads only signal chunks ~1-3MB each)
-                    for idx, ep in enumerate(episodes_to_analyze):
-                        if await request.is_disconnected():
-                            break
+                    # Dedicated thread pool for parallel MCAP extraction.
+                    # Each extract_signals_remote() creates its own HfFileSystem
+                    # and MCAP reader, so parallel threads are safe.
+                    mcap_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(10, total),
+                        thread_name_prefix="mcap_signals",
+                    )
 
-                        episode_id = ep["episode_id"]
+                    async def _extract_one(idx, ep):
                         episode_path = ep["path"]
-
-                        yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': idx, 'total': total, 'episode_id': episode_id})}\n\n"
-
+                        # Check cache first
+                        cached = _get_cached_signal(repo_id, episode_path, resolution)
+                        if cached is not None:
+                            logger.info(f"Cache hit for {episode_path}")
+                            return (idx, ep["episode_id"], cached, None)
                         try:
                             signals = await loop.run_in_executor(
-                                None, extractor.extract_signals_remote, episode_path, resolution, resolution
+                                mcap_executor,
+                                extractor.extract_signals_remote,
+                                episode_path, resolution, resolution,
                             )
-                            actions_data = signals["actions"]
-                            imu_data = signals["imu"]
+                            _set_cached_signal(repo_id, episode_path, resolution, signals)
+                            return (idx, ep["episode_id"], signals, None)
+                        except Exception as e:
+                            logger.error(f"Failed to process episode {ep['episode_id']}: {e}")
+                            return (idx, ep["episode_id"], None, str(e))
 
+                    # Extract episodes in parallel, stream results as they complete
+                    tasks_map = {}
+                    for idx, ep in enumerate(episodes_to_analyze):
+                        task = asyncio.create_task(_extract_one(idx, ep))
+                        tasks_map[task] = idx
+
+                    completed = 0
+                    for coro in asyncio.as_completed(tasks_map.keys()):
+                        idx, episode_id, signals, error = await coro
+                        completed += 1
+
+                        if await request.is_disconnected():
+                            for t in tasks_map:
+                                t.cancel()
+                            break
+
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': completed, 'total': total, 'episode_id': episode_id})}\n\n"
+
+                        if error is None:
                             result = {
                                 "type": "episode_data",
                                 "episode_id": episode_id,
                                 "episode_index": idx,
-                                "actions": actions_data,
-                                "imu": imu_data,
+                                "actions": signals["actions"],
+                                "imu": signals["imu"],
                                 "signal_stride": signals.get("action_stride", 1),
                             }
-
-                        except Exception as e:
-                            logger.error(f"Failed to process episode {episode_id}: {e}")
+                        else:
                             result = {
                                 "type": "episode_data",
                                 "episode_id": episode_id,
                                 "episode_index": idx,
-                                "actions": {"error": str(e)},
-                                "imu": {"error": str(e)},
+                                "actions": {"error": error},
+                                "imu": {"error": error},
                             }
 
                         yield f"data: {json.dumps(result)}\n\n"
 
+                    mcap_executor.shutdown(wait=False)
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
                 else:
