@@ -226,6 +226,85 @@ def _get_source_note(fmt: str) -> str:
     return f"{base} A well-curated dataset should approximate a normal distribution."
 
 
+# --- Remote Video Metadata (MP4 moov atom) ---
+
+async def _read_remote_video_metadata(repo_id: str, file_path: str) -> dict:
+    """
+    Read exact frame count/fps from a remote video via its moov atom (~1-100KB).
+
+    Uses PyAV/FFmpeg HTTP range requests — typically 1-3 HTTP requests total.
+    Returns dict with frame_count, duration, fps (any may be None on failure).
+    """
+    try:
+        import av
+    except ImportError:
+        logger.warning("PyAV not installed; cannot read remote video metadata")
+        return {"frame_count": None, "duration": None, "fps": None}
+
+    token = _get_hf_token() or ""
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+    loop = asyncio.get_event_loop()
+
+    def _probe():
+        opts = {}
+        if token:
+            opts["headers"] = f"Authorization: Bearer {token}"
+        container = av.open(url, options=opts)
+        try:
+            stream = container.streams.video[0]
+            frame_count = stream.frames if stream.frames > 0 else None
+            duration = (
+                float(stream.duration * stream.time_base)
+                if stream.duration else None
+            )
+            fps = float(stream.average_rate) if stream.average_rate else None
+            # Fallback: derive frames from duration * fps
+            if frame_count is None and duration and fps:
+                frame_count = int(duration * fps)
+            return {
+                "frame_count": frame_count,
+                "duration": duration,
+                "fps": fps,
+            }
+        finally:
+            container.close()
+
+    return await loop.run_in_executor(None, _probe)
+
+
+async def _video_frame_counts_for_task(
+    repo_id: str,
+    episodes: List[Dict[str, Any]],
+    fmt: str,
+) -> Dict[str, int]:
+    """
+    Get exact frame counts for video episodes via remote metadata probing.
+
+    For direct MP4 files, probes moov atom for exact counts.
+    Falls back to file-size heuristic for TAR-wrapped or unsupported files.
+    """
+    results: Dict[str, int] = {}
+    for ep in episodes:
+        path = ep.get("path", "")
+        episode_id = ep.get("episode_id", "")
+        size_bytes = ep.get("size_bytes", 0)
+        ext = Path(path).suffix.lower()
+
+        # Only probe direct video files (not TAR-wrapped)
+        if ext in (".mp4", ".avi", ".mov", ".mkv"):
+            try:
+                meta = await _read_remote_video_metadata(repo_id, path)
+                if meta["frame_count"]:
+                    results[episode_id] = meta["frame_count"]
+                else:
+                    results[episode_id] = _estimate_frames(size_bytes, fmt)
+            except Exception:
+                results[episode_id] = _estimate_frames(size_bytes, fmt)
+        else:
+            results[episode_id] = _estimate_frames(size_bytes, fmt)
+    return results
+
+
 # --- LeRobot/Parquet Signal Extraction ---
 
 _SIGNAL_COLUMNS = [
@@ -307,9 +386,24 @@ async def _extract_lerobot_episodes(
     all_dfs = []
     relevant_episodes = set()
 
-    for pf in parquet_files:
-        try:
-            df = await _download_parquet(client, repo_id, pf["path"], headers, branch=branch)
+    # Concurrent downloads with semaphore to limit parallelism
+    sem = asyncio.Semaphore(4)
+
+    async def _download_one(pf):
+        async with sem:
+            try:
+                return await _download_parquet(client, repo_id, pf["path"], headers, branch=branch)
+            except Exception as e:
+                logger.warning(f"Failed to download {pf['path']}: {e}")
+                return None
+
+    BATCH_SIZE = 4
+    for batch_start in range(0, len(parquet_files), BATCH_SIZE):
+        batch = parquet_files[batch_start:batch_start + BATCH_SIZE]
+        results = await asyncio.gather(*[_download_one(pf) for pf in batch])
+        for df in results:
+            if df is None:
+                continue
             all_dfs.append(df)
 
             # Track unique episodes seen so far (only relevant ones)
@@ -321,13 +415,10 @@ async def _extract_lerobot_episodes(
                 else:
                     relevant_episodes.update(found)
 
-            # Stop downloading once we have enough relevant episodes
-            if len(relevant_episodes) >= max_episodes:
-                logger.info(f"Downloaded {len(all_dfs)} parquet files, found {len(relevant_episodes)} relevant episodes (need {max_episodes})")
-                break
-
-        except Exception as e:
-            logger.warning(f"Failed to download {pf['path']}: {e}")
+        # Stop downloading once we have enough relevant episodes
+        if len(relevant_episodes) >= max_episodes:
+            logger.info(f"Downloaded {len(all_dfs)} parquet files, found {len(relevant_episodes)} relevant episodes (need {max_episodes})")
+            break
 
     if not all_dfs:
         return []
@@ -632,9 +723,13 @@ async def _lerobot_frame_counts_for_task(
     )
     import re
 
-    episodes_df = await fetch_lerobot_episodes_meta(repo_id)
-    tasks_df = await fetch_lerobot_tasks_meta(repo_id)
-    info = await fetch_lerobot_info(repo_id)
+    # Fetch all metadata in parallel (saves ~1.5-3s vs sequential)
+    episodes_df, tasks_df, info, ep_task_map = await asyncio.gather(
+        fetch_lerobot_episodes_meta(repo_id),
+        fetch_lerobot_tasks_meta(repo_id),
+        fetch_lerobot_info(repo_id),
+        fetch_lerobot_episode_task_map(repo_id),
+    )
     if episodes_df is None or tasks_df is None:
         return None
 
@@ -663,8 +758,7 @@ async def _lerobot_frame_counts_for_task(
     if task_index is None:
         return None
 
-    # Get episodes for this task
-    ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+    # Get episodes for this task (ep_task_map already fetched above)
     if ep_task_map is None:
         return None
 
@@ -883,26 +977,48 @@ async def get_frame_count_distribution(
     # Detect format for appropriate heuristic
     fmt = _detect_format(dataset_info, raw_episodes)
 
-    # Estimate frame counts using format-specific heuristic
+    # For video formats, try exact frame counts via moov atom probing
+    source = "file_size_estimate"
+    video_exact_counts: Dict[str, int] = {}
+    if fmt in ("video", "webdataset"):
+        try:
+            video_exact_counts = await _video_frame_counts_for_task(
+                repo_id, raw_episodes, fmt
+            )
+        except Exception as e:
+            logger.warning(f"Video metadata probing failed for {dataset_id}: {e}")
+
+    # Build frame counts — use exact where available, heuristic otherwise
     episode_counts = []
+    has_exact = False
     for ep in raw_episodes:
         size = ep["size_bytes"]
-        estimated = _estimate_frames(size, fmt)
+        episode_id = ep["episode_id"]
+        if episode_id in video_exact_counts:
+            estimated = video_exact_counts[episode_id]
+            has_exact = True
+        else:
+            estimated = _estimate_frames(size, fmt)
         episode_counts.append(EpisodeFrameCount(
-            episode_id=ep["episode_id"],
+            episode_id=episode_id,
             estimated_frames=estimated,
             size_bytes=size,
             file_name=ep["file_name"],
         ))
 
+    if has_exact:
+        source = "metadata"
+
     stats = _compute_statistics(episode_counts)
     source_note = _get_source_note(fmt)
+    if has_exact:
+        source_note = "Frame counts from video metadata (moov atom). " + source_note.split(".")[-1]
 
     return FrameCountDistribution(
         task_name=task_name,
         episodes=episode_counts,
         total_episodes=len(episode_counts),
-        source="file_size_estimate",
+        source=source,
         source_note=source_note,
         **stats,
     )
@@ -914,6 +1030,7 @@ async def get_signals_comparison(
     dataset_id: str,
     task_name: str = Query(..., description="Task folder name"),
     max_episodes: int = Query(5, ge=1, le=20, description="Max episodes to analyze"),
+    resolution: int = Query(200, ge=50, le=2000, description="Max data points per episode signal"),
 ):
     """
     Stream actions and IMU data for multiple episodes via SSE.
@@ -976,9 +1093,15 @@ async def get_signals_comparison(
                 )
                 import re as _re
 
-                info = await fetch_lerobot_info(repo_id)
-                tasks_df = await fetch_lerobot_tasks_meta(repo_id)
-                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                # Fetch all metadata in parallel (saves ~2-4s vs sequential)
+                info, tasks_df, ep_task_map, episodes_meta_df, _data_branch = await asyncio.gather(
+                    fetch_lerobot_info(repo_id),
+                    fetch_lerobot_tasks_meta(repo_id),
+                    fetch_lerobot_episode_task_map(repo_id),
+                    fetch_lerobot_episodes_meta(repo_id),
+                    detect_lerobot_data_branch(repo_id),
+                )
+                data_branch = _data_branch or "main"
 
                 task_ep_indices = None
                 task_index = 0  # Default to task 0
@@ -1029,8 +1152,7 @@ async def get_signals_comparison(
                         total_eps = info.get("total_episodes", max_episodes)
                         task_ep_indices = set(range(min(total_eps, max_episodes)))
 
-                # Fetch episode metadata for true frame counts
-                episodes_meta_df = await fetch_lerobot_episodes_meta(repo_id)
+                # Use episode metadata (already fetched above) for true frame counts
                 ep_frame_counts: Dict[int, int] = {}
                 if episodes_meta_df is not None and "length" in episodes_meta_df.columns:
                     for _, row in episodes_meta_df.iterrows():
@@ -1046,8 +1168,6 @@ async def get_signals_comparison(
                 target_ep_set = set(target_ep_list)
                 logger.info(f"Signal analysis: target_ep_list={target_ep_list}")
 
-                # Detect which branch has data files (some datasets use v2.0, v2.1, etc.)
-                data_branch = await detect_lerobot_data_branch(repo_id) or "main"
                 logger.info(f"Using branch '{data_branch}' for data files of {repo_id}")
 
                 # List data parquet files - try tree API first, fall back to info.json template
@@ -1070,6 +1190,7 @@ async def get_signals_comparison(
                         max_episodes=max_episodes,
                         filter_episodes=target_ep_set,
                         branch=data_branch,
+                        max_frames_per_episode=resolution,
                     )
 
                 # Sort by global index, then re-index to task-local indices
@@ -1087,7 +1208,7 @@ async def get_signals_comparison(
                     if await request.is_disconnected():
                         break
 
-                    actions_data = _downsample_actions(ep["actions"], max_points=2000)
+                    actions_data = _downsample_actions(ep["actions"], max_points=resolution)
                     result = {
                         "type": "episode_data",
                         "episode_id": ep["episode_id"],
@@ -1112,7 +1233,7 @@ async def get_signals_comparison(
                 logger.info(f"Signal analysis for {dataset_id}: format={fmt}, {len(raw_episodes)} files found")
 
                 if fmt == "mcap":
-                    # --- MCAP path (original) ---
+                    # --- MCAP path (remote range-request extraction) ---
                     episodes_to_analyze = raw_episodes[:max_episodes]
                     total = len(episodes_to_analyze)
 
@@ -1120,7 +1241,10 @@ async def get_signals_comparison(
 
                     from loaders.streaming_extractor import StreamingFrameExtractor
                     extractor = StreamingFrameExtractor(repo_id)
+                    loop = asyncio.get_event_loop()
 
+                    # Extract signals per episode via remote range requests
+                    # (no pre-download needed — reads only signal chunks ~1-3MB each)
                     for idx, ep in enumerate(episodes_to_analyze):
                         if await request.is_disconnected():
                             break
@@ -1131,11 +1255,8 @@ async def get_signals_comparison(
                         yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': idx, 'total': total, 'episode_id': episode_id})}\n\n"
 
                         try:
-                            loop = asyncio.get_event_loop()
-
-                            # Single stride-aware pass for both actions and IMU
                             signals = await loop.run_in_executor(
-                                None, extractor.extract_signals_data, episode_path, 500, 500
+                                None, extractor.extract_signals_remote, episode_path, resolution, resolution
                             )
                             actions_data = signals["actions"]
                             imu_data = signals["imu"]

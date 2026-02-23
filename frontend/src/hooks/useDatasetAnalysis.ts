@@ -93,6 +93,7 @@ export function useFrameCounts() {
 
 /**
  * Stream signal comparison data via SSE.
+ * Uses RAF-batched state updates to reduce re-renders during streaming.
  */
 export function useSignalComparison() {
   const [state, setState] = useState<SignalAnalysisState>({
@@ -104,12 +105,48 @@ export function useSignalComparison() {
   });
   const eventSourceRef = useRef<EventSource | null>(null);
 
+  // Buffers for batching SSE events — accumulate without triggering renders
+  const episodesBufferRef = useRef<Map<string, EpisodeSignalData>>(new Map());
+  const progressRef = useRef<{ current: number; total: number; currentEpisode: string }>({ current: 0, total: 0, currentEpisode: "" });
+  const rafIdRef = useRef<number | null>(null);
+
+  // Flush buffered state to React in a single render
+  const flushBuffer = useCallback(() => {
+    rafIdRef.current = null;
+    setState((prev) => ({
+      ...prev,
+      episodes: new Map(episodesBufferRef.current),
+      progress: { ...progressRef.current },
+    }));
+  }, []);
+
+  // Schedule a RAF flush (coalesces multiple events into one render)
+  const scheduleFlush = useCallback(() => {
+    if (rafIdRef.current != null) {
+      cancelAnimationFrame(rafIdRef.current);
+    }
+    rafIdRef.current = requestAnimationFrame(flushBuffer);
+  }, [flushBuffer]);
+
+  // Cancel any pending RAF
+  const cancelRaf = useCallback(() => {
+    if (rafIdRef.current != null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+  }, []);
+
   const startAnalysis = useCallback(
     (datasetId: string, taskName: string, maxEpisodes: number = 5) => {
       // Close any existing connection
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
+      cancelRaf();
+
+      // Reset buffers
+      episodesBufferRef.current = new Map();
+      progressRef.current = { current: 0, total: 0, currentEpisode: "" };
 
       setState({
         episodes: new Map(),
@@ -119,7 +156,7 @@ export function useSignalComparison() {
         noSignalsReason: null,
       });
 
-      const url = `${API_BASE}/datasets/${datasetId}/analysis/signals?task_name=${encodeURIComponent(taskName)}&max_episodes=${maxEpisodes}`;
+      const url = `${API_BASE}/datasets/${datasetId}/analysis/signals?task_name=${encodeURIComponent(taskName)}&max_episodes=${maxEpisodes}&resolution=200`;
       const eventSource = new EventSource(url);
       eventSourceRef.current = eventSource;
 
@@ -128,19 +165,15 @@ export function useSignalComparison() {
           const data = JSON.parse(event.data);
 
           if (data.type === "total") {
-            setState((prev) => ({
-              ...prev,
-              progress: { ...prev.progress, total: data.total_episodes },
-            }));
+            progressRef.current = { ...progressRef.current, total: data.total_episodes };
+            scheduleFlush();
           } else if (data.type === "progress") {
-            setState((prev) => ({
-              ...prev,
-              progress: {
-                current: data.episode_index,
-                total: data.total,
-                currentEpisode: data.episode_id,
-              },
-            }));
+            progressRef.current = {
+              current: data.episode_index,
+              total: data.total,
+              currentEpisode: data.episode_id,
+            };
+            scheduleFlush();
           } else if (data.type === "episode_data") {
             const episodeData: EpisodeSignalData = {
               episode_id: data.episode_id,
@@ -150,22 +183,24 @@ export function useSignalComparison() {
               total_frames: data.total_frames ?? null,
               global_episode_index: data.global_episode_index ?? null,
             };
-            setState((prev) => {
-              const newEpisodes = new Map(prev.episodes);
-              newEpisodes.set(data.episode_id, episodeData);
-              return {
-                ...prev,
-                episodes: newEpisodes,
-                progress: {
-                  ...prev.progress,
-                  current: data.episode_index + 1,
-                },
-              };
-            });
+            episodesBufferRef.current.set(data.episode_id, episodeData);
+            progressRef.current = {
+              ...progressRef.current,
+              current: data.episode_index + 1,
+            };
+            scheduleFlush();
           } else if (data.type === "done") {
-            setState((prev) => ({ ...prev, phase: "complete" }));
+            cancelRaf();
+            // Synchronous flush — ensure all buffered data is committed
+            setState((prev) => ({
+              ...prev,
+              episodes: new Map(episodesBufferRef.current),
+              progress: { ...progressRef.current },
+              phase: "complete",
+            }));
             eventSource.close();
           } else if (data.type === "no_signals") {
+            cancelRaf();
             setState((prev) => ({
               ...prev,
               phase: "no_signals",
@@ -173,6 +208,7 @@ export function useSignalComparison() {
             }));
             eventSource.close();
           } else if (data.type === "error") {
+            cancelRaf();
             setState((prev) => ({
               ...prev,
               phase: "error",
@@ -186,10 +222,16 @@ export function useSignalComparison() {
       };
 
       eventSource.onerror = () => {
+        cancelRaf();
         setState((prev) => {
-          // If we already got data, treat as complete
-          if (prev.episodes.size > 0) {
-            return { ...prev, phase: "complete" };
+          // If we already got buffered data, flush and treat as complete
+          if (episodesBufferRef.current.size > 0) {
+            return {
+              ...prev,
+              episodes: new Map(episodesBufferRef.current),
+              progress: { ...progressRef.current },
+              phase: "complete",
+            };
           }
           // If no_signals was already set, keep it
           if (prev.phase === "no_signals") {
@@ -200,22 +242,26 @@ export function useSignalComparison() {
         eventSource.close();
       };
     },
-    []
+    [cancelRaf, scheduleFlush]
   );
 
   const cancelAnalysis = useCallback(() => {
+    cancelRaf();
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
     setState((prev) => ({ ...prev, phase: "idle" }));
-  }, []);
+  }, [cancelRaf]);
 
   const reset = useCallback(() => {
+    cancelRaf();
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    episodesBufferRef.current = new Map();
+    progressRef.current = { current: 0, total: 0, currentEpisode: "" };
     setState({
       episodes: new Map(),
       phase: "idle",
@@ -223,7 +269,7 @@ export function useSignalComparison() {
       error: null,
       noSignalsReason: null,
     });
-  }, []);
+  }, [cancelRaf]);
 
   return { state, startAnalysis, cancelAnalysis, reset };
 }

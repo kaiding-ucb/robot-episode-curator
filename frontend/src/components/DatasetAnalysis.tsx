@@ -133,6 +133,7 @@ export default function DatasetAnalysis({
             onChange={(e) => {
               setChosenDatasetId(e.target.value || null);
               setSelectedTask(null);
+              cancelAnalysis();
             }}
             className="px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
             data-testid="dataset-selector"

@@ -284,6 +284,26 @@ class StreamingFrameExtractor:
 
         return None
 
+    def _open_hf_remote(self, file_path: str):
+        """
+        Open a remote HF file as a seekable file-like object via HfFileSystem.
+
+        The returned object supports seek() and read(), making it compatible
+        with mcap's make_reader (which auto-selects SeekingReader for seekable
+        streams, enabling HTTP range requests for selective chunk reads).
+
+        Args:
+            file_path: Path within the repo (e.g. "task/episode/00001.mcap")
+
+        Returns:
+            A seekable file-like object backed by HTTP range requests.
+        """
+        from huggingface_hub import HfFileSystem
+
+        token = self._get_hf_token()
+        fs = HfFileSystem(token=token)
+        return fs.open(f"datasets/{self.repo_id}/{file_path}", "rb")
+
     def download_file(self, file_path: str, revision: Optional[str] = None) -> Path:
         """
         Download a file from HuggingFace if not already cached.
@@ -1044,6 +1064,7 @@ class StreamingFrameExtractor:
                 "actions": [],
                 "dimension_labels": None,
             }
+            detected_msg_type = None
 
             with open(local_path, "rb") as f:
                 reader = make_reader(f, decoder_factories=decoder_factories)
@@ -1060,17 +1081,24 @@ class StreamingFrameExtractor:
                         timestamp = message.log_time / 1e9
 
                         # Try to extract action data from decoded message
-                        action_vector = self._extract_action_vector(decoded_message)
+                        action_vector, msg_type = self._extract_action_vector(decoded_message)
 
                         if action_vector is not None:
                             actions_data["timestamps"].append(timestamp)
                             actions_data["actions"].append(action_vector)
+                            if detected_msg_type is None:
+                                detected_msg_type = msg_type
 
-            # Try to infer dimension labels
+            # Infer dimension labels based on detected message type
             if actions_data["actions"]:
                 num_dims = len(actions_data["actions"][0])
-                # Common robotics action labels
-                if num_dims == 7:
+                if detected_msg_type == "pose":
+                    # PoseInFrame / Pose: position + quaternion (no gripper)
+                    if num_dims == 7:
+                        actions_data["dimension_labels"] = ["x", "y", "z", "qx", "qy", "qz", "qw"]
+                    elif num_dims == 6:
+                        actions_data["dimension_labels"] = ["x", "y", "z", "qx", "qy", "qz"]
+                elif num_dims == 7:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
                 elif num_dims == 6:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
@@ -1087,11 +1115,15 @@ class StreamingFrameExtractor:
             logger.error(f"Failed to extract actions data: {e}")
             return {"error": str(e)}
 
-    def _extract_action_vector(self, decoded_message) -> Optional[List[float]]:
+    def _extract_action_vector(self, decoded_message) -> tuple:
         """
         Extract action vector from a decoded MCAP message.
 
         Handles various ROS and Foxglove message types that might contain action data.
+
+        Returns:
+            Tuple of (action_vector, msg_type) where msg_type is one of:
+            "array", "joint", "twist", "pose", or None if extraction fails.
         """
         # Try common message attribute patterns
 
@@ -1100,7 +1132,7 @@ class StreamingFrameExtractor:
             data = decoded_message.data
             if hasattr(data, '__iter__') and not isinstance(data, (str, bytes)):
                 try:
-                    return [float(x) for x in data]
+                    return [float(x) for x in data], "array"
                 except (TypeError, ValueError):
                     pass
 
@@ -1109,7 +1141,7 @@ class StreamingFrameExtractor:
             positions = decoded_message.position
             if hasattr(positions, '__iter__'):
                 try:
-                    return [float(x) for x in positions]
+                    return [float(x) for x in positions], "joint"
                 except (TypeError, ValueError):
                     pass
 
@@ -1125,7 +1157,7 @@ class StreamingFrameExtractor:
                     getattr(angular, 'x', 0.0),
                     getattr(angular, 'y', 0.0),
                     getattr(angular, 'z', 0.0),
-                ]
+                ], "twist"
             except (TypeError, ValueError):
                 pass
 
@@ -1144,7 +1176,7 @@ class StreamingFrameExtractor:
                         getattr(ori, 'y', 0.0),
                         getattr(ori, 'z', 0.0),
                         getattr(ori, 'w', 1.0),
-                    ]
+                    ], "pose"
             except (TypeError, ValueError):
                 pass
 
@@ -1161,11 +1193,11 @@ class StreamingFrameExtractor:
                     getattr(ori, 'y', 0.0),
                     getattr(ori, 'z', 0.0),
                     getattr(ori, 'w', 1.0),
-                ]
+                ], "pose"
             except (TypeError, ValueError):
                 pass
 
-        return None
+        return None, None
 
     def _extract_imu_sample(
         self, decoded_message, timestamp: float, imu_data: Dict[str, List]
@@ -1210,18 +1242,20 @@ class StreamingFrameExtractor:
 
         return False
 
-    def _count_signal_messages(self, local_path: Path) -> Tuple[int, int]:
+    def _count_signal_messages(self, local_path: Path) -> Tuple[int, int, list]:
         """
         Cheap counting pass over MCAP messages (no decode) to determine
         action and IMU message counts for stride calculation.
 
         Returns:
-            Tuple of (action_count, imu_count)
+            Tuple of (action_count, imu_count, signal_topics)
+            where signal_topics is the list of topic names matching action/IMU patterns.
         """
         from mcap.reader import make_reader
 
         action_count = 0
         imu_count = 0
+        signal_topics: set = set()
 
         with open(local_path, "rb") as f:
             reader = make_reader(f)
@@ -1231,10 +1265,68 @@ class StreamingFrameExtractor:
                     continue
                 if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
                     action_count += 1
+                    signal_topics.add(channel.topic)
                 elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
                     imu_count += 1
+                    signal_topics.add(channel.topic)
 
-        return action_count, imu_count
+        return action_count, imu_count, list(signal_topics)
+
+    def _get_signal_counts_from_summary(
+        self, stream
+    ) -> Optional[Tuple[int, int, List[str]]]:
+        """
+        Read action/IMU message counts from MCAP footer summary statistics.
+
+        Uses summary.statistics.channel_message_counts (keyed by channel_id)
+        and summary.channels for topic-name mapping. No message iteration.
+
+        Args:
+            stream: An open seekable file-like object (local file or HfFileSystem).
+                    Must support seek(). The stream is consumed by make_reader.
+
+        Returns:
+            (action_count, imu_count, signal_topics) or None if summary unavailable.
+        """
+        try:
+            from mcap.reader import make_reader
+
+            reader = make_reader(stream)
+            summary = reader.get_summary()
+            if summary is None:
+                return None
+
+            statistics = summary.statistics
+            channels = summary.channels  # {channel_id: Channel}
+
+            if statistics is None or channels is None:
+                return None
+
+            # channel_message_counts: {channel_id: count}
+            counts_by_id = statistics.channel_message_counts or {}
+
+            # Build topic → count mapping
+            action_count = 0
+            imu_count = 0
+            signal_topics: list = []
+
+            for ch_id, ch in channels.items():
+                topic_lower = ch.topic.lower()
+                count = counts_by_id.get(ch_id, 0)
+
+                if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
+                    continue
+                if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
+                    action_count += count
+                    signal_topics.append(ch.topic)
+                elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
+                    imu_count += count
+                    signal_topics.append(ch.topic)
+
+            return action_count, imu_count, signal_topics
+        except Exception as e:
+            logger.warning(f"Failed to read MCAP summary: {e}")
+            return None
 
     def extract_signals_data(
         self,
@@ -1276,36 +1368,26 @@ class StreamingFrameExtractor:
         try:
             from mcap.reader import make_reader
 
-            # Import all available decoder factories
-            decoder_factories = []
-            try:
-                from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
-                decoder_factories.append(Ros2DecoderFactory())
-            except ImportError:
-                pass
-            try:
-                from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
-                decoder_factories.append(ProtobufDecoderFactory())
-            except ImportError:
-                pass
+            decoder_factories = self._get_decoder_factories()
 
-            if not decoder_factories:
-                return {
-                    "actions": {"error": "No MCAP decoder factories available"},
-                    "imu": {"error": "No MCAP decoder factories available"},
-                    "action_stride": 1,
-                    "imu_stride": 1,
-                }
+            # Pass 1: count messages to compute strides + collect signal topic names
+            # Try summary-based counting first (reads only footer, no iteration)
+            summary_result = None
+            with open(local_path, "rb") as f:
+                summary_result = self._get_signal_counts_from_summary(f)
 
-            # Pass 1: count messages to compute strides
-            action_count, imu_count = self._count_signal_messages(local_path)
+            if summary_result is not None:
+                action_count, imu_count, signal_topics = summary_result
+            else:
+                action_count, imu_count, signal_topics = self._count_signal_messages(local_path)
 
             action_stride = max(1, math.ceil(action_count / max_actions)) if action_count > max_actions else 1
             imu_stride = max(1, math.ceil(imu_count / max_imu)) if imu_count > max_imu else 1
 
             logger.info(
                 f"Signal extraction: {action_count} action msgs (stride={action_stride}), "
-                f"{imu_count} IMU msgs (stride={imu_stride})"
+                f"{imu_count} IMU msgs (stride={imu_stride}), "
+                f"filtering to topics: {signal_topics}"
             )
 
             # Pass 2: single decoded loop with stride filtering
@@ -1330,21 +1412,22 @@ class StreamingFrameExtractor:
             with open(local_path, "rb") as f:
                 reader = make_reader(f, decoder_factories=decoder_factories)
 
-                for schema, channel, message, decoded_message in reader.iter_decoded_messages():
+                # Filter to only action/IMU topics — skips decoding video frames entirely
+                for schema, channel, message, decoded_message in reader.iter_decoded_messages(
+                    topics=signal_topics if signal_topics else None
+                ):
                     topic_lower = channel.topic.lower()
-
-                    # Skip camera/image topics
-                    if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
-                        continue
 
                     # Action topics
                     if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
                         if action_idx % action_stride == 0:
                             timestamp = message.log_time / 1e9
-                            action_vector = self._extract_action_vector(decoded_message)
-                            if action_vector is not None:
+                            action_result = self._extract_action_vector(decoded_message)
+                            if action_result is not None:
+                                # _extract_action_vector returns (values_list, type_str) tuple
+                                values, _msg_type = action_result
                                 actions_data["timestamps"].append(timestamp)
-                                actions_data["actions"].append(action_vector)
+                                actions_data["actions"].append(values)
                         action_idx += 1
 
                     # IMU topics
@@ -1392,6 +1475,189 @@ class StreamingFrameExtractor:
                 "action_stride": 1,
                 "imu_stride": 1,
             }
+
+    def _get_decoder_factories(self) -> list:
+        """
+        Import and return all available MCAP decoder factories.
+
+        Returns list of decoder factory instances (Protobuf, ROS2, etc.).
+        Raises ImportError if no factories are available.
+        """
+        decoder_factories = []
+        try:
+            from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+            decoder_factories.append(Ros2DecoderFactory())
+        except ImportError:
+            pass
+        try:
+            from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
+            decoder_factories.append(ProtobufDecoderFactory())
+        except ImportError:
+            pass
+
+        if not decoder_factories:
+            raise ImportError(
+                "No MCAP decoder factories available. "
+                "Install mcap-ros2-support or mcap-protobuf-support."
+            )
+        return decoder_factories
+
+    def extract_signals_remote(
+        self,
+        episode_path: str,
+        max_actions: int = 500,
+        max_imu: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Extract action and IMU signals from a remote MCAP file via HTTP range requests.
+
+        Uses HfFileSystem for seekable HTTP access. The mcap SeekingReader reads
+        only the footer (~8KB) to get summary statistics and then fetches only
+        signal-bearing chunks (~1-3MB), skipping all video data (~35-72MB).
+
+        Falls back to full download + extract_signals_data() on any failure.
+
+        Args:
+            episode_path: Path within the HuggingFace repo
+            max_actions: Target maximum number of action samples
+            max_imu: Target maximum number of IMU samples
+
+        Returns:
+            Same format as extract_signals_data():
+            {
+                "actions": {timestamps, actions, dimension_labels},
+                "imu": {timestamps, accel_x/y/z, gyro_x/y/z},
+                "action_stride": int,
+                "imu_stride": int,
+            }
+        """
+        import time
+
+        try:
+            from mcap.reader import make_reader
+
+            decoder_factories = self._get_decoder_factories()
+
+            t0 = time.time()
+
+            # Step 1: Read summary from footer (1-2 HTTP range requests, ~8KB)
+            remote_file = self._open_hf_remote(episode_path)
+            reader = make_reader(remote_file, decoder_factories=decoder_factories)
+            summary = reader.get_summary()
+            remote_file.close()
+
+            if summary is None:
+                logger.info(f"No MCAP summary for {episode_path}, falling back to full download")
+                return self.extract_signals_data(episode_path, max_actions, max_imu)
+
+            # Step 2: Extract counts and signal topics directly from summary
+            statistics = summary.statistics
+            channels = summary.channels
+            if statistics is None or channels is None:
+                logger.info(f"No statistics/channels in summary for {episode_path}, falling back")
+                return self.extract_signals_data(episode_path, max_actions, max_imu)
+
+            counts_by_id = statistics.channel_message_counts or {}
+            action_count = 0
+            imu_count = 0
+            signal_topics: list = []
+
+            for ch_id, ch in channels.items():
+                topic_lower = ch.topic.lower()
+                count = counts_by_id.get(ch_id, 0)
+                if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
+                    continue
+                if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
+                    action_count += count
+                    signal_topics.append(ch.topic)
+                elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
+                    imu_count += count
+                    signal_topics.append(ch.topic)
+
+            # Re-open for message iteration
+            remote_file = self._open_hf_remote(episode_path)
+            reader = make_reader(remote_file, decoder_factories=decoder_factories)
+
+            t_summary = time.time()
+            logger.info(
+                f"Remote summary for {episode_path}: "
+                f"{action_count} actions, {imu_count} IMU, "
+                f"topics={signal_topics} ({t_summary - t0:.1f}s)"
+            )
+
+            # Step 3: Compute strides
+            action_stride = max(1, math.ceil(action_count / max_actions)) if action_count > max_actions else 1
+            imu_stride = max(1, math.ceil(imu_count / max_imu)) if imu_count > max_imu else 1
+
+            # Step 4: Iterate decoded messages for signal topics only
+            actions_data = {
+                "timestamps": [],
+                "actions": [],
+                "dimension_labels": None,
+            }
+            imu_data = {
+                "timestamps": [],
+                "accel_x": [], "accel_y": [], "accel_z": [],
+                "gyro_x": [], "gyro_y": [], "gyro_z": [],
+            }
+
+            action_idx = 0
+            imu_idx = 0
+
+            for schema, channel, message, decoded_message in reader.iter_decoded_messages(
+                topics=signal_topics if signal_topics else None
+            ):
+                topic_lower = channel.topic.lower()
+
+                if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
+                    if action_idx % action_stride == 0:
+                        timestamp = message.log_time / 1e9
+                        action_result = self._extract_action_vector(decoded_message)
+                        if action_result is not None:
+                            values, _msg_type = action_result
+                            actions_data["timestamps"].append(timestamp)
+                            actions_data["actions"].append(values)
+                    action_idx += 1
+
+                elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
+                    if imu_idx % imu_stride == 0:
+                        timestamp = message.log_time / 1e9
+                        self._extract_imu_sample(decoded_message, timestamp, imu_data)
+                    imu_idx += 1
+
+            remote_file.close()
+
+            # Infer dimension labels
+            if actions_data["actions"]:
+                num_dims = len(actions_data["actions"][0])
+                if num_dims == 7:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+                elif num_dims == 6:
+                    actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
+                elif num_dims == 3:
+                    actions_data["dimension_labels"] = ["x", "y", "z"]
+
+            t_done = time.time()
+            logger.info(
+                f"Remote signal extraction complete for {episode_path}: "
+                f"{len(actions_data['timestamps'])} actions, "
+                f"{len(imu_data['timestamps'])} IMU samples "
+                f"({t_done - t0:.1f}s total, {t_summary - t0:.1f}s summary)"
+            )
+
+            return {
+                "actions": actions_data,
+                "imu": imu_data,
+                "action_stride": action_stride,
+                "imu_stride": imu_stride,
+            }
+
+        except Exception as e:
+            logger.warning(
+                f"Remote signal extraction failed for {episode_path}: {e}, "
+                f"falling back to full download"
+            )
+            return self.extract_signals_data(episode_path, max_actions, max_imu)
 
     def get_frame_count(self, episode_path: str) -> int:
         """
