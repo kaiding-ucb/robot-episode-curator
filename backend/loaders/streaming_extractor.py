@@ -12,6 +12,7 @@ import math
 import os
 import pickle
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
@@ -1425,10 +1426,10 @@ class StreamingFrameExtractor:
                             timestamp = message.log_time / 1e9
                             action_result = self._extract_action_vector(decoded_message)
                             if action_result is not None:
-                                # _extract_action_vector returns (values_list, type_str) tuple
                                 values, _msg_type = action_result
-                                actions_data["timestamps"].append(timestamp)
-                                actions_data["actions"].append(values)
+                                if values is not None:
+                                    actions_data["timestamps"].append(timestamp)
+                                    actions_data["actions"].append(values)
                         action_idx += 1
 
                     # IMU topics
@@ -1458,6 +1459,8 @@ class StreamingFrameExtractor:
                 "imu": imu_data,
                 "action_stride": action_stride,
                 "imu_stride": imu_stride,
+                "raw_action_count": action_count,
+                "raw_imu_count": imu_count,
             }
 
         except ImportError as e:
@@ -1513,6 +1516,7 @@ class StreamingFrameExtractor:
         episode_path: str,
         max_actions: int = 500,
         max_imu: int = 500,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """
         Extract action and IMU signals from a remote MCAP file via HTTP range requests.
@@ -1527,6 +1531,7 @@ class StreamingFrameExtractor:
             episode_path: Path within the HuggingFace repo
             max_actions: Target maximum number of action samples
             max_imu: Target maximum number of IMU samples
+            cancel_event: Optional threading.Event; when set, extraction aborts early.
 
         Returns:
             Same format as extract_signals_data():
@@ -1536,8 +1541,18 @@ class StreamingFrameExtractor:
                 "action_stride": int,
                 "imu_stride": int,
             }
+
+        Raises:
+            concurrent.futures.CancelledError: If cancel_event is set during extraction.
         """
+        import concurrent.futures
         import time
+
+        def _check_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise concurrent.futures.CancelledError(
+                    f"Extraction cancelled for {episode_path}"
+                )
 
         try:
             from mcap.reader import make_reader
@@ -1545,12 +1560,15 @@ class StreamingFrameExtractor:
             decoder_factories = self._get_decoder_factories()
 
             t0 = time.time()
+            _check_cancelled()
 
             # Step 1: Read summary from footer (1-2 HTTP range requests, ~8KB)
             remote_file = self._open_hf_remote(episode_path)
             reader = make_reader(remote_file, decoder_factories=decoder_factories)
             summary = reader.get_summary()
             remote_file.close()
+
+            _check_cancelled()
 
             if summary is None:
                 logger.info(f"No MCAP summary for {episode_path}, falling back to full download")
@@ -1609,10 +1627,16 @@ class StreamingFrameExtractor:
 
             action_idx = 0
             imu_idx = 0
+            msg_count = 0
 
             for schema, channel, message, decoded_message in reader.iter_decoded_messages(
                 topics=signal_topics if signal_topics else None
             ):
+                # Check cancellation every 100 messages to avoid overhead
+                msg_count += 1
+                if msg_count % 100 == 0:
+                    _check_cancelled()
+
                 topic_lower = channel.topic.lower()
 
                 if any(p in topic_lower for p in self._ACTION_TOPIC_PATTERNS):
@@ -1621,8 +1645,9 @@ class StreamingFrameExtractor:
                         action_result = self._extract_action_vector(decoded_message)
                         if action_result is not None:
                             values, _msg_type = action_result
-                            actions_data["timestamps"].append(timestamp)
-                            actions_data["actions"].append(values)
+                            if values is not None:
+                                actions_data["timestamps"].append(timestamp)
+                                actions_data["actions"].append(values)
                     action_idx += 1
 
                 elif any(p in topic_lower for p in self._IMU_TOPIC_PATTERNS):
@@ -1656,14 +1681,215 @@ class StreamingFrameExtractor:
                 "imu": imu_data,
                 "action_stride": action_stride,
                 "imu_stride": imu_stride,
+                "raw_action_count": action_count,
+                "raw_imu_count": imu_count,
             }
 
+        except concurrent.futures.CancelledError:
+            logger.info(f"Remote signal extraction cancelled for {episode_path}")
+            raise
         except Exception as e:
             logger.warning(
                 f"Remote signal extraction failed for {episode_path}: {e}, "
                 f"falling back to full download"
             )
+            _check_cancelled()  # Don't fall back if we're cancelled
             return self.extract_signals_data(episode_path, max_actions, max_imu)
+
+    def extract_first_frame_remote(
+        self,
+        episode_path: str,
+        thumb_width: int = 160,
+        thumb_height: int = 120,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Optional[str]:
+        """
+        Extract the first video frame from a remote MCAP file as a base64 JPEG thumbnail.
+
+        Uses HTTP range requests to read only the MCAP footer (~8KB) for metadata,
+        then fetches only the first video message (~1-2KB for JPEG, or ~50-100KB for
+        H.264 keyframe). This avoids downloading the entire 40-80MB file.
+
+        Args:
+            episode_path: Path within the HuggingFace repo
+            thumb_width: Thumbnail width in pixels
+            thumb_height: Thumbnail height in pixels
+            cancel_event: Optional threading.Event; when set, extraction aborts early.
+
+        Returns:
+            Base64-encoded JPEG string, or None on failure.
+        """
+        import base64
+        import concurrent.futures
+        import time
+
+        def _check_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise concurrent.futures.CancelledError(
+                    f"First frame extraction cancelled for {episode_path}"
+                )
+
+        try:
+            import cv2
+            from mcap.reader import make_reader
+
+            decoder_factories = self._get_decoder_factories()
+            t0 = time.time()
+            _check_cancelled()
+
+            # Step 1: Read summary to find video/image topics
+            remote_file = self._open_hf_remote(episode_path)
+            reader = make_reader(remote_file, decoder_factories=decoder_factories)
+            summary = reader.get_summary()
+            remote_file.close()
+
+            _check_cancelled()
+
+            if summary is None or summary.channels is None:
+                logger.warning(f"No MCAP summary for first frame: {episode_path}")
+                return None
+
+            # Video topics are the ones matching _SKIP_TOPIC_PATTERNS (camera/image/rgb/depth)
+            video_topics = []
+            for _ch_id, ch in summary.channels.items():
+                topic_lower = ch.topic.lower()
+                if any(p in topic_lower for p in self._SKIP_TOPIC_PATTERNS):
+                    # Prefer RGB/camera over depth
+                    if "depth" not in topic_lower:
+                        video_topics.insert(0, ch.topic)
+                    else:
+                        video_topics.append(ch.topic)
+
+            if not video_topics:
+                logger.warning(f"No video topics found in {episode_path}")
+                return None
+
+            target_topic = video_topics[0]
+
+            # Step 2: Re-open and iterate to find the first message on the video topic
+            _check_cancelled()
+            remote_file = self._open_hf_remote(episode_path)
+            reader = make_reader(remote_file, decoder_factories=decoder_factories)
+
+            frame_img = None
+            for _schema, channel, _message, decoded_message in reader.iter_decoded_messages(
+                topics=[target_topic]
+            ):
+                _check_cancelled()
+                # Try to extract image data from the decoded message
+                frame_img = self._decode_first_frame_message(decoded_message)
+                break  # Only need the first message
+
+            remote_file.close()
+
+            if frame_img is None:
+                logger.warning(f"Could not decode first frame from {episode_path}")
+                return None
+
+            # Step 3: Resize to thumbnail and encode as JPEG base64
+            thumb = cv2.resize(frame_img, (thumb_width, thumb_height), interpolation=cv2.INTER_AREA)
+            # Convert RGB to BGR for cv2 encoding
+            if len(thumb.shape) == 3 and thumb.shape[2] == 3:
+                thumb_bgr = cv2.cvtColor(thumb, cv2.COLOR_RGB2BGR)
+            else:
+                thumb_bgr = thumb
+            _, jpeg_buf = cv2.imencode(".jpg", thumb_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+
+            t_done = time.time()
+            logger.info(
+                f"First frame extracted from {episode_path} "
+                f"({thumb_width}x{thumb_height}, {len(b64)} bytes b64, {t_done - t0:.1f}s)"
+            )
+            return b64
+
+        except concurrent.futures.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"First frame extraction failed for {episode_path}: {e}")
+            return None
+
+    def _decode_first_frame_message(self, decoded_message) -> Optional[np.ndarray]:
+        """
+        Decode a single MCAP video/image message into an RGB numpy array.
+
+        Handles:
+        - ROS CompressedImage (JPEG/PNG data field)
+        - ROS Image (raw pixel data)
+        - Protobuf messages with image data fields
+        - Raw H.264 NAL units
+        """
+        try:
+            import cv2
+
+            # Try CompressedImage-style (has .data and .format)
+            raw_data = None
+            if hasattr(decoded_message, "data"):
+                raw_data = bytes(decoded_message.data)
+            elif isinstance(decoded_message, dict) and "data" in decoded_message:
+                raw_data = bytes(decoded_message["data"])
+
+            if raw_data is None or len(raw_data) == 0:
+                return None
+
+            # Check if it's JPEG or PNG by magic bytes
+            is_jpeg = raw_data[:2] == b"\xff\xd8"
+            is_png = raw_data[:4] == b"\x89PNG"
+
+            if is_jpeg or is_png:
+                arr = np.frombuffer(raw_data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            # Try H.264 decode (NAL unit)
+            if raw_data[:4] == b"\x00\x00\x00\x01" or raw_data[:3] == b"\x00\x00\x01":
+                return self._decode_single_h264_nal(raw_data)
+
+            # Try raw Image (has width/height/encoding fields)
+            width = getattr(decoded_message, "width", None)
+            height = getattr(decoded_message, "height", None)
+            encoding = getattr(decoded_message, "encoding", "")
+
+            if width and height and width > 0 and height > 0:
+                if encoding in ("rgb8", "8UC3"):
+                    img = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width, 3)
+                    return img.copy()
+                elif encoding in ("bgr8",):
+                    img = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width, 3)
+                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                elif encoding in ("mono8", "8UC1"):
+                    img = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width)
+                    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to decode frame message: {e}")
+            return None
+
+    def _decode_single_h264_nal(self, nal_data: bytes) -> Optional[np.ndarray]:
+        """Decode a single H.264 NAL unit to an RGB frame using PyAV."""
+        try:
+            import av
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".h264", delete=False) as tmp:
+                tmp_path = tmp.name
+                tmp.write(nal_data)
+
+            try:
+                container = av.open(tmp_path)
+                for frame in container.decode(container.streams.video[0]):
+                    img = frame.to_ndarray(format="rgb24")
+                    container.close()
+                    return img
+                container.close()
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        except Exception as e:
+            logger.warning(f"H.264 single-NAL decode failed: {e}")
+        return None
 
     def get_frame_count(self, episode_path: str) -> int:
         """

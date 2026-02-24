@@ -369,6 +369,8 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSigna
 
   const hasError = episodeData.actions?.error || episodeData.imu?.error;
   const frameCount = episodeData.total_frames ?? episodeData.actions?.actions?.length ?? 0;
+  const stride = episodeData.signal_stride ?? 1;
+  const rawCount = episodeData.raw_action_count;
 
   return (
     <div className="flex items-stretch gap-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-b-0">
@@ -377,7 +379,9 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSigna
           {getEpisodeLabel(episodeId)}
         </span>
         <span className="text-[10px] text-gray-400">
-          {frameCount > 0 ? `${frameCount} frames` : ""}
+          {rawCount && stride > 1
+            ? `${frameCount}/${rawCount} (stride ${stride})`
+            : frameCount > 0 ? `${frameCount} frames` : ""}
         </span>
         {hasError && (
           <span className="text-[10px] text-red-400">Error</span>
@@ -656,13 +660,26 @@ function useFirstFrames(
       prevDatasetRef.current = datasetId;
     }
 
+    // Ingest any SSE-provided first_frame data (MCAP episodes)
+    let hasNewSseFrames = false;
+    for (const [id, epData] of episodeList) {
+      if (epData.first_frame && !accumulatedRef.current.has(id)) {
+        accumulatedRef.current.set(id, epData.first_frame);
+        hasNewSseFrames = true;
+      }
+    }
+    if (hasNewSseFrames) {
+      setFrameData(new Map(accumulatedRef.current));
+    }
+
     // Abort only the previous fetch sequence, not already-completed results
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
 
-    // Find episodes that need fetching (not already loaded or in-flight)
-    const toFetch = episodeList.filter(([id]) =>
+    // Find episodes that need fetching via API (no SSE frame, not already loaded)
+    const toFetch = episodeList.filter(([id, epData]) =>
+      !epData.first_frame &&
       !accumulatedRef.current.has(id) &&
       !errorsRef.current.has(id) &&
       !fetchingRef.current.has(id)
@@ -732,7 +749,7 @@ function StartingPositionGrid({
             >
               {frame ? (
                 <img
-                  src={`data:image/webp;base64,${frame}`}
+                  src={`data:image/${frame.startsWith("/9j/") ? "jpeg" : "webp"};base64,${frame}`}
                   alt={getEpisodeLabel(id)}
                   className="w-full h-full object-cover"
                 />

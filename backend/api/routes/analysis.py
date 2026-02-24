@@ -11,11 +11,13 @@ Supports multiple formats:
 - LeRobot/Parquet (Libero, etc.): Downloads tiny Parquet files for actions (no IMU)
 """
 import asyncio
+import concurrent.futures
 import io
 import json
 import logging
 import math
 import os
+import threading
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -89,6 +91,43 @@ def _set_cached_signal(repo_id: str, episode_path: str, resolution: int, result:
         disk_path.write_text(json.dumps(result))
     except Exception as e:
         logger.warning(f"Disk cache write failed for {disk_path}: {e}")
+
+
+# --- First-frame thumbnail cache ---
+# Caches base64 JPEG thumbnails extracted from MCAP video topics.
+_FIRST_FRAME_CACHE_DIR = Path.home() / ".cache" / "data_viewer" / "first_frames"
+
+
+def _first_frame_disk_path(repo_id: str, episode_path: str) -> Path:
+    """Build disk cache path for a first-frame thumbnail."""
+    safe_repo = repo_id.replace("/", "__")
+    safe_ep = episode_path.replace("/", "__").replace(".", "_")
+    return _FIRST_FRAME_CACHE_DIR / safe_repo / f"{safe_ep}.txt"
+
+
+def _get_cached_first_frame(repo_id: str, episode_path: str) -> Optional[str]:
+    """Return cached first-frame base64 string or None."""
+    disk_path = _first_frame_disk_path(repo_id, episode_path)
+    if disk_path.exists():
+        try:
+            mtime = datetime.fromtimestamp(disk_path.stat().st_mtime)
+            if datetime.utcnow() - mtime < timedelta(hours=_SIGNAL_DISK_CACHE_TTL_HOURS):
+                return disk_path.read_text()
+            else:
+                disk_path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"First-frame cache read failed for {disk_path}: {e}")
+    return None
+
+
+def _set_cached_first_frame(repo_id: str, episode_path: str, base64_str: str):
+    """Cache a first-frame base64 string to disk."""
+    disk_path = _first_frame_disk_path(repo_id, episode_path)
+    try:
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_text(base64_str)
+    except Exception as e:
+        logger.warning(f"First-frame cache write failed for {disk_path}: {e}")
 
 
 # --- Models ---
@@ -369,6 +408,7 @@ async def _video_frame_counts_for_task(
 _SIGNAL_COLUMNS = [
     "action", "observation.state", "end_pose", "start_pos", "gripper_width",
     "episode_index", "frame_index", "timestamp", "index", "episode_id",
+    "task_index",
 ]
 
 
@@ -425,6 +465,7 @@ async def _extract_lerobot_episodes(
     headers: Dict[str, str],
     max_episodes: int,
     filter_episodes: Optional[set] = None,
+    filter_task_index: Optional[int] = None,
     branch: str = "main",
     max_frames_per_episode: int = 500,
 ) -> List[Dict[str, Any]]:
@@ -437,6 +478,10 @@ async def _extract_lerobot_episodes(
 
     If filter_episodes is provided, only episodes with indices in that set
     are counted toward max_episodes and included in the result.
+
+    If filter_task_index is provided (and filter_episodes is None), rows are
+    filtered by their task_index column. This is the fallback when the
+    episode-to-task mapping is unavailable from the HF datasets server.
 
     Auto-stride: episodes with more than max_frames_per_episode rows are
     subsampled using stride = ceil(num_rows / max_frames_per_episode).
@@ -468,11 +513,16 @@ async def _extract_lerobot_episodes(
             # Track unique episodes seen so far (only relevant ones)
             ep_col = "episode_index" if "episode_index" in df.columns else "episode_id"
             if ep_col in df.columns:
-                found = set(int(x) for x in df[ep_col].unique())
-                if filter_episodes is not None:
-                    relevant_episodes.update(found & filter_episodes)
+                # When filtering by task_index, narrow to matching rows first
+                if filter_task_index is not None and filter_episodes is None and "task_index" in df.columns:
+                    task_rows = df[df["task_index"] == filter_task_index]
+                    found = set(int(x) for x in task_rows[ep_col].unique())
+                elif filter_episodes is not None:
+                    found = set(int(x) for x in df[ep_col].unique())
+                    found = found & filter_episodes
                 else:
-                    relevant_episodes.update(found)
+                    found = set(int(x) for x in df[ep_col].unique())
+                relevant_episodes.update(found)
 
         # Stop downloading once we have enough relevant episodes
         if len(relevant_episodes) >= max_episodes:
@@ -512,6 +562,12 @@ async def _extract_lerobot_episodes(
         # Skip episodes not in filter set
         if filter_episodes is not None and ep_idx_int not in filter_episodes:
             continue
+
+        # Skip episodes not matching the target task_index
+        if filter_task_index is not None and filter_episodes is None:
+            if "task_index" in group.columns:
+                if int(group["task_index"].iloc[0]) != filter_task_index:
+                    continue
 
         episode_id = f"episode_{ep_idx_int}"
 
@@ -600,13 +656,23 @@ def _build_lerobot_data_file_list(
     """
     Build data file list from info.json data_path template.
 
-    For LeRobot v2.1 datasets where the tree API doesn't list data/ files,
-    we construct the paths directly using the template from info.json.
+    Only works for datasets where each episode maps to a unique file
+    (i.e. data_path contains ``{episode_index}``).  LeRobot v3 datasets
+    that pack multiple episodes per file use ``{file_index}`` instead —
+    for those we return an empty list so the caller falls through to
+    tree-API discovery.
+
     When path_prefix is set, prepends the subdataset prefix to all paths.
     """
     data_path_template = info.get("data_path", "")
     chunks_size = info.get("chunks_size", 1000)
     if not data_path_template:
+        return []
+
+    # v3 datasets use {file_index} where multiple episodes share one file.
+    # We cannot predict the episode→file mapping, so bail out and let the
+    # caller use the tree API to discover actual files.
+    if "{episode_index}" not in data_path_template:
         return []
 
     files = []
@@ -1203,13 +1269,26 @@ async def get_signals_comparison(
                         if t_idx == task_index
                     )
                 else:
-                    # No task metadata at all - use first N episodes
+                    # ep_task_map unavailable (HF datasets server not indexed yet).
+                    # Resolve task_index from tasks_df if available; the data
+                    # parquet files contain a task_index column so we can
+                    # filter at download time via filter_task_index.
+                    if tasks_df is not None:
+                        task_col_fb = "task_description"
+                        if task_col_fb not in tasks_df.columns:
+                            for col in tasks_df.columns:
+                                if col != "task_index":
+                                    task_col_fb = col
+                                    break
+                        if task_col_fb in tasks_df.columns:
+                            match_fb = tasks_df[tasks_df[task_col_fb] == task_name]
+                            if len(match_fb) > 0:
+                                task_index = int(match_fb.iloc[0]["task_index"])
                     untitled_match = _re.match(r"^Untitled \(task (\d+)\)$", task_name)
                     if untitled_match:
                         task_index = int(untitled_match.group(1))
-                    if info and task_index == 0:
-                        total_eps = info.get("total_episodes", max_episodes)
-                        task_ep_indices = set(range(min(total_eps, max_episodes)))
+                    # task_ep_indices stays None — filtering will be done
+                    # inside _extract_lerobot_episodes via filter_task_index
 
                 # Use episode metadata (already fetched above) for true frame counts
                 ep_frame_counts: Dict[int, int] = {}
@@ -1218,13 +1297,16 @@ async def get_signals_comparison(
                         ep_frame_counts[int(row["episode_index"])] = int(row["length"])
 
                 # Determine which episodes to fetch: sorted by global index, capped
-                logger.info(f"Signal analysis: task_index={task_index}, task_ep_indices={task_ep_indices if task_ep_indices and len(task_ep_indices) < 20 else f'{len(task_ep_indices)} episodes' if task_ep_indices else 'None'}")
+                # When task_ep_indices is empty/None, we rely on filter_task_index
+                # inside _extract_lerobot_episodes to filter at download time.
+                use_task_index_filter = not task_ep_indices  # None or empty set
+                logger.info(f"Signal analysis: task_index={task_index}, task_ep_indices={task_ep_indices if task_ep_indices and len(task_ep_indices) < 20 else f'{len(task_ep_indices)} episodes' if task_ep_indices else 'None/empty'}, use_task_index_filter={use_task_index_filter}")
                 if task_ep_indices:
                     target_ep_list = sorted(task_ep_indices)[:max_episodes]
+                    target_ep_set: Optional[set] = set(target_ep_list)
                 else:
-                    total_eps = (info or {}).get("total_episodes", max_episodes)
-                    target_ep_list = list(range(min(total_eps, max_episodes)))
-                target_ep_set = set(target_ep_list)
+                    target_ep_list = []
+                    target_ep_set = None  # Will filter by task_index instead
                 logger.info(f"Signal analysis: target_ep_list={target_ep_list}")
 
                 logger.info(f"Using branch '{data_branch}' for data files of {repo_id}")
@@ -1235,11 +1317,12 @@ async def get_signals_comparison(
                 data_files = []
 
                 # Fast path: construct paths from info.json data_path template (no network call)
-                if info and info.get("data_path"):
+                # Only works when we have specific episode indices AND the template uses {episode_index}
+                if target_ep_list and info and info.get("data_path"):
                     data_files = _build_lerobot_data_file_list(info, target_ep_list)
                     logger.info(f"Built {len(data_files)} data file paths from info.json template")
 
-                # Slow path fallback: tree API discovery (for datasets without data_path)
+                # Slow path fallback: tree API discovery (for datasets without data_path or v3 multi-episode files)
                 if not data_files:
                     try:
                         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1252,6 +1335,7 @@ async def get_signals_comparison(
                         client, repo_id, data_files, headers,
                         max_episodes=max_episodes,
                         filter_episodes=target_ep_set,
+                        filter_task_index=task_index if use_task_index_filter else None,
                         branch=data_branch,
                         max_frames_per_episode=resolution,
                     )
@@ -1304,78 +1388,147 @@ async def get_signals_comparison(
                     yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': total, 'episode_id': 'extracting signals in parallel...'})}\n\n"
 
                     from loaders.streaming_extractor import StreamingFrameExtractor
-                    import concurrent.futures
 
                     extractor = StreamingFrameExtractor(repo_id)
                     loop = asyncio.get_event_loop()
 
-                    # Dedicated thread pool for parallel MCAP extraction.
-                    # Each extract_signals_remote() creates its own HfFileSystem
-                    # and MCAP reader, so parallel threads are safe.
+                    # Shared cancellation token — when set, all worker threads
+                    # abort their HTTP range requests and exit promptly.
+                    cancel_event = threading.Event()
+
+                    # Limit parallel workers to avoid saturating the HF API
+                    # with concurrent HTTP range requests (causes cascading
+                    # timeouts at 10 workers). 3 workers keeps throughput high
+                    # while avoiding network saturation.
                     mcap_executor = concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(10, total),
+                        max_workers=min(3, total),
                         thread_name_prefix="mcap_signals",
                     )
 
+                    # Per-episode timeout (seconds). MCAP files are 40-80MB;
+                    # with selective range requests this should finish in <90s.
+                    EPISODE_TIMEOUT = 120
+
+                    def _extract_first_frame_sync(episode_path):
+                        """Extract first frame, checking disk cache first."""
+                        cached_frame = _get_cached_first_frame(repo_id, episode_path)
+                        if cached_frame is not None:
+                            return cached_frame
+                        try:
+                            frame_b64 = extractor.extract_first_frame_remote(
+                                episode_path, cancel_event=cancel_event,
+                            )
+                            if frame_b64:
+                                _set_cached_first_frame(repo_id, episode_path, frame_b64)
+                            return frame_b64
+                        except Exception as e:
+                            logger.warning(f"First frame extraction failed for {episode_path}: {e}")
+                            return None
+
                     async def _extract_one(idx, ep):
                         episode_path = ep["path"]
-                        # Check cache first
+                        first_frame = None
+                        # Check signal cache first
                         cached = _get_cached_signal(repo_id, episode_path, resolution)
                         if cached is not None:
                             logger.info(f"Cache hit for {episode_path}")
-                            return (idx, ep["episode_id"], cached, None)
+                            first_frame = await loop.run_in_executor(
+                                mcap_executor, _extract_first_frame_sync, episode_path,
+                            )
+                            return (idx, ep["episode_id"], cached, None, first_frame)
                         try:
-                            signals = await loop.run_in_executor(
-                                mcap_executor,
-                                extractor.extract_signals_remote,
-                                episode_path, resolution, resolution,
+                            signals = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    mcap_executor,
+                                    extractor.extract_signals_remote,
+                                    episode_path, resolution, resolution,
+                                    cancel_event,
+                                ),
+                                timeout=EPISODE_TIMEOUT,
                             )
                             _set_cached_signal(repo_id, episode_path, resolution, signals)
-                            return (idx, ep["episode_id"], signals, None)
+                            # Extract first frame after signals (reuses cached HF auth)
+                            first_frame = await loop.run_in_executor(
+                                mcap_executor, _extract_first_frame_sync, episode_path,
+                            )
+                            return (idx, ep["episode_id"], signals, None, first_frame)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Episode {ep['episode_id']} timed out after {EPISODE_TIMEOUT}s")
+                            return (idx, ep["episode_id"], None, f"Timed out after {EPISODE_TIMEOUT}s", None)
+                        except concurrent.futures.CancelledError:
+                            logger.info(f"Episode {ep['episode_id']} cancelled")
+                            return (idx, ep["episode_id"], None, "Cancelled", None)
                         except Exception as e:
                             logger.error(f"Failed to process episode {ep['episode_id']}: {e}")
-                            return (idx, ep["episode_id"], None, str(e))
+                            return (idx, ep["episode_id"], None, str(e), None)
 
-                    # Extract episodes in parallel, stream results as they complete
-                    tasks_map = {}
+                    # Extract episodes in parallel, stream results as they complete.
+                    # Use asyncio.wait with a short timeout instead of as_completed
+                    # so we can check for client disconnect even while workers are busy.
+                    pending = set()
                     for idx, ep in enumerate(episodes_to_analyze):
                         task = asyncio.create_task(_extract_one(idx, ep))
-                        tasks_map[task] = idx
+                        pending.add(task)
 
                     completed = 0
-                    for coro in asyncio.as_completed(tasks_map.keys()):
-                        idx, episode_id, signals, error = await coro
-                        completed += 1
+                    cancelled = False
 
+                    while pending:
+                        # Check disconnect before waiting
                         if await request.is_disconnected():
-                            for t in tasks_map:
+                            logger.info("SSE client disconnected, cancelling MCAP extraction")
+                            cancel_event.set()
+                            for t in pending:
                                 t.cancel()
+                            cancelled = True
                             break
 
-                        yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': completed, 'total': total, 'episode_id': episode_id})}\n\n"
+                        # Wait up to 2s for any task to complete
+                        done, pending = await asyncio.wait(
+                            pending, timeout=2.0, return_when=asyncio.FIRST_COMPLETED
+                        )
 
-                        if error is None:
-                            result = {
-                                "type": "episode_data",
-                                "episode_id": episode_id,
-                                "episode_index": idx,
-                                "actions": signals["actions"],
-                                "imu": signals["imu"],
-                                "signal_stride": signals.get("action_stride", 1),
-                            }
-                        else:
-                            result = {
-                                "type": "episode_data",
-                                "episode_id": episode_id,
-                                "episode_index": idx,
-                                "actions": {"error": error},
-                                "imu": {"error": error},
-                            }
+                        for task in done:
+                            try:
+                                idx, episode_id, signals, error, first_frame = task.result()
+                            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                                continue
+                            except Exception as exc:
+                                logger.error(f"Unexpected task error: {exc}")
+                                continue
 
-                        yield f"data: {json.dumps(result)}\n\n"
+                            completed += 1
 
-                    mcap_executor.shutdown(wait=False)
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': completed, 'total': total, 'episode_id': episode_id})}\n\n"
+
+                            if error is None and signals is not None:
+                                result = {
+                                    "type": "episode_data",
+                                    "episode_id": episode_id,
+                                    "episode_index": idx,
+                                    "actions": signals["actions"],
+                                    "imu": signals["imu"],
+                                    "signal_stride": signals.get("action_stride", 1),
+                                    "raw_action_count": signals.get("raw_action_count"),
+                                    "first_frame": first_frame,
+                                }
+                            else:
+                                result = {
+                                    "type": "episode_data",
+                                    "episode_id": episode_id,
+                                    "episode_index": idx,
+                                    "actions": {"error": error or "Unknown error"},
+                                    "imu": {"error": error or "Unknown error"},
+                                    "first_frame": first_frame,
+                                }
+
+                            yield f"data: {json.dumps(result)}\n\n"
+
+                    # Signal cancellation and clean up the thread pool
+                    cancel_event.set()
+                    mcap_executor.shutdown(wait=False, cancel_futures=True)
+                    if not cancelled:
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
                 else:
                     yield f"data: {json.dumps({'type': 'no_signals', 'reason': f'Signal comparison is not supported for {fmt} format'})}\n\n"

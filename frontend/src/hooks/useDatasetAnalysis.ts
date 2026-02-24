@@ -182,6 +182,9 @@ export function useSignalComparison() {
               imu: data.imu,
               total_frames: data.total_frames ?? null,
               global_episode_index: data.global_episode_index ?? null,
+              signal_stride: data.signal_stride,
+              raw_action_count: data.raw_action_count ?? null,
+              first_frame: data.first_frame ?? null,
             };
             episodesBufferRef.current.set(data.episode_id, episodeData);
             progressRef.current = {
