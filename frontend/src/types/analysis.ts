@@ -53,12 +53,19 @@ export interface EpisodeSignalData {
   first_frame?: string | null;
 }
 
+export interface EpisodeStub {
+  episode_id: string;
+  episode_index: number;
+}
+
 export interface SignalAnalysisState {
   episodes: Map<string, EpisodeSignalData>;
   phase: "idle" | "processing" | "complete" | "error" | "no_signals";
   progress: { current: number; total: number; currentEpisode: string };
   error: string | null;
   noSignalsReason: string | null;
+  firstFrames: Map<string, string>;
+  knownEpisodes: EpisodeStub[];
 }
 
 export interface DatasetCapabilities {

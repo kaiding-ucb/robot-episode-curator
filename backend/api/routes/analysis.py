@@ -1385,6 +1385,14 @@ async def get_signals_comparison(
                     total = len(episodes_to_analyze)
 
                     yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
+
+                    # Emit episode_list so the frontend can show placeholder grid cells immediately
+                    episode_stubs = [
+                        {"episode_id": ep["episode_id"], "episode_index": idx}
+                        for idx, ep in enumerate(episodes_to_analyze)
+                    ]
+                    yield f"data: {json.dumps({'type': 'episode_list', 'episodes': episode_stubs})}\n\n"
+
                     yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': total, 'episode_id': 'extracting signals in parallel...'})}\n\n"
 
                     from loaders.streaming_extractor import StreamingFrameExtractor
@@ -1398,11 +1406,15 @@ async def get_signals_comparison(
 
                     # Limit parallel workers to avoid saturating the HF API
                     # with concurrent HTTP range requests (causes cascading
-                    # timeouts at 10 workers). 3 workers keeps throughput high
-                    # while avoiding network saturation.
+                    # timeouts at 10 workers). 3 signal + 2 frame = 5 total
+                    # workers keeps throughput high while avoiding saturation.
                     mcap_executor = concurrent.futures.ThreadPoolExecutor(
                         max_workers=min(3, total),
                         thread_name_prefix="mcap_signals",
+                    )
+                    frame_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(2, total),
+                        thread_name_prefix="mcap_frames",
                     )
 
                     # Per-episode timeout (seconds). MCAP files are 40-80MB;
@@ -1425,17 +1437,31 @@ async def get_signals_comparison(
                             logger.warning(f"First frame extraction failed for {episode_path}: {e}")
                             return None
 
+                    async def _extract_frame_only(idx, ep):
+                        """Lightweight frame extraction — runs on frame_executor."""
+                        episode_path = ep["path"]
+                        try:
+                            frame_b64 = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    frame_executor, _extract_first_frame_sync, episode_path,
+                                ),
+                                timeout=EPISODE_TIMEOUT,
+                            )
+                            return ("frame", idx, ep["episode_id"], frame_b64)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Frame extraction timed out for {ep['episode_id']} after {EPISODE_TIMEOUT}s")
+                            return ("frame", idx, ep["episode_id"], None)
+                        except Exception as e:
+                            logger.warning(f"Frame-only extraction failed for {ep['episode_id']}: {e}")
+                            return ("frame", idx, ep["episode_id"], None)
+
                     async def _extract_one(idx, ep):
                         episode_path = ep["path"]
-                        first_frame = None
                         # Check signal cache first
                         cached = _get_cached_signal(repo_id, episode_path, resolution)
                         if cached is not None:
                             logger.info(f"Cache hit for {episode_path}")
-                            first_frame = await loop.run_in_executor(
-                                mcap_executor, _extract_first_frame_sync, episode_path,
-                            )
-                            return (idx, ep["episode_id"], cached, None, first_frame)
+                            return ("signal", idx, ep["episode_id"], cached, None)
                         try:
                             signals = await asyncio.wait_for(
                                 loop.run_in_executor(
@@ -1447,30 +1473,26 @@ async def get_signals_comparison(
                                 timeout=EPISODE_TIMEOUT,
                             )
                             _set_cached_signal(repo_id, episode_path, resolution, signals)
-                            # Extract first frame after signals (reuses cached HF auth)
-                            first_frame = await loop.run_in_executor(
-                                mcap_executor, _extract_first_frame_sync, episode_path,
-                            )
-                            return (idx, ep["episode_id"], signals, None, first_frame)
+                            return ("signal", idx, ep["episode_id"], signals, None)
                         except asyncio.TimeoutError:
                             logger.warning(f"Episode {ep['episode_id']} timed out after {EPISODE_TIMEOUT}s")
-                            return (idx, ep["episode_id"], None, f"Timed out after {EPISODE_TIMEOUT}s", None)
+                            return ("signal", idx, ep["episode_id"], None, f"Timed out after {EPISODE_TIMEOUT}s")
                         except concurrent.futures.CancelledError:
                             logger.info(f"Episode {ep['episode_id']} cancelled")
-                            return (idx, ep["episode_id"], None, "Cancelled", None)
+                            return ("signal", idx, ep["episode_id"], None, "Cancelled")
                         except Exception as e:
                             logger.error(f"Failed to process episode {ep['episode_id']}: {e}")
-                            return (idx, ep["episode_id"], None, str(e), None)
+                            return ("signal", idx, ep["episode_id"], None, str(e))
 
-                    # Extract episodes in parallel, stream results as they complete.
-                    # Use asyncio.wait with a short timeout instead of as_completed
-                    # so we can check for client disconnect even while workers are busy.
+                    # Submit both frame and signal tasks into a single pending set.
+                    # Frame tasks run on frame_executor (2 workers), signal tasks
+                    # on mcap_executor (3 workers). Tagged tuples distinguish results.
                     pending = set()
                     for idx, ep in enumerate(episodes_to_analyze):
-                        task = asyncio.create_task(_extract_one(idx, ep))
-                        pending.add(task)
+                        pending.add(asyncio.create_task(_extract_frame_only(idx, ep)))
+                        pending.add(asyncio.create_task(_extract_one(idx, ep)))
 
-                    completed = 0
+                    completed_signals = 0
                     cancelled = False
 
                     while pending:
@@ -1490,43 +1512,51 @@ async def get_signals_comparison(
 
                         for task in done:
                             try:
-                                idx, episode_id, signals, error, first_frame = task.result()
+                                result_tuple = task.result()
                             except (asyncio.CancelledError, concurrent.futures.CancelledError):
                                 continue
                             except Exception as exc:
                                 logger.error(f"Unexpected task error: {exc}")
                                 continue
 
-                            completed += 1
+                            tag = result_tuple[0]
 
-                            yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': completed, 'total': total, 'episode_id': episode_id})}\n\n"
+                            if tag == "frame":
+                                _, idx, episode_id, first_frame_b64 = result_tuple
+                                if first_frame_b64:
+                                    yield f"data: {json.dumps({'type': 'first_frame', 'episode_id': episode_id, 'episode_index': idx, 'first_frame': first_frame_b64})}\n\n"
 
-                            if error is None and signals is not None:
-                                result = {
-                                    "type": "episode_data",
-                                    "episode_id": episode_id,
-                                    "episode_index": idx,
-                                    "actions": signals["actions"],
-                                    "imu": signals["imu"],
-                                    "signal_stride": signals.get("action_stride", 1),
-                                    "raw_action_count": signals.get("raw_action_count"),
-                                    "first_frame": first_frame,
-                                }
-                            else:
-                                result = {
-                                    "type": "episode_data",
-                                    "episode_id": episode_id,
-                                    "episode_index": idx,
-                                    "actions": {"error": error or "Unknown error"},
-                                    "imu": {"error": error or "Unknown error"},
-                                    "first_frame": first_frame,
-                                }
+                            elif tag == "signal":
+                                _, idx, episode_id, signals, error = result_tuple
+                                completed_signals += 1
 
-                            yield f"data: {json.dumps(result)}\n\n"
+                                yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': completed_signals, 'total': total, 'episode_id': episode_id})}\n\n"
 
-                    # Signal cancellation and clean up the thread pool
+                                if error is None and signals is not None:
+                                    result = {
+                                        "type": "episode_data",
+                                        "episode_id": episode_id,
+                                        "episode_index": idx,
+                                        "actions": signals["actions"],
+                                        "imu": signals["imu"],
+                                        "signal_stride": signals.get("action_stride", 1),
+                                        "raw_action_count": signals.get("raw_action_count"),
+                                    }
+                                else:
+                                    result = {
+                                        "type": "episode_data",
+                                        "episode_id": episode_id,
+                                        "episode_index": idx,
+                                        "actions": {"error": error or "Unknown error"},
+                                        "imu": {"error": error or "Unknown error"},
+                                    }
+
+                                yield f"data: {json.dumps(result)}\n\n"
+
+                    # Signal cancellation and clean up thread pools
                     cancel_event.set()
                     mcap_executor.shutdown(wait=False, cancel_futures=True)
+                    frame_executor.shutdown(wait=False, cancel_futures=True)
                     if not cancelled:
                         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 

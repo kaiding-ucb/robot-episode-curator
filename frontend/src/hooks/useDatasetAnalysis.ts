@@ -5,6 +5,7 @@ import { useState, useCallback, useRef } from "react";
 import type {
   FrameCountDistribution,
   EpisodeSignalData,
+  EpisodeStub,
   SignalAnalysisState,
   DatasetCapabilities,
 } from "@/types/analysis";
@@ -102,12 +103,16 @@ export function useSignalComparison() {
     progress: { current: 0, total: 0, currentEpisode: "" },
     error: null,
     noSignalsReason: null,
+    firstFrames: new Map(),
+    knownEpisodes: [],
   });
   const eventSourceRef = useRef<EventSource | null>(null);
 
   // Buffers for batching SSE events — accumulate without triggering renders
   const episodesBufferRef = useRef<Map<string, EpisodeSignalData>>(new Map());
   const progressRef = useRef<{ current: number; total: number; currentEpisode: string }>({ current: 0, total: 0, currentEpisode: "" });
+  const firstFramesBufferRef = useRef<Map<string, string>>(new Map());
+  const knownEpisodesRef = useRef<EpisodeStub[]>([]);
   const rafIdRef = useRef<number | null>(null);
 
   // Flush buffered state to React in a single render
@@ -117,6 +122,8 @@ export function useSignalComparison() {
       ...prev,
       episodes: new Map(episodesBufferRef.current),
       progress: { ...progressRef.current },
+      firstFrames: new Map(firstFramesBufferRef.current),
+      knownEpisodes: [...knownEpisodesRef.current],
     }));
   }, []);
 
@@ -147,6 +154,8 @@ export function useSignalComparison() {
       // Reset buffers
       episodesBufferRef.current = new Map();
       progressRef.current = { current: 0, total: 0, currentEpisode: "" };
+      firstFramesBufferRef.current = new Map();
+      knownEpisodesRef.current = [];
 
       setState({
         episodes: new Map(),
@@ -154,6 +163,8 @@ export function useSignalComparison() {
         progress: { current: 0, total: 0, currentEpisode: "" },
         error: null,
         noSignalsReason: null,
+        firstFrames: new Map(),
+        knownEpisodes: [],
       });
 
       const url = `${API_BASE}/datasets/${datasetId}/analysis/signals?task_name=${encodeURIComponent(taskName)}&max_episodes=${maxEpisodes}&resolution=200`;
@@ -167,6 +178,14 @@ export function useSignalComparison() {
           if (data.type === "total") {
             progressRef.current = { ...progressRef.current, total: data.total_episodes };
             scheduleFlush();
+          } else if (data.type === "episode_list") {
+            knownEpisodesRef.current = data.episodes as EpisodeStub[];
+            scheduleFlush();
+          } else if (data.type === "first_frame") {
+            if (data.first_frame) {
+              firstFramesBufferRef.current.set(data.episode_id, data.first_frame);
+              scheduleFlush();
+            }
           } else if (data.type === "progress") {
             progressRef.current = {
               current: data.episode_index,
@@ -199,6 +218,8 @@ export function useSignalComparison() {
               ...prev,
               episodes: new Map(episodesBufferRef.current),
               progress: { ...progressRef.current },
+              firstFrames: new Map(firstFramesBufferRef.current),
+              knownEpisodes: [...knownEpisodesRef.current],
               phase: "complete",
             }));
             eventSource.close();
@@ -233,6 +254,8 @@ export function useSignalComparison() {
               ...prev,
               episodes: new Map(episodesBufferRef.current),
               progress: { ...progressRef.current },
+              firstFrames: new Map(firstFramesBufferRef.current),
+              knownEpisodes: [...knownEpisodesRef.current],
               phase: "complete",
             };
           }
@@ -265,12 +288,16 @@ export function useSignalComparison() {
     }
     episodesBufferRef.current = new Map();
     progressRef.current = { current: 0, total: 0, currentEpisode: "" };
+    firstFramesBufferRef.current = new Map();
+    knownEpisodesRef.current = [];
     setState({
       episodes: new Map(),
       phase: "idle",
       progress: { current: 0, total: 0, currentEpisode: "" },
       error: null,
       noSignalsReason: null,
+      firstFrames: new Map(),
+      knownEpisodes: [],
     });
   }, [cancelRaf]);
 

@@ -1,11 +1,13 @@
 "use client";
 
 import { useMemo, useState, useEffect, useRef, useCallback } from "react";
-import type { EpisodeSignalData } from "@/types/analysis";
+import type { EpisodeSignalData, EpisodeStub } from "@/types/analysis";
 
 interface SignalComparisonChartProps {
   episodes: Map<string, EpisodeSignalData>;
   datasetId: string | null;
+  firstFrames?: Map<string, string>;
+  knownEpisodes?: EpisodeStub[];
 }
 
 function getEpisodeLabel(episodeId: string): string {
@@ -591,7 +593,8 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
 function useFirstFrames(
   episodeList: [string, EpisodeSignalData][],
-  datasetId: string | null
+  datasetId: string | null,
+  sseFirstFrames?: Map<string, string>,
 ) {
   const [frameData, setFrameData] = useState<Map<string, string>>(new Map());
   const [loading, setLoading] = useState(false);
@@ -660,8 +663,17 @@ function useFirstFrames(
       prevDatasetRef.current = datasetId;
     }
 
-    // Ingest any SSE-provided first_frame data (MCAP episodes)
+    // Ingest SSE-provided first frames (decoupled first_frame events)
     let hasNewSseFrames = false;
+    if (sseFirstFrames) {
+      for (const [id, frame] of sseFirstFrames) {
+        if (frame && !accumulatedRef.current.has(id)) {
+          accumulatedRef.current.set(id, frame);
+          hasNewSseFrames = true;
+        }
+      }
+    }
+    // Also ingest any first_frame embedded in episode data (legacy path)
     for (const [id, epData] of episodeList) {
       if (epData.first_frame && !accumulatedRef.current.has(id)) {
         accumulatedRef.current.set(id, epData.first_frame);
@@ -674,6 +686,7 @@ function useFirstFrames(
 
     // Abort only the previous fetch sequence, not already-completed results
     controllerRef.current?.abort();
+    fetchingRef.current.clear();  // Prevent aborted episodes from being permanently skipped
     const controller = new AbortController();
     controllerRef.current = controller;
 
@@ -706,24 +719,24 @@ function useFirstFrames(
 
     fetchNewFrames();
     return () => { controller.abort(); };
-  }, [episodeList, datasetId, fetchSingleFrame]);
+  }, [episodeList, datasetId, fetchSingleFrame, sseFirstFrames]);
 
   return { frameData, loading, errors };
 }
 
 function StartingPositionGrid({
-  episodeList,
+  gridEpisodeIds,
   frameData,
   loading,
   errors,
 }: {
-  episodeList: [string, EpisodeSignalData][];
+  gridEpisodeIds: { id: string; index: number }[];
   frameData: Map<string, string>;
   loading: boolean;
   errors: Set<string>;
 }) {
-  // Show nothing only if loading hasn't produced any frames yet AND no episodes listed
-  if (!loading && frameData.size === 0 && errors.size === 0) return null;
+  // Show nothing only if no episodes to show at all
+  if (gridEpisodeIds.length === 0 && !loading && frameData.size === 0 && errors.size === 0) return null;
 
   return (
     <div className="mb-4" data-testid="starting-position-grid">
@@ -737,10 +750,10 @@ function StartingPositionGrid({
         )}
       </div>
       <div className="grid grid-cols-5 gap-3">
-        {episodeList.map(([id]) => {
+        {gridEpisodeIds.map(({ id }) => {
           const frame = frameData.get(id);
           const hasError = errors.has(id);
-          const isPending = !frame && !hasError && loading;
+          const isPending = !frame && !hasError;
 
           return (
             <div
@@ -758,7 +771,7 @@ function StartingPositionGrid({
                   <span className="text-[10px] text-gray-400">No frame</span>
                 </div>
               ) : isPending ? (
-                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center">
+                <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center animate-pulse">
                   <svg className="animate-spin h-4 w-4 text-gray-400" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
@@ -783,6 +796,8 @@ function StartingPositionGrid({
 export default function SignalComparisonChart({
   episodes,
   datasetId,
+  firstFrames: sseFirstFrames,
+  knownEpisodes,
 }: SignalComparisonChartProps) {
   const episodeList = useMemo(() => {
     return Array.from(episodes.entries()).sort(
@@ -790,7 +805,19 @@ export default function SignalComparisonChart({
     );
   }, [episodes]);
 
-  const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId);
+  // Build grid episode list: use knownEpisodes for early placeholder rendering,
+  // fall back to episodeList once signal data arrives
+  const gridEpisodeIds = useMemo(() => {
+    if (episodeList.length > 0) {
+      return episodeList.map(([id, ep]) => ({ id, index: ep.episode_index }));
+    }
+    if (knownEpisodes && knownEpisodes.length > 0) {
+      return knownEpisodes.map((stub) => ({ id: stub.episode_id, index: stub.episode_index }));
+    }
+    return [];
+  }, [episodeList, knownEpisodes]);
+
+  const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId, sseFirstFrames);
 
   // Single precomputation pass: compute all magnitudes once per episode
   const precomputed = useMemo(() => {
@@ -861,101 +888,106 @@ export default function SignalComparisonChart({
     return { positionTraces, rotationTraces, accelTraces, gyroTraces };
   }, [episodeList, precomputed]);
 
-  if (episodeList.length === 0) {
+  if (episodeList.length === 0 && gridEpisodeIds.length === 0) {
     return null;
   }
 
   return (
     <div data-testid="signal-comparison-chart">
-      {/* Starting position thumbnails */}
-      {datasetId && (
+      {/* Starting position thumbnails — shows placeholders immediately via knownEpisodes */}
+      {datasetId && gridEpisodeIds.length > 0 && (
         <StartingPositionGrid
-          episodeList={episodeList}
+          gridEpisodeIds={gridEpisodeIds}
           frameData={frameData}
           loading={framesLoading}
           errors={frameErrors}
         />
       )}
 
-      {/* Overlay section */}
-      <div className="mb-4">
-        <div className="flex flex-wrap gap-x-3 gap-y-1 mb-2">
-          <span className="text-xs font-medium text-gray-500">Overlay — </span>
-          {episodeList.map(([id], i) => (
-            <span key={id} className="flex items-center gap-1 text-xs">
-              <span
-                className="w-3 h-0.5 rounded"
-                style={{ backgroundColor: EPISODE_COLORS[i % EPISODE_COLORS.length] }}
-              />
-              <span className="text-gray-600 dark:text-gray-300 font-mono">
-                {getEpisodeLabel(id)}
-              </span>
-            </span>
-          ))}
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <OverlayPanel title="Position Magnitude (x,y,z)" traces={positionTraces} batchRange={batchRanges.position} />
-          <OverlayPanel title="Accelerometer Magnitude" traces={accelTraces} batchRange={batchRanges.accel} />
-          <OverlayPanel title="Rotation Magnitude" traces={rotationTraces} batchRange={batchRanges.rotation} />
-          <OverlayPanel title="Gyroscope Magnitude" traces={gyroTraces} batchRange={batchRanges.gyro} />
-        </div>
-      </div>
-
-      {/* Per-episode section */}
-      <div className="text-xs font-medium text-gray-500 mb-1">Per Episode</div>
-
-      {/* Column headers */}
-      <div className="flex items-center gap-3 mb-1 pb-1 border-b border-gray-200 dark:border-gray-700">
-        <div className="w-28 flex-shrink-0">
-          <span className="text-xs font-medium text-gray-500">Episode</span>
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-gray-500">Actions</span>
-            <span className="flex items-center gap-1 text-[10px] text-gray-400">
-              <span className="inline-block w-2.5 h-0.5 rounded bg-blue-500" />
-              Position
-              <span className="inline-block w-2.5 h-0.5 rounded bg-purple-500 ml-1" />
-              Rotation
-              <span
-                className="inline-block w-2.5 h-0.5 rounded bg-green-500 ml-1"
-                style={{ borderBottom: "1px dashed #22c55e" }}
-              />
-              Gripper
-            </span>
+      {/* Overlay and per-episode charts — only render when signal data exists */}
+      {episodeList.length > 0 && (
+        <>
+          {/* Overlay section */}
+          <div className="mb-4">
+            <div className="flex flex-wrap gap-x-3 gap-y-1 mb-2">
+              <span className="text-xs font-medium text-gray-500">Overlay — </span>
+              {episodeList.map(([id], i) => (
+                <span key={id} className="flex items-center gap-1 text-xs">
+                  <span
+                    className="w-3 h-0.5 rounded"
+                    style={{ backgroundColor: EPISODE_COLORS[i % EPISODE_COLORS.length] }}
+                  />
+                  <span className="text-gray-600 dark:text-gray-300 font-mono">
+                    {getEpisodeLabel(id)}
+                  </span>
+                </span>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <OverlayPanel title="Position Magnitude (x,y,z)" traces={positionTraces} batchRange={batchRanges.position} />
+              <OverlayPanel title="Accelerometer Magnitude" traces={accelTraces} batchRange={batchRanges.accel} />
+              <OverlayPanel title="Rotation Magnitude" traces={rotationTraces} batchRange={batchRanges.rotation} />
+              <OverlayPanel title="Gyroscope Magnitude" traces={gyroTraces} batchRange={batchRanges.gyro} />
+            </div>
           </div>
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-gray-500">IMU</span>
-            <span className="flex items-center gap-1 text-[10px] text-gray-400">
-              <span className="inline-block w-2.5 h-0.5 rounded bg-blue-500" />
-              Accel
-              <span className="inline-block w-2.5 h-0.5 rounded bg-orange-500 ml-1" />
-              Gyro
-            </span>
+
+          {/* Per-episode section */}
+          <div className="text-xs font-medium text-gray-500 mb-1">Per Episode</div>
+
+          {/* Column headers */}
+          <div className="flex items-center gap-3 mb-1 pb-1 border-b border-gray-200 dark:border-gray-700">
+            <div className="w-28 flex-shrink-0">
+              <span className="text-xs font-medium text-gray-500">Episode</span>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-gray-500">Actions</span>
+                <span className="flex items-center gap-1 text-[10px] text-gray-400">
+                  <span className="inline-block w-2.5 h-0.5 rounded bg-blue-500" />
+                  Position
+                  <span className="inline-block w-2.5 h-0.5 rounded bg-purple-500 ml-1" />
+                  Rotation
+                  <span
+                    className="inline-block w-2.5 h-0.5 rounded bg-green-500 ml-1"
+                    style={{ borderBottom: "1px dashed #22c55e" }}
+                  />
+                  Gripper
+                </span>
+              </div>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-gray-500">IMU</span>
+                <span className="flex items-center gap-1 text-[10px] text-gray-400">
+                  <span className="inline-block w-2.5 h-0.5 rounded bg-blue-500" />
+                  Accel
+                  <span className="inline-block w-2.5 h-0.5 rounded bg-orange-500 ml-1" />
+                  Gyro
+                </span>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
 
-      {/* Episode rows */}
-      <div className="max-h-[400px] overflow-y-auto">
-        {episodeList.map(([id, data]) => (
-          <EpisodeChartRow
-            key={id}
-            episodeId={id}
-            episodeData={data}
-            batchRanges={batchRanges}
-            precomputedSignals={precomputed.get(id)}
-          />
-        ))}
-      </div>
+          {/* Episode rows */}
+          <div className="max-h-[400px] overflow-y-auto">
+            {episodeList.map(([id, data]) => (
+              <EpisodeChartRow
+                key={id}
+                episodeId={id}
+                episodeData={data}
+                batchRanges={batchRanges}
+                precomputedSignals={precomputed.get(id)}
+              />
+            ))}
+          </div>
 
-      {/* Error summary */}
-      {episodeList.some(([, ep]) => ep.actions?.error || ep.imu?.error) && (
-        <div className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-          Some episodes had extraction errors — check console for details.
-        </div>
+          {/* Error summary */}
+          {episodeList.some(([, ep]) => ep.actions?.error || ep.imu?.error) && (
+            <div className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              Some episodes had extraction errors — check console for details.
+            </div>
+          )}
+        </>
       )}
     </div>
   );

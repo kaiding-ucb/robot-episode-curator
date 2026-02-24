@@ -319,12 +319,17 @@ export default function DatasetAnalysis({
             )}
 
             {/* Charts */}
-            {signalState.episodes.size > 0 && (
-              <SignalComparisonChart episodes={signalState.episodes} datasetId={datasetId} />
+            {(signalState.episodes.size > 0 || signalState.knownEpisodes.length > 0) && (
+              <SignalComparisonChart
+                episodes={signalState.episodes}
+                datasetId={datasetId}
+                firstFrames={signalState.firstFrames}
+                knownEpisodes={signalState.knownEpisodes}
+              />
             )}
 
             {/* Idle state */}
-            {signalState.phase === "idle" && signalState.episodes.size === 0 && (
+            {signalState.phase === "idle" && signalState.episodes.size === 0 && signalState.knownEpisodes.length === 0 && (
               <div className="text-sm text-gray-500 text-center py-12">
                 Click &quot;Start Analysis&quot; to download and compare episode signals.
                 <br />
