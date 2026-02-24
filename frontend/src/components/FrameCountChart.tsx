@@ -79,20 +79,12 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
     return { bins, maxCount, meanBinX, stdLeftX, stdRightX };
   }, [data]);
 
-  if (!data.episodes.length) {
-    return (
-      <div className="text-sm text-gray-500 text-center py-8">
-        No episodes found in this task.
-      </div>
-    );
-  }
-
   const chartWidth = 700;
   const chartHeight = 220;
   const padding = { top: 20, right: 20, bottom: 50, left: 50 };
   const innerWidth = chartWidth - padding.left - padding.right;
   const innerHeight = chartHeight - padding.top - padding.bottom;
-  const barWidth = innerWidth / bins.length;
+  const barWidth = bins.length > 0 ? innerWidth / bins.length : 0;
 
   // Y-axis tick values
   const yTicks = useMemo(() => {
@@ -118,6 +110,14 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
     }
     return ticks;
   }, [bins]);
+
+  if (!data.episodes.length) {
+    return (
+      <div className="text-sm text-gray-500 text-center py-8">
+        No episodes found in this task.
+      </div>
+    );
+  }
 
   // Mean and std positions in pixel space, clamped to chart bounds
   const minFrame = bins[0].rangeStart;

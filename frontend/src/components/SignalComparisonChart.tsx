@@ -75,17 +75,26 @@ function computeGripperSignal(actions: number[][], dimIndex: number): number[] {
   return actions.map((a) => (dimIndex < a.length ? a[dimIndex] : 0));
 }
 
-// Get min/max across multiple arrays
+// Get robust min/max across multiple arrays using percentiles
+// This prevents a single extreme episode from compressing all others
 function getBatchRange(arrays: number[][]): { min: number; max: number } {
-  let min = Infinity;
-  let max = -Infinity;
+  const all: number[] = [];
   for (const arr of arrays) {
     for (const v of arr) {
-      if (v < min) min = v;
-      if (v > max) max = v;
+      all.push(v);
     }
   }
-  if (!isFinite(min)) return { min: 0, max: 1 };
+  if (all.length === 0) return { min: 0, max: 1 };
+
+  all.sort((a, b) => a - b);
+
+  // Use 2nd and 98th percentile for robust range
+  const lo = Math.floor(all.length * 0.02);
+  const hi = Math.ceil(all.length * 0.98) - 1;
+  const min = all[Math.max(0, lo)];
+  const max = all[Math.min(all.length - 1, hi)];
+
+  if (max <= min) return { min: min - 0.5, max: max + 0.5 };
   return { min, max };
 }
 
@@ -225,6 +234,15 @@ const EPISODE_COLORS = [
   "#f43f5e", // rose
 ];
 
+// Precomputed magnitude arrays per episode (computed once, reused everywhere)
+interface PrecomputedEpisodeSignals {
+  position: number[];
+  rotation: number[];
+  gripper: number[];
+  accel: number[];
+  gyro: number[];
+}
+
 // Batch normalization ranges for per-episode charts
 interface BatchRanges {
   position: { min: number; max: number };
@@ -293,87 +311,66 @@ interface EpisodeChartRowProps {
   episodeId: string;
   episodeData: EpisodeSignalData;
   batchRanges: BatchRanges;
+  precomputedSignals?: PrecomputedEpisodeSignals;
 }
 
-function EpisodeChartRow({ episodeId, episodeData, batchRanges }: EpisodeChartRowProps) {
+function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSignals }: EpisodeChartRowProps) {
   const { actionTraces, imuTraces } = useMemo(() => {
     const actionTraces: SignalTrace[] = [];
     const imuTraces: SignalTrace[] = [];
 
-    // Actions: Position (blue), Rotation (purple), Gripper (green)
-    if (
-      episodeData.actions &&
-      !episodeData.actions.error &&
-      episodeData.actions.actions?.length > 0
-    ) {
-      const dims = episodeData.actions.actions[0].length;
-
-      const posData = computeMagnitude(episodeData.actions.actions, [0, 1, 2]);
-      actionTraces.push({
-        label: "Position",
-        data: posData,
-        normalized: normalizeBatch(posData, batchRanges.position.min, batchRanges.position.max),
-        color: "#3b82f6",
-      });
-
-      if (dims > 3) {
-        const rotData = computeMagnitude(episodeData.actions.actions, [3, 4, 5]);
+    if (precomputedSignals) {
+      // Use precomputed magnitude arrays — no recomputation
+      if (precomputedSignals.position.length > 0) {
+        actionTraces.push({
+          label: "Position",
+          data: precomputedSignals.position,
+          normalized: normalizeBatch(precomputedSignals.position, batchRanges.position.min, batchRanges.position.max),
+          color: "#3b82f6",
+        });
+      }
+      if (precomputedSignals.rotation.length > 0) {
         actionTraces.push({
           label: "Rotation",
-          data: rotData,
-          normalized: normalizeBatch(rotData, batchRanges.rotation.min, batchRanges.rotation.max),
+          data: precomputedSignals.rotation,
+          normalized: normalizeBatch(precomputedSignals.rotation, batchRanges.rotation.min, batchRanges.rotation.max),
           color: "#8b5cf6",
         });
       }
-
-      if (dims > 6) {
-        const gripData = computeGripperSignal(episodeData.actions.actions, 6);
+      if (precomputedSignals.gripper.length > 0) {
         actionTraces.push({
           label: "Gripper",
-          data: gripData,
-          normalized: normalizeBatch(gripData, batchRanges.gripper.min, batchRanges.gripper.max),
+          data: precomputedSignals.gripper,
+          normalized: normalizeBatch(precomputedSignals.gripper, batchRanges.gripper.min, batchRanges.gripper.max),
           color: "#22c55e",
           dashed: true,
         });
       }
-    }
-
-    // IMU: Accel (blue), Gyro (orange)
-    if (
-      episodeData.imu &&
-      !episodeData.imu.error &&
-      episodeData.imu.timestamps?.length > 0
-    ) {
-      const accelData = computeIMUMagnitude(
-        episodeData.imu.accel_x,
-        episodeData.imu.accel_y,
-        episodeData.imu.accel_z
-      );
-      imuTraces.push({
-        label: "Accel",
-        data: accelData,
-        normalized: normalizeBatch(accelData, batchRanges.accel.min, batchRanges.accel.max),
-        color: "#3b82f6",
-      });
-
-      const gyroData = computeIMUMagnitude(
-        episodeData.imu.gyro_x,
-        episodeData.imu.gyro_y,
-        episodeData.imu.gyro_z
-      );
-      imuTraces.push({
-        label: "Gyro",
-        data: gyroData,
-        normalized: normalizeBatch(gyroData, batchRanges.gyro.min, batchRanges.gyro.max),
-        color: "#f97316",
-      });
+      if (precomputedSignals.accel.length > 0) {
+        imuTraces.push({
+          label: "Accel",
+          data: precomputedSignals.accel,
+          normalized: normalizeBatch(precomputedSignals.accel, batchRanges.accel.min, batchRanges.accel.max),
+          color: "#3b82f6",
+        });
+      }
+      if (precomputedSignals.gyro.length > 0) {
+        imuTraces.push({
+          label: "Gyro",
+          data: precomputedSignals.gyro,
+          normalized: normalizeBatch(precomputedSignals.gyro, batchRanges.gyro.min, batchRanges.gyro.max),
+          color: "#f97316",
+        });
+      }
     }
 
     return { actionTraces, imuTraces };
-  }, [episodeData, batchRanges]);
+  }, [precomputedSignals, batchRanges]);
 
   const hasError = episodeData.actions?.error || episodeData.imu?.error;
   const frameCount = episodeData.total_frames ?? episodeData.actions?.actions?.length ?? 0;
+  const stride = episodeData.signal_stride ?? 1;
+  const rawCount = episodeData.raw_action_count;
 
   return (
     <div className="flex items-stretch gap-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-b-0">
@@ -382,7 +379,9 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges }: EpisodeChartRo
           {getEpisodeLabel(episodeId)}
         </span>
         <span className="text-[10px] text-gray-400">
-          {frameCount > 0 ? `${frameCount} frames` : ""}
+          {rawCount && stride > 1
+            ? `${frameCount}/${rawCount} (stride ${stride})`
+            : frameCount > 0 ? `${frameCount} frames` : ""}
         </span>
         {hasError && (
           <span className="text-[10px] text-red-400">Error</span>
@@ -661,13 +660,26 @@ function useFirstFrames(
       prevDatasetRef.current = datasetId;
     }
 
+    // Ingest any SSE-provided first_frame data (MCAP episodes)
+    let hasNewSseFrames = false;
+    for (const [id, epData] of episodeList) {
+      if (epData.first_frame && !accumulatedRef.current.has(id)) {
+        accumulatedRef.current.set(id, epData.first_frame);
+        hasNewSseFrames = true;
+      }
+    }
+    if (hasNewSseFrames) {
+      setFrameData(new Map(accumulatedRef.current));
+    }
+
     // Abort only the previous fetch sequence, not already-completed results
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
 
-    // Find episodes that need fetching (not already loaded or in-flight)
-    const toFetch = episodeList.filter(([id]) =>
+    // Find episodes that need fetching via API (no SSE frame, not already loaded)
+    const toFetch = episodeList.filter(([id, epData]) =>
+      !epData.first_frame &&
       !accumulatedRef.current.has(id) &&
       !errorsRef.current.has(id) &&
       !fetchingRef.current.has(id)
@@ -737,7 +749,7 @@ function StartingPositionGrid({
             >
               {frame ? (
                 <img
-                  src={`data:image/webp;base64,${frame}`}
+                  src={`data:image/${frame.startsWith("/9j/") ? "jpeg" : "webp"};base64,${frame}`}
                   alt={getEpisodeLabel(id)}
                   className="w-full h-full object-cover"
                 />
@@ -780,7 +792,29 @@ export default function SignalComparisonChart({
 
   const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId);
 
-  // Compute batch ranges: min/max per signal type across ALL episodes
+  // Single precomputation pass: compute all magnitudes once per episode
+  const precomputed = useMemo(() => {
+    const map = new Map<string, PrecomputedEpisodeSignals>();
+    for (const [id, ep] of episodeList) {
+      const signals: PrecomputedEpisodeSignals = {
+        position: [], rotation: [], gripper: [], accel: [], gyro: [],
+      };
+      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
+        const dims = ep.actions.actions[0].length;
+        signals.position = computeMagnitude(ep.actions.actions, [0, 1, 2]);
+        if (dims > 3) signals.rotation = computeMagnitude(ep.actions.actions, [3, 4, 5]);
+        if (dims > 6) signals.gripper = computeGripperSignal(ep.actions.actions, 6);
+      }
+      if (ep.imu && !ep.imu.error && ep.imu.timestamps?.length > 0) {
+        signals.accel = computeIMUMagnitude(ep.imu.accel_x, ep.imu.accel_y, ep.imu.accel_z);
+        signals.gyro = computeIMUMagnitude(ep.imu.gyro_x, ep.imu.gyro_y, ep.imu.gyro_z);
+      }
+      map.set(id, signals);
+    }
+    return map;
+  }, [episodeList]);
+
+  // Derive batch ranges from precomputed magnitudes (no recomputation)
   const batchRanges: BatchRanges = useMemo(() => {
     const allPosition: number[][] = [];
     const allRotation: number[][] = [];
@@ -788,21 +822,12 @@ export default function SignalComparisonChart({
     const allAccel: number[][] = [];
     const allGyro: number[][] = [];
 
-    for (const [, ep] of episodeList) {
-      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
-        const dims = ep.actions.actions[0].length;
-        allPosition.push(computeMagnitude(ep.actions.actions, [0, 1, 2]));
-        if (dims > 3) {
-          allRotation.push(computeMagnitude(ep.actions.actions, [3, 4, 5]));
-        }
-        if (dims > 6) {
-          allGripper.push(computeGripperSignal(ep.actions.actions, 6));
-        }
-      }
-      if (ep.imu && !ep.imu.error && ep.imu.timestamps?.length > 0) {
-        allAccel.push(computeIMUMagnitude(ep.imu.accel_x, ep.imu.accel_y, ep.imu.accel_z));
-        allGyro.push(computeIMUMagnitude(ep.imu.gyro_x, ep.imu.gyro_y, ep.imu.gyro_z));
-      }
+    for (const [, signals] of precomputed) {
+      if (signals.position.length > 0) allPosition.push(signals.position);
+      if (signals.rotation.length > 0) allRotation.push(signals.rotation);
+      if (signals.gripper.length > 0) allGripper.push(signals.gripper);
+      if (signals.accel.length > 0) allAccel.push(signals.accel);
+      if (signals.gyro.length > 0) allGyro.push(signals.gyro);
     }
 
     return {
@@ -812,51 +837,29 @@ export default function SignalComparisonChart({
       accel: getBatchRange(allAccel),
       gyro: getBatchRange(allGyro),
     };
-  }, [episodeList]);
+  }, [precomputed]);
 
-  // Compute overlay traces (one trace per episode, colored by episode)
+  // Derive overlay traces from precomputed magnitudes (no recomputation)
   const { positionTraces, rotationTraces, accelTraces, gyroTraces } = useMemo(() => {
     const positionTraces: { label: string; data: number[]; color: string }[] = [];
     const rotationTraces: { label: string; data: number[]; color: string }[] = [];
     const accelTraces: { label: string; data: number[]; color: string }[] = [];
     const gyroTraces: { label: string; data: number[]; color: string }[] = [];
 
-    episodeList.forEach(([id, ep], i) => {
+    episodeList.forEach(([id], i) => {
       const color = EPISODE_COLORS[i % EPISODE_COLORS.length];
       const label = getEpisodeLabel(id);
+      const signals = precomputed.get(id);
+      if (!signals) return;
 
-      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
-        const dims = ep.actions.actions[0].length;
-        positionTraces.push({
-          label,
-          data: computeMagnitude(ep.actions.actions, [0, 1, 2]),
-          color,
-        });
-        if (dims > 3) {
-          rotationTraces.push({
-            label,
-            data: computeMagnitude(ep.actions.actions, [3, 4, 5]),
-            color,
-          });
-        }
-      }
-
-      if (ep.imu && !ep.imu.error && ep.imu.timestamps?.length > 0) {
-        accelTraces.push({
-          label,
-          data: computeIMUMagnitude(ep.imu.accel_x, ep.imu.accel_y, ep.imu.accel_z),
-          color,
-        });
-        gyroTraces.push({
-          label,
-          data: computeIMUMagnitude(ep.imu.gyro_x, ep.imu.gyro_y, ep.imu.gyro_z),
-          color,
-        });
-      }
+      if (signals.position.length > 0) positionTraces.push({ label, data: signals.position, color });
+      if (signals.rotation.length > 0) rotationTraces.push({ label, data: signals.rotation, color });
+      if (signals.accel.length > 0) accelTraces.push({ label, data: signals.accel, color });
+      if (signals.gyro.length > 0) gyroTraces.push({ label, data: signals.gyro, color });
     });
 
     return { positionTraces, rotationTraces, accelTraces, gyroTraces };
-  }, [episodeList]);
+  }, [episodeList, precomputed]);
 
   if (episodeList.length === 0) {
     return null;
@@ -943,6 +946,7 @@ export default function SignalComparisonChart({
             episodeId={id}
             episodeData={data}
             batchRanges={batchRanges}
+            precomputedSignals={precomputed.get(id)}
           />
         ))}
       </div>

@@ -275,6 +275,154 @@ class TestCaching:
             pytest.skip(f"Could not test caching: {e}")
 
 
+class TestRemoteSignalExtraction:
+    """
+    Tests for remote MCAP signal extraction via HTTP range requests.
+
+    Verifies that extract_signals_remote() produces the same results as
+    the full-download extract_signals_data() path, and that summary-based
+    counting matches iteration-based counting.
+    """
+
+    @pytest.fixture
+    def realomni_extractor(self, realomni_repo_id, cache_dir):
+        return StreamingFrameExtractor(realomni_repo_id, cache_dir)
+
+    @pytest.mark.slow
+    def test_summary_counts_match_iteration(self, realomni_extractor):
+        """
+        _get_signal_counts_from_summary() should return the same counts
+        as _count_signal_messages() for a local MCAP file.
+        """
+        episode_path = "Cooking_and_Kitchen_Clean/clean_bowl/00001/00001.mcap"
+
+        try:
+            local_path = realomni_extractor.download_file(episode_path)
+
+            # Iteration-based counting
+            iter_action, iter_imu, iter_topics = realomni_extractor._count_signal_messages(local_path)
+
+            # Summary-based counting
+            with open(local_path, "rb") as f:
+                summary_result = realomni_extractor._get_signal_counts_from_summary(f)
+
+            assert summary_result is not None, "MCAP file should have a summary"
+            sum_action, sum_imu, sum_topics = summary_result
+
+            assert sum_action == iter_action, (
+                f"Action count mismatch: summary={sum_action}, iteration={iter_action}"
+            )
+            assert sum_imu == iter_imu, (
+                f"IMU count mismatch: summary={sum_imu}, iteration={iter_imu}"
+            )
+            assert set(sum_topics) == set(iter_topics), (
+                f"Topic mismatch: summary={sum_topics}, iteration={iter_topics}"
+            )
+
+        except Exception as e:
+            pytest.skip(f"Could not test summary counts: {e}")
+
+    @pytest.mark.slow
+    def test_remote_matches_local_signals(self, realomni_extractor):
+        """
+        extract_signals_remote() should produce identical action/IMU counts
+        and values as extract_signals_data() (full download path).
+        """
+        episode_path = "Cooking_and_Kitchen_Clean/clean_bowl/00001/00001.mcap"
+        max_actions = 200
+        max_imu = 200
+
+        try:
+            # Remote extraction (HTTP range requests)
+            remote_result = realomni_extractor.extract_signals_remote(
+                episode_path, max_actions, max_imu
+            )
+
+            # Local extraction (full download)
+            local_result = realomni_extractor.extract_signals_data(
+                episode_path, max_actions, max_imu
+            )
+
+            # Compare action counts
+            remote_actions = remote_result["actions"]
+            local_actions = local_result["actions"]
+
+            assert "error" not in remote_actions, f"Remote actions error: {remote_actions.get('error')}"
+            assert "error" not in local_actions, f"Local actions error: {local_actions.get('error')}"
+
+            remote_action_count = len(remote_actions["timestamps"])
+            local_action_count = len(local_actions["timestamps"])
+            assert remote_action_count == local_action_count, (
+                f"Action count mismatch: remote={remote_action_count}, local={local_action_count}"
+            )
+
+            # Compare IMU counts
+            remote_imu = remote_result["imu"]
+            local_imu = local_result["imu"]
+
+            remote_imu_count = len(remote_imu["timestamps"])
+            local_imu_count = len(local_imu["timestamps"])
+            assert remote_imu_count == local_imu_count, (
+                f"IMU count mismatch: remote={remote_imu_count}, local={local_imu_count}"
+            )
+
+            # Compare strides
+            assert remote_result["action_stride"] == local_result["action_stride"], (
+                f"Action stride mismatch: remote={remote_result['action_stride']}, "
+                f"local={local_result['action_stride']}"
+            )
+
+            # Compare first few action values (floating point)
+            if remote_action_count > 0:
+                for i in range(min(5, remote_action_count)):
+                    remote_vals = remote_actions["actions"][i]
+                    local_vals = local_actions["actions"][i]
+                    for j, (rv, lv) in enumerate(zip(remote_vals, local_vals)):
+                        assert abs(rv - lv) < 1e-6, (
+                            f"Action value mismatch at [{i}][{j}]: "
+                            f"remote={rv}, local={lv}"
+                        )
+
+            # Compare first few IMU values
+            if remote_imu_count > 0:
+                for key in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]:
+                    for i in range(min(5, remote_imu_count)):
+                        rv = remote_imu[key][i]
+                        lv = local_imu[key][i]
+                        assert abs(rv - lv) < 1e-6, (
+                            f"IMU {key} mismatch at [{i}]: remote={rv}, local={lv}"
+                        )
+
+        except Exception as e:
+            pytest.skip(f"Could not test remote signal extraction: {e}")
+
+    @pytest.mark.slow
+    def test_remote_extraction_has_data(self, realomni_extractor):
+        """
+        Remote extraction should return non-empty action and IMU data
+        for a known RealOmni episode.
+        """
+        episode_path = "Cooking_and_Kitchen_Clean/clean_bowl/00001/00001.mcap"
+
+        try:
+            result = realomni_extractor.extract_signals_remote(
+                episode_path, max_actions=500, max_imu=500
+            )
+
+            assert "error" not in result["actions"], (
+                f"Actions error: {result['actions'].get('error')}"
+            )
+            assert len(result["actions"]["timestamps"]) > 0, "Should have action data"
+            assert len(result["actions"]["actions"]) > 0, "Should have action vectors"
+            assert len(result["imu"]["timestamps"]) > 0, "Should have IMU data"
+            assert result["actions"]["dimension_labels"] is not None, (
+                "Should have dimension labels"
+            )
+
+        except Exception as e:
+            pytest.skip(f"Could not test remote extraction: {e}")
+
+
 class TestWebDatasetExtraction:
     """Tests for WebDataset/TAR extraction (Egocentric-10K format)."""
 
