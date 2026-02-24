@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { useStreamingFrames, getFrame } from "@/hooks/useStreamingFrames";
+import { useStreamingFrames, getFrame, getFloorFrame } from "@/hooks/useStreamingFrames";
 import type { StreamingOptions, Modality } from "@/types/api";
 import { useQualityEvents } from "@/hooks/useQuality";
 import EnhancedTimeline from "./EnhancedTimeline";
@@ -31,9 +31,12 @@ export default function EpisodeViewer({
   const [activeStream, setActiveStream] = useState<"rgb" | "depth">("rgb");
   const [activeChartTab, setActiveChartTab] = useState<"none" | "actions" | "imu">("none");
 
+  // Deferred loading: SSE only starts after user clicks Play
+  const [playRequested, setPlayRequested] = useState(false);
+
   // Background caching status
   const [cachingStatus, setCachingStatus] = useState<{
-    status: "not_cached" | "caching" | "cached" | "not_applicable" | "started" | null;
+    status: "not_cached" | "caching" | "cached" | "not_applicable" | "started" | "error" | null;
     progress?: number;
     totalFrames?: number;
   }>({ status: null });
@@ -59,9 +62,9 @@ export default function EpisodeViewer({
   // Trigger background caching when play is clicked
   const triggerBackgroundCaching = useCallback(async () => {
     if (!episodeId || !datasetId || cachingTriggeredRef.current) return;
-    // Don't trigger if already cached, caching, or not applicable
+    // Don't trigger if already cached or caching in progress
     if (cachingStatus.status === "cached" || cachingStatus.status === "caching" ||
-        cachingStatus.status === "started" || cachingStatus.status === "not_applicable") return;
+        cachingStatus.status === "started") return;
 
     cachingTriggeredRef.current = true;
 
@@ -164,9 +167,9 @@ export default function EpisodeViewer({
       }
     };
 
-    // Poll immediately, then every 2 seconds
+    // Poll immediately, then every 1 second for responsive UX during caching
     pollStatus();
-    const interval = setInterval(pollStatus, 2000);
+    const interval = setInterval(pollStatus, 1000);
     return () => clearInterval(interval);
   }, [episodeId, datasetId, cachingStatus.status, streamingOptions, activeStream, API_BASE]);
 
@@ -180,6 +183,7 @@ export default function EpisodeViewer({
 
   const {
     frames,
+    sortedIndices,
     totalFrames: apiTotalFrames,
     stride,
     progress,
@@ -194,8 +198,11 @@ export default function EpisodeViewer({
     batchStart + batchSize,
     {
       ...streamingOptions,
-      // Don't start SSE until we know caching status, and skip if already caching
-      enabled: initialStatusChecked && !isActivelyCaching,
+      // Only start SSE when user has clicked Play AND episode is confirmed cached or doesn't need caching.
+      // This prevents triggering a multi-minute download just by browsing episodes.
+      // Whitelist approach avoids race conditions with null/transient states.
+      enabled: playRequested && initialStatusChecked && !isActivelyCaching &&
+        (cachingStatus.status === "cached" || cachingStatus.status === "not_applicable"),
     }
   );
 
@@ -220,21 +227,14 @@ export default function EpisodeViewer({
   }, [episodeId, cancel]);
 
   // Get the frame to display from the streaming Map
-  // Frames are added progressively as they arrive via SSE
-  const displayFrame = getFrame(frames, currentFrame);
+  // Uses O(log n) binary search on sorted indices instead of O(n) linear scan
+  const displayFrame = getFrame(frames, currentFrame, sortedIndices);
 
   // For streaming: show last available frame if current frame hasn't arrived yet
+  // Uses O(log n) binary search instead of O(n) linear scan
   const lastLoadedFrame = useMemo(() => {
-    if (frames.size === 0) return null;
-    // Find the highest frame index that's <= currentFrame
-    let best = null;
-    for (const [idx, frame] of frames) {
-      if (idx <= currentFrame && (best === null || idx > best)) {
-        best = idx;
-      }
-    }
-    return best !== null ? frames.get(best) : null;
-  }, [frames, currentFrame]);
+    return getFloorFrame(frames, currentFrame, sortedIndices);
+  }, [frames, currentFrame, sortedIndices]);
 
   // Use current frame if available, otherwise fallback to last loaded frame
   const frameToShow = displayFrame || lastLoadedFrame;
@@ -248,37 +248,40 @@ export default function EpisodeViewer({
   isLoadingRef.current = loading;
 
   // Playback logic - continues during loading, uses fallback frames
+  // When stride > 1, increment by stride so each tick shows a new actual frame
+  const playbackStride = stride > 1 ? stride : 1;
+
   useEffect(() => {
     if (!playing) return;
 
-    // Don't start playback if we don't have any frame to display
-    if (!hasFrameRef.current) {
-      return;
-    }
-
     const interval = setInterval(() => {
-      // Skip tick if no frame available (fallback will show last known frame)
+      // Skip tick if no frame available yet (waiting for SSE)
       if (!hasFrameRef.current) {
         return;
       }
 
       setCurrentFrame((prev) => {
-        if (prev >= effectiveTotalFrames - 1) {
+        const next = prev + playbackStride;
+        if (next >= effectiveTotalFrames) {
           setPlaying(false);
           return prev;
         }
-        return prev + 1;
+        return next;
       });
     }, 1000 / (30 * playbackSpeed)); // Assume 30fps base
 
     return () => clearInterval(interval);
-  }, [playing, effectiveTotalFrames, playbackSpeed]); // Removed 'loading' dependency
+  }, [playing, effectiveTotalFrames, playbackSpeed, playbackStride]);
 
   // Reset when episode changes
   useEffect(() => {
     setCurrentFrame(0);
     setPlaying(false);
+    setPlayRequested(false); // Reset deferred loading on episode change
     setActiveStream("rgb"); // Reset to RGB when episode changes
+    // Reset caching status to prevent stale state from enabling SSE on first render
+    setCachingStatus({ status: null });
+    cachingTriggeredRef.current = false; // Allow caching for new episode
   }, [episodeId]);
 
   const handleFrameChange = useCallback((frame: number) => {
@@ -288,7 +291,17 @@ export default function EpisodeViewer({
     onFrameChange?.(frame);
   }, [onFrameChange]);
 
+  // Direct caching trigger for uncached episode Play button
+  // Calls triggerBackgroundCaching() directly before setting playing state,
+  // avoiding race conditions with React's batched updates in togglePlayback
+  const handleStartCaching = useCallback(async () => {
+    setPlayRequested(true);
+    await triggerBackgroundCaching();
+    setPlaying(true);
+  }, [triggerBackgroundCaching]);
+
   const togglePlayback = useCallback(() => {
+    setPlayRequested(true);
     setPlaying((prev) => {
       // Trigger background caching when starting playback
       if (!prev) {
@@ -324,56 +337,16 @@ export default function EpisodeViewer({
     );
   }
 
-  // Only show full loading screen if we have NO frames at all AND not actively caching
-  // If we have previous frames, show them with a loading overlay instead
-  // Skip loading screen if episode is being cached - show caching progress instead
-  const showFullLoadingScreen = loading && frames.size === 0 && !frameToShow && !isActivelyCaching;
+  // Overlay state logic (replaces early returns)
+  const isReadyToStream = cachingStatus.status === "cached" || cachingStatus.status === "not_applicable";
+  const needsCaching = initialStatusChecked && !isReadyToStream && !isActivelyCaching && frames.size === 0 && !loading;
+  const showReadyToPlayOverlay = !playRequested;
+  const showCachingOverlay = playRequested && isActivelyCaching && !frameToShow;
+  const showLoadingOverlay = playRequested && loading && frames.size === 0 && !frameToShow && !isActivelyCaching;
+  const showErrorOverlay = !!error;
 
-  // Show caching progress screen when episode is being cached and no frames yet
-  if (isActivelyCaching && frames.size === 0 && !frameToShow) {
-    return (
-      <div
-        className="flex items-center justify-center h-full text-gray-500"
-        data-testid="caching-progress"
-      >
-        <div className="text-center">
-          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-          <p className="text-lg font-medium">Caching Episode...</p>
-          <p className="text-2xl font-bold text-blue-500 mt-1">{cachingStatus.progress || 0}%</p>
-          <p className="text-xs text-gray-400 mt-2">
-            {cachingStatus.totalFrames
-              ? `${Math.round((cachingStatus.progress || 0) * cachingStatus.totalFrames / 100)} / ${cachingStatus.totalFrames} frames`
-              : "Preparing..."}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (showFullLoadingScreen) {
-    return (
-      <div
-        className="flex items-center justify-center h-full text-gray-500"
-        data-testid="loading-frames"
-      >
-        <div className="text-center">
-          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-          <p>Loading frames...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div
-        className="flex items-center justify-center h-full text-red-500"
-        data-testid="error-frames"
-      >
-        Error: {error}
-      </div>
-    );
-  }
+  // Controls disabled before play
+  const controlsDisabled = !playRequested;
 
   return (
     <div className="flex flex-col h-full" data-testid="episode-viewer">
@@ -381,14 +354,88 @@ export default function EpisodeViewer({
       <div className="flex-1 min-h-0 bg-black flex items-center justify-center relative overflow-hidden">
         {frameToShow ? (
           <img
-            key={`frame-${frameToShow.index}`}
-            src={`data:image/webp;base64,${frameToShow.image}`}
+            src={frameToShow.blobUrl || `data:image/webp;base64,${frameToShow.image}`}
             alt={`Frame ${currentFrame}`}
             className="max-w-full max-h-full object-contain"
             data-testid="frame-image"
           />
         ) : (
-          <div className="text-gray-500">No frame available</div>
+          <div className="text-gray-500">{playRequested ? "No frame available" : ""}</div>
+        )}
+
+        {/* Ready-to-play overlay — shown before user clicks Play */}
+        {showReadyToPlayOverlay && (
+          <div
+            className="absolute inset-0 bg-black/60 flex items-center justify-center z-10"
+            data-testid="ready-to-play-overlay"
+          >
+            <div className="text-center">
+              <button
+                onClick={handleStartCaching}
+                className="w-20 h-20 rounded-full bg-blue-500 hover:bg-blue-600 text-white flex items-center justify-center transition-colors mx-auto mb-3"
+                data-testid="play-overlay-btn"
+              >
+                <svg className="w-10 h-10 ml-1" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              </button>
+              <p className="text-white text-sm opacity-75">
+                {needsCaching && cachingStatus.status === "error"
+                  ? "Previous caching failed. Click to retry."
+                  : "Click to play"}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Caching overlay — downloading/caching in progress, no frames yet */}
+        {showCachingOverlay && (
+          <div
+            className="absolute inset-0 bg-black/60 flex items-center justify-center z-10"
+            data-testid="caching-progress"
+          >
+            <div className="text-center text-white">
+              <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <p className="text-lg font-medium">Caching Episode...</p>
+              <p className="text-2xl font-bold text-blue-500 mt-1">{cachingStatus.progress || 0}%</p>
+              <p className="text-xs text-gray-400 mt-2">
+                {cachingStatus.totalFrames
+                  ? `${Math.round((cachingStatus.progress || 0) * cachingStatus.totalFrames / 100)} / ${cachingStatus.totalFrames} frames`
+                  : "Preparing..."}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Loading overlay — SSE streaming started, waiting for first frame */}
+        {showLoadingOverlay && (
+          <div
+            className="absolute inset-0 bg-black/60 flex items-center justify-center z-10"
+            data-testid="loading-frames"
+          >
+            <div className="text-center text-white">
+              <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <p>Loading frames...</p>
+            </div>
+          </div>
+        )}
+
+        {/* Error overlay */}
+        {showErrorOverlay && (
+          <div
+            className="absolute inset-0 bg-black/60 flex items-center justify-center z-10"
+            data-testid="error-frames"
+          >
+            <div className="text-center">
+              <p className="text-red-400 mb-3">Error: {error}</p>
+              <button
+                onClick={() => { setPlayRequested(false); }}
+                className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-500 transition-colors text-sm"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
         )}
 
         {/* Frame info overlay */}
@@ -535,7 +582,7 @@ export default function EpisodeViewer({
       {/* Timeline Controls */}
       <div className="p-4 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
         {/* Enhanced Timeline with Event Markers */}
-        <div className="mb-3">
+        <div className={`mb-3 ${controlsDisabled ? "pointer-events-none opacity-50" : ""}`}>
           <EnhancedTimeline
             currentFrame={currentFrame}
             totalFrames={effectiveTotalFrames}
@@ -567,7 +614,7 @@ export default function EpisodeViewer({
             {/* Step Backward */}
             <button
               onClick={() => handleFrameChange(Math.max(0, currentFrame - 1))}
-              disabled={currentFrame === 0}
+              disabled={controlsDisabled || currentFrame === 0}
               className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-30"
               data-testid="step-back-btn"
             >
@@ -579,7 +626,7 @@ export default function EpisodeViewer({
             {/* Step Forward */}
             <button
               onClick={() => handleFrameChange(Math.min(effectiveTotalFrames - 1, currentFrame + 1))}
-              disabled={currentFrame >= effectiveTotalFrames - 1}
+              disabled={controlsDisabled || currentFrame >= effectiveTotalFrames - 1}
               className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-30"
               data-testid="step-forward-btn"
             >
@@ -595,7 +642,8 @@ export default function EpisodeViewer({
             <select
               value={playbackSpeed}
               onChange={(e) => setPlaybackSpeed(parseFloat(e.target.value))}
-              className="text-sm bg-gray-100 dark:bg-gray-800 rounded px-2 py-1"
+              disabled={controlsDisabled}
+              className="text-sm bg-gray-100 dark:bg-gray-800 rounded px-2 py-1 disabled:opacity-50"
               data-testid="speed-select"
             >
               <option value={0.25}>0.25x</option>

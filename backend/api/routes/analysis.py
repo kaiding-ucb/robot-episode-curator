@@ -240,6 +240,7 @@ async def _download_parquet(
     file_path: str,
     headers: Dict[str, str],
     branch: str = "main",
+    executor: Optional[Any] = None,
 ) -> pd.DataFrame:
     """
     Download only signal-related columns from a HF Parquet file.
@@ -270,7 +271,7 @@ async def _download_parquet(
         return table.to_pandas()
 
     try:
-        return await loop.run_in_executor(None, _read_columns)
+        return await loop.run_in_executor(executor, _read_columns)
     except Exception as e:
         logger.warning(f"Column-filtered read failed for {file_path}, falling back to full download: {e}")
         resolve_ref = branch or "main"
@@ -289,6 +290,8 @@ async def _extract_lerobot_episodes(
     filter_episodes: Optional[set] = None,
     branch: str = "main",
     max_frames_per_episode: int = 500,
+    executor: Optional[Any] = None,
+    is_disconnected: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Download LeRobot Parquet files and extract per-episode action data.
@@ -308,8 +311,11 @@ async def _extract_lerobot_episodes(
     relevant_episodes = set()
 
     for pf in parquet_files:
+        if is_disconnected and await is_disconnected():
+            logger.info("Client disconnected during parquet downloads, stopping")
+            break
         try:
-            df = await _download_parquet(client, repo_id, pf["path"], headers, branch=branch)
+            df = await _download_parquet(client, repo_id, pf["path"], headers, branch=branch, executor=executor)
             all_dfs.append(df)
 
             # Track unique episodes seen so far (only relevant ones)
@@ -952,6 +958,24 @@ async def get_signals_comparison(
     repo_id = dataset_info.get("repo_id", "")
 
     async def signal_stream():
+        import concurrent.futures
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        loop = asyncio.get_event_loop()
+
+        async def run_in_thread(func, *args, **kwargs):
+            """Run blocking function in thread pool with disconnection checking."""
+            future = loop.run_in_executor(executor, lambda: func(*args, **kwargs))
+            while not future.done():
+                if await request.is_disconnected():
+                    future.cancel()
+                    logger.info("Cancelled signal analysis due to client disconnect")
+                    return None
+                try:
+                    return await asyncio.wait_for(asyncio.shield(future), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+            return future.result()
+
         try:
             headers = _get_hf_headers()
             fmt = dataset_info.get("format") or "unknown"
@@ -959,6 +983,8 @@ async def get_signals_comparison(
             # For LeRobot datasets, use metadata to find data parquet files
             is_lerobot = False
             if dataset_info.get("streaming_recommended"):
+                if await request.is_disconnected():
+                    return
                 from api.routes.datasets import is_lerobot_dataset
                 is_lerobot = await is_lerobot_dataset(dataset_info)
 
@@ -976,6 +1002,8 @@ async def get_signals_comparison(
                 )
                 import re as _re
 
+                if await request.is_disconnected():
+                    return
                 info = await fetch_lerobot_info(repo_id)
                 tasks_df = await fetch_lerobot_tasks_meta(repo_id)
                 ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
@@ -1053,6 +1081,9 @@ async def get_signals_comparison(
                 # List data parquet files - try tree API first, fall back to info.json template
                 yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': 0, 'total': max_episodes, 'episode_id': 'downloading parquet data...'})}\n\n"
 
+                if await request.is_disconnected():
+                    return
+
                 data_files = []
                 try:
                     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1064,12 +1095,17 @@ async def get_signals_comparison(
                 if not data_files and info and info.get("data_path"):
                     data_files = _build_lerobot_data_file_list(info, target_ep_list)
 
+                if await request.is_disconnected():
+                    return
+
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     episodes = await _extract_lerobot_episodes(
                         client, repo_id, data_files, headers,
                         max_episodes=max_episodes,
                         filter_episodes=target_ep_set,
                         branch=data_branch,
+                        executor=executor,
+                        is_disconnected=request.is_disconnected,
                     )
 
                 # Sort by global index, then re-index to task-local indices
@@ -1105,6 +1141,8 @@ async def get_signals_comparison(
 
             else:
                 # Non-LeRobot: use directory-based file collection
+                if await request.is_disconnected():
+                    return
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     raw_episodes = await _collect_episode_files(client, repo_id, task_name, headers)
 
@@ -1131,12 +1169,11 @@ async def get_signals_comparison(
                         yield f"data: {json.dumps({'type': 'progress', 'phase': 'processing', 'episode_index': idx, 'total': total, 'episode_id': episode_id})}\n\n"
 
                         try:
-                            loop = asyncio.get_event_loop()
-
                             # Single stride-aware pass for both actions and IMU
-                            signals = await loop.run_in_executor(
-                                None, extractor.extract_signals_data, episode_path, 500, 500
-                            )
+                            signals = await run_in_thread(extractor.extract_signals_data, episode_path, 500, 500)
+                            if signals is None:
+                                logger.info("Client disconnected during MCAP signal extraction")
+                                return
                             actions_data = signals["actions"]
                             imu_data = signals["imu"]
 
@@ -1166,9 +1203,13 @@ async def get_signals_comparison(
                 else:
                     yield f"data: {json.dumps({'type': 'no_signals', 'reason': f'Signal comparison is not supported for {fmt} format'})}\n\n"
 
+        except GeneratorExit:
+            logger.info("Client closed signal comparison connection")
         except Exception as e:
             logger.error(f"Signal analysis failed: {e}")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return StreamingResponse(signal_stream(), media_type="text/event-stream")
 

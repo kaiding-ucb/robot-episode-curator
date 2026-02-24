@@ -56,6 +56,22 @@ _caching_tasks: Dict[str, asyncio.Task] = {}
 _caching_progress: Dict[str, Dict[str, Any]] = {}  # {key: {progress: 0-100, status: str, total_frames: int}}
 
 
+def _compute_stride_target(total_frames: int) -> int:
+    """Compute stride target based on episode size.
+
+    Balances storage savings with playback quality.
+    Target ~300 frames for most episodes (10s at 30fps playback).
+    """
+    if total_frames <= 300:
+        return total_frames
+    elif total_frames <= 1000:
+        return 300
+    elif total_frames <= 5000:
+        return 300
+    else:
+        return 300
+
+
 class EpisodeDetail(BaseModel):
     """Detailed episode information."""
 
@@ -919,6 +935,8 @@ async def stream_frames_generator(
             logger.info(f"Client disconnected before download: {file_path}")
             return
 
+        yield f"data: {json.dumps({'type': 'status', 'status': 'downloading'})}\n\n"
+
         # Download the file in thread pool (allows disconnection checking)
         local_path = await run_in_thread(extractor.download_file, file_path, revision=revision)
         if local_path is None:
@@ -931,12 +949,14 @@ async def stream_frames_generator(
                 logger.info(f"Client disconnected before decoding: {file_path}")
                 return
 
+            yield f"data: {json.dumps({'type': 'status', 'status': 'extracting'})}\n\n"
+
             # For non-MCAP files, fall back to batch decoding (in thread pool)
             # When stride==1, let the decoder skip frames via auto_stride_target
             result = await run_in_thread(
                 extractor.extract_frames_with_count,
                 file_path, start, end, stream=stream,
-                auto_stride_target=500 if stride == 1 else None,
+                auto_stride_target=150 if stride == 1 else None,
             )
             if result is None:
                 return  # Client disconnected during extraction
@@ -990,6 +1010,8 @@ async def stream_frames_generator(
             logger.info(f"Client disconnected before MCAP processing: {file_path}")
             return
 
+        yield f"data: {json.dumps({'type': 'status', 'status': 'extracting'})}\n\n"
+
         # For MCAP files, we can stream frames as they're decoded
         # First, get total frame count (in thread pool)
         total_frames = await run_in_thread(extractor.get_frame_count, file_path)
@@ -998,26 +1020,27 @@ async def stream_frames_generator(
         total_frames_count = total_frames
 
         # Auto-compute stride for large MCAP episodes
-        if stride == 1 and total_frames > 500:
-            stride = math.ceil(total_frames / 500)
-            logger.info(f"Auto-stride (MCAP): {total_frames} frames -> stride={stride}")
+        target = _compute_stride_target(total_frames)
+        if stride == 1 and total_frames > target:
+            stride = math.ceil(total_frames / target)
+            logger.info(f"Auto-stride (MCAP): {total_frames} frames -> stride={stride} (target={target})")
 
         yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': stride})}\n\n"
 
         # Extract frames progressively (in thread pool)
         # For H.264, we still need to decode from the beginning, but we can yield as we go
+        # Pass stride to MCAP extractor — JPEG/PNG frames skip decode, H.264 filters post-decode
         raw_frames = await run_in_thread(
             extractor.extract_frames_from_mcap,
             local_path, start, end,
             episode_path=file_path,
-            stream=stream
+            stream=stream,
+            stride=stride,
         )
         if raw_frames is None:
             return  # Client disconnected during extraction
 
-        # Apply stride filtering (MCAP decodes all frames, then we filter)
-        if stride > 1:
-            raw_frames = [(idx, ts, img) for i, (idx, ts, img) in enumerate(raw_frames) if i % stride == 0]
+        # Stride already applied during extraction — no post-filtering needed
 
         for frame_idx, timestamp, image in raw_frames:
             # Check for disconnection periodically (every 10 frames)
@@ -1067,11 +1090,19 @@ async def serve_cached_frames_as_sse(
 ) -> AsyncGenerator[str, None]:
     """
     Serve cached frames as SSE events (much faster than re-decoding).
+
+    Stride is inferred from the mismatch between total_frames and cached frame count.
+    Cached frames are already strided — no further filtering needed.
     """
     all_frames = cached_episode["frames"]
     total_frames = cached_episode["total"]
 
-    yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': 1})}\n\n"
+    # Infer stride from cache: if total > cached count, stride was applied during caching
+    stride = 1
+    if total_frames and len(all_frames) > 0 and total_frames > len(all_frames):
+        stride = math.ceil(total_frames / len(all_frames))
+
+    yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': stride})}\n\n"
 
     # Clamp range to available frames
     actual_end = min(end, len(all_frames))
@@ -1137,15 +1168,18 @@ async def stream_lerobot_frames_generator(
 
     try:
         # Auto-compute stride for large episodes
-        if stride == 1 and num_frames and num_frames > 500:
-            stride = math.ceil(num_frames / 500)
-            logger.info(f"Auto-stride (LeRobot): {num_frames} frames -> stride={stride}")
+        target = _compute_stride_target(num_frames) if num_frames else 150
+        if stride == 1 and num_frames and num_frames > target:
+            stride = math.ceil(num_frames / target)
+            logger.info(f"Auto-stride (LeRobot): {num_frames} frames -> stride={stride} (target={target})")
 
         # Send total frames first (with stride info)
         yield f"data: {json.dumps({'type': 'total', 'total_frames': num_frames, 'stride': stride})}\n\n"
 
         if await check_disconnected():
             return
+
+        yield f"data: {json.dumps({'type': 'status', 'status': 'downloading'})}\n\n"
 
         # Download the video chunk file (use data_branch for datasets on non-main branches)
         data_branch = resolution_info.get("data_branch")
@@ -1159,6 +1193,8 @@ async def stream_lerobot_frames_generator(
         if await check_disconnected():
             return
 
+        yield f"data: {json.dumps({'type': 'status', 'status': 'extracting'})}\n\n"
+
         # Extract only this episode's frames from the video chunk
         # frame_start/frame_end are absolute positions within the video file
         actual_start = frame_start + start
@@ -1170,15 +1206,14 @@ async def stream_lerobot_frames_generator(
             local_path,
             actual_start,
             actual_end,
+            stride,  # Pass stride to decoder — skips non-stride frames during decode
         )
 
         if raw_frames is None:
             yield f"data: {json.dumps({'type': 'error', 'message': 'Failed to extract frames'})}\n\n"
             return
 
-        # Apply stride filtering for LeRobot frames
-        if stride > 1:
-            raw_frames = [(idx, ts, img) for idx, ts, img in raw_frames if (idx - frame_start) % stride == 0]
+        # Stride already applied during decode — no post-filtering needed
 
         for abs_frame_idx, timestamp, image in raw_frames:
             # Re-index to episode-relative (0-based within the episode)
@@ -1759,63 +1794,106 @@ async def start_background_caching(
 
             extractor = StreamingFrameExtractor(repo_id)
 
-            # Get total frame count first (run in thread to avoid blocking)
+            # For TAR files, extract video once and reuse across all batches
+            # This avoids re-extracting the video from the TAR archive for every batch
+            local_path = await asyncio.to_thread(extractor.download_file, file_path)
+            tar_video_path = None
+            if local_path.suffix.lower() == '.tar':
+                tar_video_path = await asyncio.to_thread(
+                    extractor.extract_video_from_tar_once, local_path
+                )
+                logger.info(f"Pre-extracted video from TAR: {tar_video_path}")
+
+            # Get total frame count (uses cached download, no re-download)
             total_frames = await asyncio.to_thread(extractor.get_frame_count, file_path)
             _caching_progress[task_key]["total_frames"] = total_frames
             logger.info(f"Background caching {file_path}: {total_frames} total frames")
 
-            # Process in batches to avoid blocking the event loop
-            BATCH_SIZE = 200
+            # Compute stride to avoid caching more frames than needed
+            cache_stride = 1
+            target = _compute_stride_target(total_frames)
+            if total_frames > target:
+                cache_stride = math.ceil(total_frames / target)
+                logger.info(f"Background caching with stride={cache_stride} (target={target})")
+
+            # Pipelined batch processing: extract batch N+1 while encoding batch N
+            # Larger batch size reduces overhead from task switching
+            BATCH_SIZE = 500
             all_frames = []
+
+            def extract_batch_raw(start, end):
+                """Extract raw frames from episode (blocking)."""
+                if tar_video_path:
+                    # Use pre-extracted video path instead of re-extracting from TAR
+                    return list(extractor.extract_frames_from_video(
+                        tar_video_path, start, end, cache_stride
+                    ))
+                else:
+                    return list(extractor.extract_frames(
+                        file_path, start=start, end=end, stream=stream,
+                        force_full_extraction=True, stride=cache_stride
+                    ))
+
+            def encode_batch(raw_frames):
+                """Encode raw frames to base64 WebP in parallel (blocking)."""
+                if not raw_frames:
+                    return []
+
+                def encode_single(frame_data):
+                    frame_idx, timestamp, image = frame_data
+                    image_base64 = encode_image_with_options(image, resolution, quality)
+                    return {
+                        "frame_idx": frame_idx,
+                        "timestamp": timestamp,
+                        "image_base64": image_base64,
+                        "action": None,
+                    }
+
+                futures = [_ENCODE_EXECUTOR.submit(encode_single, f) for f in raw_frames]
+                return [future.result() for future in futures]
+
+            # Pipeline: extract batch N+1 while encoding batch N
+            prev_encode_task = None
 
             for batch_start in range(0, total_frames, BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, total_frames)
 
-                # Define batch extraction function with parallel encoding
-                def extract_batch(start, end):
-                    # First extract all raw frames
-                    raw_frames = list(extractor.extract_frames(
-                        file_path, start=start, end=end, stream=stream,
-                        force_full_extraction=True
-                    ))
+                # Extract current batch in thread pool
+                raw_frames = await asyncio.to_thread(extract_batch_raw, batch_start, batch_end)
 
-                    if not raw_frames:
-                        return []
+                # Wait for previous encode task to finish and collect results
+                if prev_encode_task:
+                    all_frames.extend(await prev_encode_task)
 
-                    # Encode frames in parallel using thread pool
-                    def encode_single_frame(frame_data):
-                        frame_idx, timestamp, image = frame_data
-                        image_base64 = encode_image_with_options(image, resolution, quality)
-                        return {
-                            "frame_idx": frame_idx,
-                            "timestamp": timestamp,
-                            "image_base64": image_base64,
-                            "action": None,
-                        }
-
-                    # Submit all encoding tasks in parallel
-                    futures = [_ENCODE_EXECUTOR.submit(encode_single_frame, f) for f in raw_frames]
-
-                    # Collect results in order
-                    batch_frames = [future.result() for future in futures]
-                    return batch_frames
-
-                # Run batch extraction in thread pool
-                batch_frames = await asyncio.to_thread(extract_batch, batch_start, batch_end)
-                all_frames.extend(batch_frames)
+                # Start encoding this batch in background while we extract the next
+                prev_encode_task = asyncio.create_task(
+                    asyncio.to_thread(encode_batch, raw_frames)
+                )
 
                 # Update progress
-                progress = int((len(all_frames) / total_frames) * 100) if total_frames > 0 else 0
+                progress = int((batch_start / total_frames) * 100) if total_frames > 0 else 0
                 _caching_progress[task_key]["progress"] = min(progress, 99)
 
                 # Yield control to event loop between batches
                 await asyncio.sleep(0)
 
-            # Store as full episode
+            # Collect final batch
+            if prev_encode_task:
+                all_frames.extend(await prev_encode_task)
+
+            # Clean up pre-extracted TAR video temp file
+            if tar_video_path:
+                try:
+                    tar_video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            # Store as full episode — use original total_frames (not strided count)
+            # so the frontend knows the true episode length for timeline/playback
             cache.store_episode_frames(
                 episode_key,
                 all_frames,
-                len(all_frames),
+                total_frames,
                 {
                     "dataset_id": effective_dataset_id,
                     "episode_id": file_path,
@@ -1833,6 +1911,12 @@ async def start_background_caching(
         except Exception as e:
             logger.error(f"Background caching failed for {file_path}: {e}")
             _caching_progress[task_key] = {"progress": 0, "status": "error", "error": str(e)}
+            # Clean up TAR video temp file on error too
+            if tar_video_path:
+                try:
+                    tar_video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     # Start the background task
     task = asyncio.create_task(cache_full_episode())

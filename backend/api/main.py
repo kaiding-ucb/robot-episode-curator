@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.routes import datasets, episodes, downloads, quality, compare, analysis
+from loaders.streaming_extractor import cleanup_all_decoded_frames
 
 # Configure logging
 logging.basicConfig(
@@ -121,6 +122,15 @@ async def general_exception_handler(request, exc):
         content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
         headers=cors_headers,
     )
+
+
+@app.on_event("startup")
+async def startup_cleanup():
+    """Clean up stale decoded frame pickle files from previous sessions."""
+    result = cleanup_all_decoded_frames()
+    if result["files_deleted"] > 0:
+        mb_freed = result["bytes_freed"] / (1024 * 1024)
+        logger.info(f"Startup cleanup: removed {result['files_deleted']} decoded frame files ({mb_freed:.1f} MB)")
 
 
 # Store data root in app state for access by routes

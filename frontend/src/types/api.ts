@@ -60,6 +60,7 @@ export interface Frame {
   index: number;
   timestamp?: number;
   image: string; // base64 encoded
+  blobUrl?: string; // Object URL for fast rendering (avoids base64 re-parsing)
   action?: number[];
 }
 

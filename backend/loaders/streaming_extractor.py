@@ -169,6 +169,13 @@ def _save_persistent_frame_cache(repo_id: str, episode_path: str, frames: List) 
         logger.info(f"Skipping persistent cache save - too many frames ({len(frames)}): {episode_path}")
         return False
 
+    # Size guard: estimate raw numpy size and reject if too large
+    if frames and hasattr(frames[0][2], 'nbytes'):
+        estimated_mb = (frames[0][2].nbytes * len(frames)) / (1024 * 1024)
+        if estimated_mb > 200:
+            logger.info(f"Skipping persistent cache save - estimated {estimated_mb:.0f}MB exceeds 200MB limit: {episode_path}")
+            return False
+
     cache_path = _get_frame_cache_path(repo_id, episode_path)
     try:
         with open(cache_path, 'wb') as f:
@@ -196,7 +203,7 @@ def cleanup_decoded_frames(repo_id: str, episode_path: str, stream: str = "rgb")
     Returns:
         True if cleanup was successful or file didn't exist
     """
-    cache_key = f"{episode_path}:{stream}" if stream != "rgb" else episode_path
+    cache_key = f"{episode_path}:{stream}"
     cache_path = _get_frame_cache_path(repo_id, cache_key)
 
     if cache_path.exists():
@@ -351,7 +358,8 @@ class StreamingFrameExtractor:
         episode_path: str = None,
         stream: str = "rgb",
         depth_colormap: str = "viridis",
-        force_full_extraction: bool = False
+        force_full_extraction: bool = False,
+        stride: int = 1,
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an MCAP file.
@@ -445,6 +453,7 @@ class StreamingFrameExtractor:
             frames = []
             h264_data = []
             timestamps = []
+            _frame_counter = 0  # Track raw frame index for stride filtering
 
             def matches_topic_patterns(topic: str, patterns: List[str]) -> bool:
                 """Check if topic matches any of the patterns."""
@@ -480,6 +489,11 @@ class StreamingFrameExtractor:
                                 h264_data.append(img_data)
                                 timestamps.append(timestamp)
                             elif 'jpeg' in img_format or 'jpg' in img_format or 'png' in img_format:
+                                # Apply stride: skip non-stride frames (cheap — no decode)
+                                if stride > 1 and _frame_counter % stride != 0:
+                                    _frame_counter += 1
+                                    continue
+                                _frame_counter += 1
                                 # Direct decode for JPEG/PNG
                                 import cv2
                                 nparr = np.frombuffer(img_data, np.uint8)
@@ -494,11 +508,17 @@ class StreamingFrameExtractor:
                                         # RGB: Convert BGR to RGB
                                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                                     frames.append((len(frames), timestamp, image))
-                                    # Early termination for JPEG - stop when we have enough frames
-                                    if len(frames) >= end:
-                                        logger.info(f"Reached requested frame limit ({end}), stopping extraction")
+                                    # Early termination — stop when we have enough strided frames
+                                    target_count = end if stride <= 1 else math.ceil(end / stride)
+                                    if len(frames) >= target_count:
+                                        logger.info(f"Reached strided frame limit ({target_count}), stopping extraction")
                                         break
                             elif img_format in ['16uc1', 'mono16', '16uc', 'depth']:
+                                # Apply stride for depth too
+                                if stride > 1 and _frame_counter % stride != 0:
+                                    _frame_counter += 1
+                                    continue
+                                _frame_counter += 1
                                 # Raw 16-bit depth data
                                 import cv2
                                 depth_array = np.frombuffer(img_data, dtype=np.uint16)
@@ -511,9 +531,9 @@ class StreamingFrameExtractor:
                                 if len(depth_array.shape) == 2:
                                     image = colorize_depth(depth_array, depth_colormap)
                                     frames.append((len(frames), timestamp, image))
-                                    # Early termination for depth - stop when we have enough frames
-                                    if len(frames) >= end:
-                                        logger.info(f"Reached requested frame limit ({end}), stopping extraction")
+                                    target_count = end if stride <= 1 else math.ceil(end / stride)
+                                    if len(frames) >= target_count:
+                                        logger.info(f"Reached strided frame limit ({target_count}), stopping extraction")
                                         break
 
                     # Check if we have enough frames (handles break from inner conditions)
@@ -539,6 +559,11 @@ class StreamingFrameExtractor:
                 if len(frames) < len(h264_data):
                     logger.warning(f"Incomplete decode: expected ~{len(h264_data)} frames, got {len(frames)} frames")
 
+                # Apply stride to H.264 decoded frames (H.264 must decode all, but only cache strided subset)
+                if stride > 1:
+                    frames = frames[::stride]
+                    logger.info(f"Applied stride={stride} to H.264 frames: {len(frames)} frames after filtering")
+
                 # Cache the decoded frames for future requests (both in-memory and persistent)
                 if frames:
                     # Limit in-memory cache to prevent memory explosion
@@ -548,10 +573,6 @@ class StreamingFrameExtractor:
                     _update_frame_cache_access(cache_key)
                     _evict_frame_cache_if_needed()
                     logger.info(f"Cached {len(frames_to_cache)} of {len(frames)} frames in memory for {file_path}:{stream}")
-
-                    # Save to persistent cache for future sessions
-                    if persistent_cache_key:
-                        _save_persistent_frame_cache(self.repo_id, persistent_cache_key, frames)
 
             # Return requested range
             if frames:
@@ -805,6 +826,37 @@ class StreamingFrameExtractor:
             logger.error(f"PyAV fallback failed for {file_path}: {e}")
             return []
 
+    def extract_video_from_tar_once(self, file_path: Path) -> Path:
+        """
+        Extract the video file from a TAR archive to a temp file.
+
+        Returns the path to the extracted video file. Caller is responsible
+        for cleaning up the temp file when done.
+
+        This avoids re-extracting the video from the TAR for every batch
+        during background caching (significant speedup for large episodes).
+        """
+        import tarfile
+
+        with tarfile.open(file_path, 'r') as tar:
+            video_member = None
+            for member in tar.getmembers():
+                if member.name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    video_member = member
+                    break
+
+            if video_member is None:
+                raise ValueError(f"No video file found in TAR: {file_path}")
+
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=Path(video_member.name).suffix, delete=False
+            )
+            video_file = tar.extractfile(video_member)
+            if video_file:
+                tmp.write(video_file.read())
+            tmp.close()
+            return Path(tmp.name)
+
     def extract_frames_from_tar(
         self,
         file_path: Path,
@@ -866,7 +918,8 @@ class StreamingFrameExtractor:
         end: int = 10,
         stream: str = "rgb",
         depth_colormap: str = "viridis",
-        force_full_extraction: bool = False
+        force_full_extraction: bool = False,
+        stride: int = 1,
     ) -> List[Tuple[int, float, np.ndarray]]:
         """
         Extract frames from an episode file (auto-detects format).
@@ -881,6 +934,7 @@ class StreamingFrameExtractor:
             stream: Which stream to extract: "rgb" or "depth"
             depth_colormap: Colormap for depth visualization
             force_full_extraction: If True, bypass partial cache returns (for background caching)
+            stride: Extract every Nth frame (1 = all frames)
 
         Returns:
             List of (frame_idx, timestamp, image_array) tuples
@@ -897,12 +951,13 @@ class StreamingFrameExtractor:
                 episode_path=episode_path,
                 stream=stream,
                 depth_colormap=depth_colormap,
-                force_full_extraction=force_full_extraction
+                force_full_extraction=force_full_extraction,
+                stride=stride,
             )
         elif suffix == '.tar':
-            return self.extract_frames_from_tar(local_path, start, end)
+            return self.extract_frames_from_tar(local_path, start, end, stride)
         elif suffix in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
-            return self.extract_frames_from_video(local_path, start, end)
+            return self.extract_frames_from_video(local_path, start, end, stride)
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
 
@@ -1504,11 +1559,10 @@ class StreamingFrameExtractor:
                 local_path, start, end,
                 episode_path=episode_path,
                 stream=stream,
-                depth_colormap=depth_colormap
+                depth_colormap=depth_colormap,
+                stride=stride,
             )
-            # MCAP extractor doesn't support stride param; apply post-hoc
-            if stride > 1:
-                frames = [f for i, f in enumerate(frames) if i % stride == 0]
+            # Stride applied during extraction — no post-hoc filtering needed
         elif suffix == '.tar':
             frames = self.extract_frames_from_tar(local_path, start, end, stride)
         elif suffix in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
