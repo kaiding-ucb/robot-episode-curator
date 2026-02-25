@@ -198,11 +198,12 @@ export default function EpisodeViewer({
     batchStart + batchSize,
     {
       ...streamingOptions,
-      // Only start SSE when user has clicked Play AND episode is confirmed cached or doesn't need caching.
-      // This prevents triggering a multi-minute download just by browsing episodes.
-      // Whitelist approach avoids race conditions with null/transient states.
-      enabled: playRequested && initialStatusChecked && !isActivelyCaching &&
-        (cachingStatus.status === "cached" || cachingStatus.status === "not_applicable"),
+      // Only start SSE when user has clicked Play AND no background caching is actively running.
+      // This prevents triggering a multi-minute download just by browsing episodes,
+      // and avoids double downloads (SSE + background caching simultaneously).
+      // When caching completes ("cached") or fails ("error"/"not_cached"), SSE starts
+      // and the stream_frames endpoint handles cache-first logic independently.
+      enabled: playRequested && initialStatusChecked && !isActivelyCaching,
     }
   );
 

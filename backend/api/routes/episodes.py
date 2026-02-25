@@ -1865,6 +1865,13 @@ async def start_background_caching(
     if not is_streaming:
         return CachingStatusResponse(status="not_applicable", error="Only streaming episodes need caching")
 
+    # LeRobot episodes (episode_N format) need special resolution via the SSE endpoint
+    # (resolve_lerobot_episode finds the correct video chunk path). The generic
+    # StreamingFrameExtractor can't handle them, so skip background caching and let
+    # the SSE stream_frames endpoint handle them directly.
+    if _is_lerobot_episode_id(episode_id):
+        return CachingStatusResponse(status="not_applicable")
+
     cache = get_encoded_frame_cache()
     effective_dataset_id = dataset_id or repo_id.replace("/", "_")
     cache_key_suffix = f":{stream}" if stream != "rgb" else ""
@@ -2054,6 +2061,24 @@ async def get_caching_status(
     is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
 
     if not is_streaming:
+        return CachingStatusResponse(status="not_applicable")
+
+    # LeRobot episodes use direct SSE streaming, not background caching
+    if _is_lerobot_episode_id(episode_id):
+        # Still check if frames happen to be cached (from SSE streaming)
+        cache = get_encoded_frame_cache()
+        effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+        cache_key_suffix = f":{stream}" if stream != "rgb" else ""
+        episode_key = cache.get_episode_cache_key(
+            effective_dataset_id, episode_id + cache_key_suffix, resolution, quality
+        )
+        cached = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+        if cached and cached.get("full_episode"):
+            return CachingStatusResponse(
+                status="cached",
+                progress=100,
+                total_frames=cached.get("total", len(cached.get("frames", [])))
+            )
         return CachingStatusResponse(status="not_applicable")
 
     cache = get_encoded_frame_cache()
