@@ -37,6 +37,7 @@ export default function Home() {
   const [showDatasetQuality, setShowDatasetQuality] = useState(false);
   const [showCompare, setShowCompare] = useState(false);
   const [showDatasetAnalysis, setShowDatasetAnalysis] = useState(false);
+  const [navigatedFromAnalysis, setNavigatedFromAnalysis] = useState(false);
 
   const handleSelectEpisode = (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => {
     setSelectedDataset(datasetId);
@@ -69,6 +70,22 @@ export default function Home() {
         onFrameChange={() => setTargetFrame(null)}
         availableModalities={selectedModalities}
       />
+      {/* Floating "Back to Analysis" pill — shown after navigating from analysis modal */}
+      {navigatedFromAnalysis && !showDatasetAnalysis && (
+        <button
+          onClick={() => {
+            setShowDatasetAnalysis(true);
+            setNavigatedFromAnalysis(false);
+          }}
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-full shadow-lg transition-colors"
+          data-testid="back-to-analysis-btn"
+        >
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+          </svg>
+          Back to Analysis
+        </button>
+      )}
       <Modals
         showDataManager={showDataManager}
         showDatasetQuality={showDatasetQuality}
@@ -78,7 +95,16 @@ export default function Home() {
         onCloseDataManager={() => setShowDataManager(false)}
         onCloseDatasetQuality={() => setShowDatasetQuality(false)}
         onCloseCompare={() => setShowCompare(false)}
-        onCloseDatasetAnalysis={() => setShowDatasetAnalysis(false)}
+        onCloseDatasetAnalysis={() => {
+          setShowDatasetAnalysis(false);
+          setNavigatedFromAnalysis(false);
+        }}
+        onNavigateToEpisode={(datasetId, episodeId, numFrames, targetFrameIdx) => {
+          handleSelectEpisode(datasetId, episodeId, numFrames);
+          if (targetFrameIdx != null) setTargetFrame(targetFrameIdx);
+          setShowDatasetAnalysis(false);
+          setNavigatedFromAnalysis(true);
+        }}
       />
     </div>
   );

@@ -8,6 +8,7 @@ interface SignalComparisonChartProps {
   datasetId: string | null;
   firstFrames?: Map<string, string>;
   knownEpisodes?: EpisodeStub[];
+  onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number, targetFrame?: number) => void;
 }
 
 function getEpisodeLabel(episodeId: string): string {
@@ -399,6 +400,59 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSigna
   );
 }
 
+// Detect contiguous high-variance regions from envelope std array
+interface HotZone {
+  start: number;
+  end: number;
+  peakVariance: number;
+}
+
+function detectHotZones(std: number[]): HotZone[] {
+  if (std.length < 20) return [];
+
+  // Normalize std relative to max
+  const maxStd = Math.max(...std);
+  if (maxStd < 1e-10) return [];
+  const normalized = std.map((s) => s / maxStd);
+
+  // Find threshold: top 30th percentile
+  const sorted = [...normalized].sort((a, b) => a - b);
+  const threshold = sorted[Math.floor(sorted.length * 0.7)];
+
+  // Find contiguous segments above threshold
+  const segments: HotZone[] = [];
+  let segStart = -1;
+  let segPeak = 0;
+  for (let i = 0; i < normalized.length; i++) {
+    if (normalized[i] >= threshold) {
+      if (segStart < 0) segStart = i;
+      segPeak = Math.max(segPeak, normalized[i]);
+    } else if (segStart >= 0) {
+      segments.push({ start: segStart, end: i - 1, peakVariance: segPeak });
+      segStart = -1;
+      segPeak = 0;
+    }
+  }
+  if (segStart >= 0) {
+    segments.push({ start: segStart, end: normalized.length - 1, peakVariance: segPeak });
+  }
+
+  // Merge segments with gap < 5
+  const merged: HotZone[] = [];
+  for (const seg of segments) {
+    const last = merged[merged.length - 1];
+    if (last && seg.start - last.end < 5) {
+      last.end = seg.end;
+      last.peakVariance = Math.max(last.peakVariance, seg.peakVariance);
+    } else {
+      merged.push({ ...seg });
+    }
+  }
+
+  // Filter out short segments (< 10 indices)
+  return merged.filter((s) => s.end - s.start >= 10);
+}
+
 // Overlay panel: all episodes on one chart, each a different color
 // Uses batch normalization so all traces share the same scale
 // Renders a mean ± 2std shaded envelope to highlight outliers
@@ -406,33 +460,46 @@ function OverlayPanel({
   title,
   traces,
   batchRange,
+  onInspect,
 }: {
   title: string;
   traces: { label: string; data: number[]; color: string }[];
   batchRange: { min: number; max: number };
+  onInspect?: (resampledIndex: number) => void;
 }) {
   const validTraces = traces.filter((t) => t.data.length > 0);
 
-  // Compute envelope, outlier info, and band quality metrics
-  const { envelope, outliers, bandMetrics } = useMemo(() => {
-    if (validTraces.length < 2) return { envelope: null, outliers: [], bandMetrics: null };
+  // Compute envelope, outlier info, band quality metrics, and hot zones
+  const { envelope, outliers, bandMetrics, hotZones, resampled } = useMemo(() => {
+    if (validTraces.length < 2) return { envelope: null, outliers: [], bandMetrics: null, hotZones: [], resampled: [] };
 
     // Resample raw data to common length
     const resampled = validTraces.map((t) => resampleToLength(t.data, RESAMPLE_LEN));
     const env = computeEnvelope(resampled);
 
     // Find outlier episodes (>5% of timesteps outside band)
-    const outliers: { label: string; pct: number }[] = [];
+    const outliers: { label: string; pct: number; maxDeviationIdx: number }[] = [];
     for (let i = 0; i < resampled.length; i++) {
       const frac = computeOutlierFraction(resampled[i], env.upper, env.lower);
       if (frac > 0.05) {
-        outliers.push({ label: validTraces[i].label, pct: Math.round(frac * 100) });
+        // Find index of maximum deviation from mean
+        let maxDev = 0;
+        let maxDevIdx = 0;
+        for (let j = 0; j < resampled[i].length; j++) {
+          const dev = Math.abs(resampled[i][j] - env.mean[j]);
+          if (dev > maxDev) {
+            maxDev = dev;
+            maxDevIdx = j;
+          }
+        }
+        outliers.push({ label: validTraces[i].label, pct: Math.round(frac * 100), maxDeviationIdx: maxDevIdx });
       }
     }
 
     const bandMetrics = computeBandMetrics(env, batchRange);
+    const hotZones = detectHotZones(env.std);
 
-    return { envelope: env, outliers, bandMetrics };
+    return { envelope: env, outliers, bandMetrics, hotZones, resampled };
   }, [validTraces, batchRange]);
 
   if (validTraces.length === 0) {
@@ -518,7 +585,8 @@ function OverlayPanel({
           {outliers.map((o) => (
             <div
               key={o.label}
-              className="text-[10px] text-amber-500 dark:text-amber-400 font-mono"
+              className={`text-[10px] text-amber-500 dark:text-amber-400 font-mono ${onInspect ? "cursor-pointer hover:underline" : ""}`}
+              onClick={onInspect ? () => onInspect(o.maxDeviationIdx) : undefined}
             >
               {o.label}: outlier ({o.pct}% outside band)
             </div>
@@ -559,13 +627,19 @@ function OverlayPanel({
           />
         )}
       </svg>
-      {/* Sigma profile bar */}
+      {/* Sigma profile bar with hot zone overlays */}
       {envelopeRender?.sigmaBar && (
         <svg
           viewBox={`0 0 ${w} 20`}
-          className="w-full bg-gray-100 dark:bg-gray-700 rounded-b"
+          className={`w-full bg-gray-100 dark:bg-gray-700 rounded-b ${onInspect ? "cursor-crosshair" : ""}`}
           style={{ height: 20 }}
           preserveAspectRatio="none"
+          onClick={onInspect ? (e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const idx = Math.round((x / rect.width) * (RESAMPLE_LEN - 1));
+            onInspect(Math.max(0, Math.min(RESAMPLE_LEN - 1, idx)));
+          } : undefined}
         >
           {envelopeRender.sigmaBar.map((normSigma, i) => {
             const barX = (i / RESAMPLE_LEN) * w;
@@ -580,6 +654,28 @@ function OverlayPanel({
                 height={barH}
                 fill={envelopeRender.segColors[i]}
                 opacity="0.7"
+              />
+            );
+          })}
+          {/* Hot zone overlays */}
+          {hotZones.map((zone, i) => {
+            const x1 = (zone.start / RESAMPLE_LEN) * w;
+            const x2 = ((zone.end + 1) / RESAMPLE_LEN) * w;
+            return (
+              <rect
+                key={`hz-${i}`}
+                x={x1}
+                y={0}
+                width={x2 - x1}
+                height={20}
+                fill="#ef4444"
+                opacity={0.2 + zone.peakVariance * 0.15}
+                className="cursor-pointer"
+                onClick={onInspect ? (e) => {
+                  e.stopPropagation();
+                  const mid = Math.round((zone.start + zone.end) / 2);
+                  onInspect(mid);
+                } : undefined}
               />
             );
           })}
@@ -793,11 +889,195 @@ function StartingPositionGrid({
   );
 }
 
+// Frame Comparison Strip — shows thumbnails from all episodes at a given resampled index
+const FRAME_AT_API = `${API_BASE}/episodes`;
+
+function FrameComparisonStrip({
+  resampledIndex,
+  episodes,
+  episodeList,
+  datasetId,
+  traceColors,
+  onNavigate,
+  onClose,
+  onIndexChange,
+}: {
+  resampledIndex: number;
+  episodes: Map<string, EpisodeSignalData>;
+  episodeList: [string, EpisodeSignalData][];
+  datasetId: string | null;
+  traceColors: Map<string, string>;
+  onNavigate: (episodeId: string, frameNumber: number) => void;
+  onClose: () => void;
+  onIndexChange: (newIndex: number) => void;
+}) {
+  const [thumbnails, setThumbnails] = useState<Map<string, { image: string; frameIdx: number } | null>>(new Map());
+  const [loading, setLoading] = useState<Set<string>>(new Set());
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+
+  // Keyboard scrubbing
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      const step = e.shiftKey ? 15 : 3;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        onIndexChange(Math.max(0, resampledIndex - step));
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        onIndexChange(Math.min(RESAMPLE_LEN - 1, resampledIndex + step));
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [resampledIndex, onClose, onIndexChange]);
+
+  // Debounced fetch of thumbnails for all episodes at the current index
+  useEffect(() => {
+    if (!datasetId) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    abortRef.current?.abort();
+
+    debounceRef.current = setTimeout(() => {
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      const fetchAll = async () => {
+        const newLoading = new Set<string>();
+        const newThumbnails = new Map(thumbnails);
+
+        for (const [epId, epData] of episodeList) {
+          const totalFrames = epData.total_frames ?? epData.actions?.actions?.length ?? 0;
+          if (totalFrames === 0) continue;
+          const frameIdx = Math.round((resampledIndex / (RESAMPLE_LEN - 1)) * Math.max(0, totalFrames - 1));
+          newLoading.add(epId);
+
+          // Resolve episode ID for the main viewer
+          const viewerEpId = epData.global_episode_index != null
+            ? `episode_${epData.global_episode_index}`
+            : epId;
+
+          try {
+            const res = await fetch(
+              `${FRAME_AT_API}/${encodeURIComponent(viewerEpId)}/frame-at?frame_index=${frameIdx}&dataset_id=${encodeURIComponent(datasetId)}&resolution=low&quality=70`,
+              { signal: controller.signal }
+            );
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data.image_base64) {
+              newThumbnails.set(epId, { image: data.image_base64, frameIdx });
+            }
+          } catch (err: unknown) {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+          }
+          newLoading.delete(epId);
+        }
+
+        if (!controller.signal.aborted) {
+          setThumbnails(new Map(newThumbnails));
+          setLoading(new Set());
+        }
+      };
+
+      setLoading(new Set(episodeList.map(([id]) => id)));
+      fetchAll();
+    }, 300);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      abortRef.current?.abort();
+    };
+  }, [resampledIndex, datasetId, episodeList]);
+
+  const progressPct = ((resampledIndex / (RESAMPLE_LEN - 1)) * 100).toFixed(0);
+
+  return (
+    <div
+      ref={stripRef}
+      className="mt-3 p-3 bg-gray-50 dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700"
+      data-testid="frame-comparison-strip"
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs font-medium text-gray-500">
+          Frame Comparison — position {progressPct}%
+          <span className="text-[10px] text-gray-400 ml-2">(Arrow keys to scrub, Shift for large jumps, Esc to close)</span>
+        </div>
+        <button
+          onClick={onClose}
+          className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-xs"
+        >
+          Close
+        </button>
+      </div>
+      <div className="grid grid-cols-5 gap-2">
+        {episodeList.map(([epId, epData]) => {
+          const totalFrames = epData.total_frames ?? epData.actions?.actions?.length ?? 0;
+          const frameIdx = totalFrames > 0 ? Math.round((resampledIndex / (RESAMPLE_LEN - 1)) * Math.max(0, totalFrames - 1)) : 0;
+          const thumb = thumbnails.get(epId);
+          const isLoading = loading.has(epId);
+          const color = traceColors.get(epId) || "#6b7280";
+
+          return (
+            <div
+              key={epId}
+              className="relative rounded overflow-hidden"
+              style={{ borderLeft: `3px solid ${color}` }}
+            >
+              <div className="aspect-video bg-gray-200 dark:bg-gray-700">
+                {isLoading ? (
+                  <div className="w-full h-full flex items-center justify-center animate-pulse">
+                    <svg className="animate-spin h-4 w-4 text-gray-400" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                  </div>
+                ) : thumb ? (
+                  <img
+                    src={`data:image/${thumb.image.startsWith("/9j/") ? "jpeg" : "webp"};base64,${thumb.image}`}
+                    alt={getEpisodeLabel(epId)}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center">
+                    <span className="text-[10px] text-gray-400">No frame</span>
+                  </div>
+                )}
+              </div>
+              <div className="bg-black/60 px-1.5 py-1 flex items-center justify-between">
+                <div>
+                  <div className="text-[10px] text-white font-mono truncate">
+                    {getEpisodeLabel(epId)}
+                  </div>
+                  <div className="text-[9px] text-gray-300">
+                    frame {frameIdx}{totalFrames > 0 ? ` / ${totalFrames}` : ""}
+                  </div>
+                </div>
+                <button
+                  onClick={() => onNavigate(epId, frameIdx)}
+                  className="text-[10px] bg-blue-500 hover:bg-blue-600 text-white px-1.5 py-0.5 rounded transition-colors"
+                >
+                  View
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function SignalComparisonChart({
   episodes,
   datasetId,
   firstFrames: sseFirstFrames,
   knownEpisodes,
+  onNavigateToEpisode,
 }: SignalComparisonChartProps) {
   const episodeList = useMemo(() => {
     return Array.from(episodes.entries()).sort(
@@ -816,6 +1096,8 @@ export default function SignalComparisonChart({
     }
     return [];
   }, [episodeList, knownEpisodes]);
+
+  const [inspectIndex, setInspectIndex] = useState<number | null>(null);
 
   const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId, sseFirstFrames);
 
@@ -888,6 +1170,27 @@ export default function SignalComparisonChart({
     return { positionTraces, rotationTraces, accelTraces, gyroTraces };
   }, [episodeList, precomputed]);
 
+  // Build episode-id → color map for the frame comparison strip
+  const traceColors = useMemo(() => {
+    const map = new Map<string, string>();
+    episodeList.forEach(([id], i) => {
+      map.set(id, EPISODE_COLORS[i % EPISODE_COLORS.length]);
+    });
+    return map;
+  }, [episodeList]);
+
+  // Handle navigate from frame comparison strip
+  const handleStripNavigate = useCallback((episodeId: string, frameNumber: number) => {
+    if (!onNavigateToEpisode || !datasetId) return;
+    const epData = episodes.get(episodeId);
+    const totalFrames = epData?.total_frames ?? epData?.actions?.actions?.length ?? 0;
+    // Resolve to viewer episode ID
+    const viewerEpId = epData?.global_episode_index != null
+      ? `episode_${epData.global_episode_index}`
+      : episodeId;
+    onNavigateToEpisode(datasetId, viewerEpId, totalFrames, frameNumber);
+  }, [onNavigateToEpisode, datasetId, episodes]);
+
   if (episodeList.length === 0 && gridEpisodeIds.length === 0) {
     return null;
   }
@@ -924,11 +1227,25 @@ export default function SignalComparisonChart({
               ))}
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <OverlayPanel title="Position Magnitude (x,y,z)" traces={positionTraces} batchRange={batchRanges.position} />
-              <OverlayPanel title="Accelerometer Magnitude" traces={accelTraces} batchRange={batchRanges.accel} />
-              <OverlayPanel title="Rotation Magnitude" traces={rotationTraces} batchRange={batchRanges.rotation} />
-              <OverlayPanel title="Gyroscope Magnitude" traces={gyroTraces} batchRange={batchRanges.gyro} />
+              <OverlayPanel title="Position Magnitude (x,y,z)" traces={positionTraces} batchRange={batchRanges.position} onInspect={setInspectIndex} />
+              <OverlayPanel title="Accelerometer Magnitude" traces={accelTraces} batchRange={batchRanges.accel} onInspect={setInspectIndex} />
+              <OverlayPanel title="Rotation Magnitude" traces={rotationTraces} batchRange={batchRanges.rotation} onInspect={setInspectIndex} />
+              <OverlayPanel title="Gyroscope Magnitude" traces={gyroTraces} batchRange={batchRanges.gyro} onInspect={setInspectIndex} />
             </div>
+
+            {/* Frame Comparison Strip */}
+            {inspectIndex !== null && datasetId && (
+              <FrameComparisonStrip
+                resampledIndex={inspectIndex}
+                episodes={episodes}
+                episodeList={episodeList}
+                datasetId={datasetId}
+                traceColors={traceColors}
+                onNavigate={handleStripNavigate}
+                onClose={() => setInspectIndex(null)}
+                onIndexChange={setInspectIndex}
+              />
+            )}
           </div>
 
           {/* Per-episode section */}

@@ -9,6 +9,7 @@ import SignalComparisonChart from "./SignalComparisonChart";
 interface DatasetAnalysisProps {
   datasetId: string | null;
   onClose: () => void;
+  onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number, targetFrame?: number) => void;
 }
 
 type AnalysisTab = "frame-counts" | "signal-comparison";
@@ -16,6 +17,7 @@ type AnalysisTab = "frame-counts" | "signal-comparison";
 export default function DatasetAnalysis({
   datasetId: initialDatasetId,
   onClose,
+  onNavigateToEpisode,
 }: DatasetAnalysisProps) {
   const [activeTab, setActiveTab] = useState<AnalysisTab>("frame-counts");
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
@@ -325,6 +327,7 @@ export default function DatasetAnalysis({
                 datasetId={datasetId}
                 firstFrames={signalState.firstFrames}
                 knownEpisodes={signalState.knownEpisodes}
+                onNavigateToEpisode={onNavigateToEpisode}
               />
             )}
 

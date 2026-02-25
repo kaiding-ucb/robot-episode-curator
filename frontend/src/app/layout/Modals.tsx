@@ -15,6 +15,7 @@ interface ModalsProps {
   onCloseDatasetQuality: () => void;
   onCloseCompare: () => void;
   onCloseDatasetAnalysis: () => void;
+  onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number, targetFrame?: number) => void;
 }
 
 export default function Modals({
@@ -27,6 +28,7 @@ export default function Modals({
   onCloseDatasetQuality,
   onCloseCompare,
   onCloseDatasetAnalysis,
+  onNavigateToEpisode,
 }: ModalsProps) {
   return (
     <>
@@ -75,22 +77,24 @@ export default function Modals({
         </div>
       )}
 
-      {/* Dataset Analysis Modal */}
-      {showDatasetAnalysis && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div
-            className="absolute inset-0 bg-black/50"
-            onClick={onCloseDatasetAnalysis}
-            data-testid="analysis-modal-backdrop"
+      {/* Dataset Analysis Modal — always mounted, hidden via CSS to preserve state */}
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center"
+        style={{ display: showDatasetAnalysis ? undefined : "none" }}
+      >
+        <div
+          className="absolute inset-0 bg-black/50"
+          onClick={onCloseDatasetAnalysis}
+          data-testid="analysis-modal-backdrop"
+        />
+        <div className="relative w-full max-w-5xl max-h-[85vh] overflow-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl">
+          <DatasetAnalysis
+            datasetId={selectedDataset}
+            onClose={onCloseDatasetAnalysis}
+            onNavigateToEpisode={onNavigateToEpisode}
           />
-          <div className="relative w-full max-w-5xl max-h-[85vh] overflow-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl">
-            <DatasetAnalysis
-              datasetId={selectedDataset}
-              onClose={onCloseDatasetAnalysis}
-            />
-          </div>
         </div>
-      )}
+      </div>
     </>
   );
 }

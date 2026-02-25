@@ -646,6 +646,114 @@ async def get_streaming_frames(
         raise
 
 
+# NOTE: /frame-at route must come BEFORE /frames and the catch-all route
+@router.get("/{episode_id:path}/frame-at")
+async def get_frame_at(
+    episode_id: str,
+    request: Request,
+    dataset_id: Optional[str] = Query(None, description="Dataset ID"),
+    frame_index: Optional[int] = Query(None, ge=0, description="Frame index to extract"),
+    timestamp: Optional[float] = Query(None, ge=0.0, description="Timestamp in seconds"),
+    resolution: str = Query("low", description="Image resolution"),
+    quality: int = Query(70, ge=10, le=100, description="WebP quality"),
+):
+    """
+    Get a single frame at a specific index or timestamp.
+
+    Optimised for the frame comparison strip: checks the encoded-frame cache
+    first, and only falls back to the full /frames endpoint logic when the
+    episode has not been cached yet.
+
+    Priority:
+    1. Cached episode frames (instant)
+    2. Existing /frames endpoint as fallback (full decode + cache)
+    """
+    if frame_index is None and timestamp is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Either frame_index or timestamp must be provided",
+        )
+
+    cache = get_encoded_frame_cache()
+
+    # Determine effective dataset_id
+    is_streaming, repo_id, file_path = is_streaming_episode(episode_id, dataset_id)
+    effective_dataset_id = dataset_id or (repo_id.replace("/", "_") if repo_id else "local")
+
+    # Build cache key matching what /frames and /frames/stream use
+    episode_key = cache.get_episode_cache_key(
+        effective_dataset_id, episode_id, resolution, quality
+    )
+    cached_episode = cache.get_episode_frames(episode_key, effective_dataset_id, episode_id)
+
+    target_idx = frame_index
+
+    if cached_episode:
+        all_frames = cached_episode["frames"]
+        total_frames = cached_episode["total"]
+
+        # Resolve timestamp to frame index if needed
+        if target_idx is None and timestamp is not None and len(all_frames) > 0:
+            # Find closest frame by timestamp
+            best_idx = 0
+            best_diff = float("inf")
+            for i, f in enumerate(all_frames):
+                ts = f.get("timestamp")
+                if ts is not None:
+                    diff = abs(ts - timestamp)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_idx = i
+            target_idx = best_idx
+
+        if target_idx is not None and target_idx < len(all_frames):
+            f = all_frames[target_idx]
+            return {
+                "frame_idx": f["frame_idx"],
+                "timestamp": f.get("timestamp"),
+                "image_base64": f.get("image_base64"),
+                "total_frames": total_frames,
+                "from_cache": True,
+            }
+
+    # Not cached — fall back to the /frames endpoint for a single frame
+    # This will trigger a full decode + cache, but returns the frame we need
+    if target_idx is None:
+        # Estimate frame_index from timestamp: default 30fps
+        target_idx = round(timestamp * 30) if timestamp is not None else 0
+
+    # Delegate to the existing frames endpoint
+    frames_response = await get_frames(
+        episode_id=episode_id,
+        request=request,
+        start=target_idx,
+        end=target_idx + 1,
+        include_actions=False,
+        dataset_id=dataset_id,
+        resolution=resolution,
+        quality=quality,
+        stream="rgb",
+    )
+
+    if frames_response.frames:
+        f = frames_response.frames[0]
+        return {
+            "frame_idx": f.frame_idx,
+            "timestamp": f.timestamp,
+            "image_base64": f.image_base64,
+            "total_frames": frames_response.total_frames,
+            "from_cache": False,
+        }
+
+    return {
+        "frame_idx": target_idx,
+        "timestamp": None,
+        "image_base64": None,
+        "total_frames": frames_response.total_frames,
+        "from_cache": False,
+    }
+
+
 # NOTE: /frames route must come BEFORE the catch-all /{episode_id:path} route
 # to prevent the path converter from matching "frames" as part of the episode ID
 @router.get("/{episode_id:path}/frames", response_model=FramesResponse)
