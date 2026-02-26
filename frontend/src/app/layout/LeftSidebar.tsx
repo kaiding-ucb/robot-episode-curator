@@ -21,9 +21,9 @@ export default function LeftSidebar({
       {/* Header */}
       <div className="p-4 border-b border-gray-200 dark:border-gray-800">
         <h1 className="text-lg font-semibold text-gray-900 dark:text-white">
-          Data Viewer
+          Robot Data Viewer
         </h1>
-        <p className="text-sm text-gray-500">Robotics Dataset Explorer</p>
+        <p className="text-sm text-gray-500">for Huggingface datasets</p>
       </div>
 
       {/* Dataset Browser */}
@@ -35,7 +35,7 @@ export default function LeftSidebar({
       <div className="p-3 border-t border-gray-200 dark:border-gray-800 space-y-2">
         <button
           onClick={onOpenAnalysis}
-          className="w-full px-3 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors flex items-center justify-center gap-2 text-sm"
+          className="w-full px-3 py-2 bg-gray-900 text-white rounded-lg hover:bg-black transition-colors flex items-center justify-center gap-2 text-sm dark:bg-gray-700 dark:hover:bg-gray-600"
           data-testid="open-analysis-btn"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -45,7 +45,7 @@ export default function LeftSidebar({
         </button>
         <button
           onClick={onOpenDataManager}
-          className="w-full px-3 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center justify-center gap-2 text-sm"
+          className="w-full px-3 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors flex items-center justify-center gap-2 text-sm dark:bg-gray-600 dark:hover:bg-gray-500"
           data-testid="open-data-manager-btn"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

@@ -85,8 +85,8 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
         onDatasetAdded={handleDatasetAdded}
       />
 
-      {/* Dataset List */}
-      <div className={`border-b border-gray-200 dark:border-gray-700 ${selectedDataset ? 'max-h-[30%] overflow-auto' : ''}`}>
+      {/* Dataset List - hidden when a dataset is selected to give tasks/episodes full space */}
+      <div className={`border-b border-gray-200 dark:border-gray-700 ${selectedDataset ? 'hidden' : ''}`}>
         <h2 className="px-4 py-2 text-sm font-semibold text-gray-500 uppercase tracking-wider sticky top-0 bg-white dark:bg-gray-900 z-10 flex items-center justify-between">
           <span>Datasets</span>
           <button
@@ -153,22 +153,6 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                       </div>
                     )}
                   </div>
-                  <div className="flex flex-col items-end gap-1 flex-shrink-0">
-                    <span
-                      className={`px-2 py-0.5 text-xs rounded-full ${
-                        dataset.type === "teleop"
-                          ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
-                          : "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
-                      }`}
-                    >
-                      {dataset.type}
-                    </span>
-                    {(dataset.format === "lerobot" || dataset.description?.includes("lerobot/")) && (
-                      <span className="px-2 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
-                        lerobot
-                      </span>
-                    )}
-                  </div>
                 </div>
               </button>
               {/* Remove button - appears on hover */}
@@ -198,18 +182,28 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
       {/* Task List (shown when dataset selected but no task selected) */}
       {selectedDataset && !selectedTask && (
         <div className="flex-1 overflow-auto">
-          <h2 className="px-4 py-2 text-sm font-semibold text-gray-500 uppercase tracking-wider sticky top-0 bg-white dark:bg-gray-900 z-10 flex items-center justify-between">
-            <span>{taskSource === "multi_subdataset" ? "Subdatasets" : "Tasks"} {totalTasks > 0 && `(${hasMoreTasks ? `${tasks.length} of ` : ""}${totalTasks.toLocaleString()})`}</span>
-            {taskSource === "huggingface_api" && (
-              <span className="text-xs font-normal text-blue-500">via HF API</span>
-            )}
-            {taskSource === "adapter" && (
-              <span className="text-xs font-normal text-green-500">via adapter</span>
-            )}
-            {taskSource === "multi_subdataset" && (
-              <span className="text-xs font-normal text-purple-500">multi-dataset</span>
-            )}
-          </h2>
+          <div className="px-4 py-2 sticky top-0 bg-white dark:bg-gray-900 z-10 border-b border-gray-200 dark:border-gray-700">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <button
+                  onClick={() => { setSelectedDataset(null); setSelectedTask(null); onSelectDataset?.(null); }}
+                  className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex-shrink-0"
+                  title="Back to datasets"
+                  data-testid="back-to-datasets"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                  </svg>
+                </button>
+                <span className="text-sm font-semibold text-gray-900 dark:text-white truncate">
+                  {selectedDatasetInfo?.name || selectedDataset}
+                </span>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-1 ml-6">
+              {taskSource === "multi_subdataset" ? "Subdatasets" : "Tasks"}{totalTasks > 0 && ` (${hasMoreTasks ? `${tasks.length} of ` : ""}${totalTasks.toLocaleString()})`}
+            </p>
+          </div>
 
           {totalTasks > 50 && (
             <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
