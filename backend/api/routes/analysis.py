@@ -843,20 +843,22 @@ async def _lerobot_frame_counts_for_task(
     from api.routes.datasets import (
         fetch_lerobot_episodes_meta,
         fetch_lerobot_tasks_meta,
-        fetch_lerobot_episode_task_map,
+        get_episode_task_map,
         fetch_lerobot_info,
     )
     import re
 
-    # Fetch all metadata in parallel (saves ~1.5-3s vs sequential)
-    episodes_df, tasks_df, info, ep_task_map = await asyncio.gather(
+    # Fetch metadata in parallel (no datasets-server calls needed)
+    episodes_df, tasks_df, info = await asyncio.gather(
         fetch_lerobot_episodes_meta(repo_id),
         fetch_lerobot_tasks_meta(repo_id),
         fetch_lerobot_info(repo_id),
-        fetch_lerobot_episode_task_map(repo_id),
     )
     if episodes_df is None or tasks_df is None:
         return None
+
+    # Get episode→task map using full resolution chain (meta parquet → data parquet → API)
+    ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
 
     # Resolve task_name to task_index
     task_col = "task_description"
@@ -1211,22 +1213,24 @@ async def get_signals_comparison(
                 # Get task's episode indices and metadata
                 from api.routes.datasets import (
                     fetch_lerobot_tasks_meta,
-                    fetch_lerobot_episode_task_map,
+                    derive_episode_task_map_from_meta,
                     fetch_lerobot_episodes_meta,
                     fetch_lerobot_info,
                     detect_lerobot_data_branch,
                 )
                 import re as _re
 
-                # Fetch all metadata in parallel (saves ~2-4s vs sequential)
-                info, tasks_df, ep_task_map, episodes_meta_df, _data_branch = await asyncio.gather(
+                # Fetch metadata in parallel (no datasets-server calls needed)
+                info, tasks_df, episodes_meta_df, _data_branch = await asyncio.gather(
                     fetch_lerobot_info(repo_id),
                     fetch_lerobot_tasks_meta(repo_id),
-                    fetch_lerobot_episode_task_map(repo_id),
                     fetch_lerobot_episodes_meta(repo_id),
                     detect_lerobot_data_branch(repo_id),
                 )
                 data_branch = _data_branch or "main"
+
+                # Derive episode→task map synchronously from already-fetched episodes_df
+                ep_task_map = derive_episode_task_map_from_meta(episodes_meta_df)
 
                 task_ep_indices = None
                 task_index = 0  # Default to task 0

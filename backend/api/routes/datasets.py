@@ -128,6 +128,41 @@ _LEROBOT_TASKS_CACHE: Dict[str, Tuple[pd.DataFrame, datetime]] = {}
 _LEROBOT_DATA_BRANCH_CACHE: Dict[str, Optional[str]] = {}
 LEROBOT_CACHE_TTL_HOURS = 24
 
+# Persistent disk cache for LeRobot metadata (survives server restarts)
+_METADATA_CACHE_DIR = Path.home() / ".cache" / "data_viewer" / "metadata"
+_METADATA_DISK_CACHE_TTL_HOURS = 48
+
+
+def _metadata_disk_path(repo_id: str, kind: str, path_prefix: str = "") -> Path:
+    """Build disk cache path for a metadata item."""
+    safe_repo = repo_id.replace("/", "__")
+    suffix = f"__{path_prefix.replace('/', '__')}" if path_prefix else ""
+    return _METADATA_CACHE_DIR / f"{safe_repo}{suffix}__{kind}.json"
+
+
+def _read_disk_cache(path: Path, ttl_hours: int = _METADATA_DISK_CACHE_TTL_HOURS) -> Optional[Any]:
+    """Read a JSON-serialisable value from disk cache if fresh."""
+    if not path.exists():
+        return None
+    try:
+        age = datetime.utcnow() - datetime.utcfromtimestamp(path.stat().st_mtime)
+        if age > timedelta(hours=ttl_hours):
+            return None
+        import json as _json
+        return _json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _write_disk_cache(path: Path, data: Any) -> None:
+    """Write a JSON-serialisable value to disk cache."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        path.write_text(_json.dumps(data))
+    except Exception:
+        pass
+
 
 def _get_hf_headers() -> dict:
     """Get HuggingFace auth headers if token is available."""
@@ -157,6 +192,13 @@ async def fetch_lerobot_info(repo_id: str, path_prefix: str = "") -> Optional[di
         if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
             return cached
 
+    # Disk cache
+    disk_path = _metadata_disk_path(repo_id, "info", path_prefix)
+    disk_data = _read_disk_cache(disk_path)
+    if disk_data is not None:
+        _LEROBOT_INFO_CACHE[cache_key] = (disk_data, datetime.utcnow())
+        return disk_data
+
     prefix_path = f"{path_prefix}/" if path_prefix else ""
     url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{prefix_path}meta/info.json"
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -165,6 +207,7 @@ async def fetch_lerobot_info(repo_id: str, path_prefix: str = "") -> Optional[di
             if resp.status_code == 200:
                 data = resp.json()
                 _LEROBOT_INFO_CACHE[cache_key] = (data, datetime.utcnow())
+                _write_disk_cache(disk_path, data)
                 return data
         except Exception as e:
             logger.warning(f"Failed to fetch LeRobot info.json for {repo_id} (prefix={path_prefix}): {e}")
@@ -252,6 +295,17 @@ async def fetch_lerobot_episodes_meta(repo_id: str, path_prefix: str = "") -> Op
         if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
             return cached
 
+    # Disk cache (episodes stored as list-of-dicts JSON)
+    disk_path = _metadata_disk_path(repo_id, "episodes", path_prefix)
+    disk_data = _read_disk_cache(disk_path)
+    if disk_data is not None:
+        try:
+            df = pd.DataFrame(disk_data)
+            _LEROBOT_EPISODES_CACHE[cache_key] = (df, datetime.utcnow())
+            return df
+        except Exception:
+            pass
+
     prefix_path = f"{path_prefix}/" if path_prefix else ""
     # LeRobot v3 stores episode metadata under meta/episodes/chunk-{N}/file-{N}.parquet
     # Discover chunks by listing meta/episodes/
@@ -308,6 +362,7 @@ async def fetch_lerobot_episodes_meta(repo_id: str, path_prefix: str = "") -> Op
     combined = pd.concat(dfs, ignore_index=True)
     combined = combined.sort_values("episode_index").reset_index(drop=True)
     _LEROBOT_EPISODES_CACHE[cache_key] = (combined, datetime.utcnow())
+    _write_disk_cache(disk_path, combined.to_dict(orient="records"))
     logger.info(f"Cached LeRobot episodes metadata for {cache_key}: {len(combined)} episodes")
     return combined
 
@@ -325,6 +380,17 @@ async def fetch_lerobot_tasks_meta(repo_id: str, path_prefix: str = "") -> Optio
         if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
             return cached
 
+    # Disk cache
+    disk_path = _metadata_disk_path(repo_id, "tasks", path_prefix)
+    disk_data = _read_disk_cache(disk_path)
+    if disk_data is not None:
+        try:
+            df = pd.DataFrame(disk_data)
+            _LEROBOT_TASKS_CACHE[cache_key] = (df, datetime.utcnow())
+            return df
+        except Exception:
+            pass
+
     prefix_path = f"{path_prefix}/" if path_prefix else ""
     url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{prefix_path}meta/tasks.parquet"
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -332,17 +398,205 @@ async def fetch_lerobot_tasks_meta(repo_id: str, path_prefix: str = "") -> Optio
             resp = await client.get(url, headers=_get_hf_headers(), timeout=30.0)
             if resp.status_code == 200:
                 df = pd.read_parquet(io.BytesIO(resp.content))
-                # In LeRobot v3 tasks.parquet, the task description is the DataFrame
-                # index and task_index is a column. Normalize to have both as columns.
-                if df.index.name is None and "task_index" in df.columns:
-                    df = df.reset_index()
-                    df = df.rename(columns={"index": "task_description"})
+                # Normalize: ensure both task_index and task_description are columns.
+                # Only apply when task_description is NOT already a column to avoid
+                # creating duplicates via reset_index().
+                if "task_index" in df.columns and "task_description" not in df.columns:
+                    if df.index.name is None:
+                        df = df.reset_index()
+                        if "index" in df.columns:
+                            df = df.rename(columns={"index": "task_description"})
+                    elif df.index.name != "task_index":
+                        desc_name = df.index.name
+                        df = df.reset_index()
+                        df = df.rename(columns={desc_name: "task_description"})
                 _LEROBOT_TASKS_CACHE[cache_key] = (df, datetime.utcnow())
+                _write_disk_cache(disk_path, df.to_dict(orient="records"))
                 logger.info(f"Cached LeRobot tasks metadata for {cache_key}: {len(df)} tasks")
                 return df
         except Exception as e:
             logger.warning(f"Failed to fetch LeRobot tasks.parquet for {cache_key}: {e}")
     return None
+
+
+def derive_episode_task_map_from_meta(episodes_df: pd.DataFrame) -> Optional[Dict[int, int]]:
+    """
+    Extract episode_index → task_index mapping from an episodes metadata DataFrame.
+
+    This is a zero-network-call fast path: the episodes parquet already contains
+    both episode_index and task_index columns for LeRobot v3 datasets.
+
+    Returns None if the task_index column is missing (v2.0/v2.1 compatibility).
+    """
+    if episodes_df is None:
+        return None
+    if "task_index" not in episodes_df.columns or "episode_index" not in episodes_df.columns:
+        return None
+    mapping: Dict[int, int] = {}
+    for _, row in episodes_df.iterrows():
+        mapping[int(row["episode_index"])] = int(row["task_index"])
+    return mapping
+
+
+async def fetch_episode_task_map_from_data_parquet(
+    repo_id: str, path_prefix: str = "",
+) -> Optional[Dict[int, int]]:
+    """
+    Read episode_index → task_index mapping from data parquet files via HfFileSystem.
+
+    This is a fallback for datasets (e.g. Libero v3.0) where meta/episodes/ parquet
+    does NOT contain a task_index column, but the data parquet files do.
+
+    Uses pyarrow column-selective reads to fetch only episode_index and task_index
+    columns via HTTP range requests (~10-50KB per file instead of full data with images).
+
+    Returns dict mapping episode_index → task_index, or None on failure.
+    """
+    import asyncio
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    # Only attempt if info.json confirms task_index exists in features
+    info = await fetch_lerobot_info(repo_id, path_prefix=path_prefix)
+    if not info:
+        return None
+    features = info.get("features", {})
+    if "task_index" not in features:
+        logger.debug(f"No task_index in features for {repo_id}, skipping data parquet fallback")
+        return None
+
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        for token_path in [
+            Path.home() / ".huggingface" / "token",
+            Path.home() / ".cache" / "huggingface" / "token",
+        ]:
+            if token_path.exists():
+                token = token_path.read_text().strip()
+                break
+
+    prefix_path = f"{path_prefix}/" if path_prefix else ""
+    headers = _get_hf_headers()
+
+    # List data chunk directories via HF tree API
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        tree_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{prefix_path}data"
+        try:
+            resp = await client.get(tree_url, headers=headers, timeout=15.0)
+            if resp.status_code != 200:
+                logger.warning(f"Could not list data/ for {repo_id}: HTTP {resp.status_code}")
+                return None
+            items = resp.json()
+        except Exception as e:
+            logger.warning(f"Failed to list data/ for {repo_id}: {e}")
+            return None
+
+        # Collect all parquet file paths from chunk directories
+        parquet_paths: List[str] = []
+        for item in items:
+            if item.get("type") == "directory":
+                chunk_path = item["path"]
+                try:
+                    chunk_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{chunk_path}"
+                    chunk_resp = await client.get(chunk_url, headers=headers, timeout=15.0)
+                    if chunk_resp.status_code == 200:
+                        for f in chunk_resp.json():
+                            if f.get("type") == "file" and f["path"].endswith(".parquet"):
+                                parquet_paths.append(f["path"])
+                except Exception:
+                    continue
+            elif item.get("type") == "file" and item["path"].endswith(".parquet"):
+                parquet_paths.append(item["path"])
+
+    if not parquet_paths:
+        logger.warning(f"No data parquet files found for {repo_id}")
+        return None
+
+    logger.info(f"Reading task_index from {len(parquet_paths)} data parquet file(s) for {repo_id}")
+
+    loop = asyncio.get_event_loop()
+    mapping: Dict[int, int] = {}
+
+    def _read_task_columns(file_path: str) -> Dict[int, int]:
+        """Read episode_index and task_index columns from a single data parquet file."""
+        fs = HfFileSystem(token=token)
+        hf_path = f"datasets/{repo_id}/{file_path}"
+        table = pq.read_table(hf_path, filesystem=fs, columns=["episode_index", "task_index"])
+        df = table.to_pandas()
+        # Deduplicate: take first task_index per episode_index
+        deduped = df.drop_duplicates(subset="episode_index", keep="first")
+        return dict(zip(deduped["episode_index"].astype(int), deduped["task_index"].astype(int)))
+
+    try:
+        for file_path in parquet_paths:
+            partial = await loop.run_in_executor(None, _read_task_columns, file_path)
+            mapping.update(partial)
+    except Exception as e:
+        logger.warning(f"Failed to read task_index from data parquet for {repo_id}: {e}")
+        return None
+
+    if not mapping:
+        return None
+
+    logger.info(f"Built episode-task map from data parquet for {repo_id}: {len(mapping)} episodes")
+    return mapping
+
+
+async def get_episode_task_map(
+    repo_id: str,
+    path_prefix: str = "",
+    episodes_df: Optional[pd.DataFrame] = None,
+) -> Optional[Dict[int, int]]:
+    """
+    Unified fast path to get episode_index → task_index mapping.
+
+    Resolution order:
+    1. In-memory cache hit
+    2. Disk cache hit
+    3. Derive from episodes_df (passed in or freshly fetched) — 0 extra API calls
+    3.5. Read from data parquet via HfFileSystem (for datasets like Libero where
+         meta/episodes lacks task_index but data parquet has it)
+    4. Fallback to fetch_lerobot_episode_task_map() for v2.0/v2.1 datasets
+
+    Callers that already have episodes_df should pass it in to avoid a redundant fetch.
+    """
+    cache_key = f"{repo_id}/{path_prefix}" if path_prefix else repo_id
+
+    # 1. In-memory cache
+    if cache_key in _LEROBOT_EP_TASK_MAP_CACHE:
+        cached, fetched_at = _LEROBOT_EP_TASK_MAP_CACHE[cache_key]
+        if datetime.utcnow() - fetched_at < timedelta(hours=LEROBOT_CACHE_TTL_HOURS):
+            return cached
+
+    # 2. Disk cache
+    disk_path = _metadata_disk_path(repo_id, "ep_task_map", path_prefix)
+    disk_data = _read_disk_cache(disk_path)
+    if disk_data is not None:
+        mapping = {int(k): int(v) for k, v in disk_data.items()}
+        _LEROBOT_EP_TASK_MAP_CACHE[cache_key] = (mapping, datetime.utcnow())
+        return mapping
+
+    # 3. Derive from episodes metadata (fast: 1-2 HTTP requests for parquet)
+    if episodes_df is None:
+        episodes_df = await fetch_lerobot_episodes_meta(repo_id, path_prefix=path_prefix)
+    mapping = derive_episode_task_map_from_meta(episodes_df)
+    if mapping is not None:
+        _LEROBOT_EP_TASK_MAP_CACHE[cache_key] = (mapping, datetime.utcnow())
+        _write_disk_cache(disk_path, mapping)
+        logger.info(f"Derived episode-task map from episodes meta for {cache_key}: {len(mapping)} episodes")
+        return mapping
+
+    # 3.5. Read from data parquet files (for Libero-style datasets where
+    #       meta/episodes lacks task_index but data/ parquet has it)
+    mapping = await fetch_episode_task_map_from_data_parquet(repo_id, path_prefix=path_prefix)
+    if mapping is not None:
+        _LEROBOT_EP_TASK_MAP_CACHE[cache_key] = (mapping, datetime.utcnow())
+        _write_disk_cache(disk_path, mapping)
+        return mapping
+
+    # 4. Fallback for v2.0/v2.1 datasets without meta/episodes/
+    logger.info(f"Episodes meta unavailable for {cache_key}, falling back to datasets-server API")
+    return await fetch_lerobot_episode_task_map(repo_id, path_prefix=path_prefix)
 
 
 _LEROBOT_EP_TASK_MAP_CACHE: Dict[str, Tuple[Dict[int, int], datetime]] = {}
@@ -367,7 +621,7 @@ async def fetch_lerobot_episode_task_map(repo_id: str, path_prefix: str = "") ->
 
     mapping: Dict[int, int] = {}
     offset = 0
-    page_size = 100
+    page_size = 1000
     # For multi-subdataset repos, the HF datasets server uses the subdataset path as config name
     config_name = path_prefix if path_prefix else "default"
 
@@ -835,8 +1089,8 @@ async def list_tasks(
                                 task_col = col
                                 break
 
-                    # Get episode-task mapping for counts
-                    ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                    # Get episode-task mapping for counts (fast path via episodes meta)
+                    ep_task_map = await get_episode_task_map(repo_id)
                     task_episode_counts: Dict[int, int] = {}
                     if ep_task_map:
                         for _, task_idx in ep_task_map.items():
@@ -983,8 +1237,8 @@ async def list_task_episodes(
                 if task_index is None:
                     return []
 
-                # Get episode->task mapping to filter episodes for this task
-                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                # Get episode->task mapping (fast path via already-fetched episodes_df)
+                ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
                 if ep_task_map is None:
                     return []
 
@@ -1048,8 +1302,8 @@ async def list_task_episodes(
                         ))
                     return episodes
 
-                # Multi-task without metadata: try datasets server API
-                ep_task_map = await fetch_lerobot_episode_task_map(repo_id)
+                # Multi-task without metadata: try fast path then datasets server API
+                ep_task_map = await get_episode_task_map(repo_id)
                 if ep_task_map:
                     task_ep_indices = sorted([
                         ep_idx for ep_idx, t_idx in ep_task_map.items()
