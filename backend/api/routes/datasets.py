@@ -112,6 +112,8 @@ class DatasetOverview(BaseModel):
     estimated_hours: Optional[float] = None
     estimated_clips: Optional[int] = None
     task_count: Optional[int] = None
+    total_episodes: Optional[int] = None
+    total_frames: Optional[int] = None
 
     # Cache metadata
     cached_at: Optional[str] = None
@@ -1640,8 +1642,13 @@ async def get_dataset_overview(
     # Also try info.json when format is unknown (older dynamic registrations)
     if repo_id and (config.get("format") in ("lerobot", "LeRobot", None)):
         info = await fetch_lerobot_info(repo_id)
-        if info and info.get("features"):
-            overview.modalities = _detect_lerobot_modalities(info)
+        if info:
+            if info.get("features"):
+                overview.modalities = _detect_lerobot_modalities(info)
+            if info.get("total_episodes") is not None:
+                overview.total_episodes = info["total_episodes"]
+            if info.get("total_frames") is not None:
+                overview.total_frames = info["total_frames"]
 
     # If no repo_id, return basic info from registry
     if not repo_id:

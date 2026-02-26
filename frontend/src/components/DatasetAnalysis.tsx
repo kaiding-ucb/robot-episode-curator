@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useFrameCounts, useSignalComparison, useDatasetCapabilities } from "@/hooks/useDatasetAnalysis";
-import { useDatasets, useTasks } from "@/hooks/useApi";
+import { useDatasets, useTasks, useDatasetOverview } from "@/hooks/useApi";
 import FrameCountChart from "./FrameCountChart";
 import SignalComparisonChart from "./SignalComparisonChart";
 
@@ -36,8 +36,11 @@ export default function DatasetAnalysis({
   // Dataset list for the picker
   const { datasets } = useDatasets();
 
+  // Dataset overview for metadata display
+  const { overview } = useDatasetOverview(datasetId);
+
   // Data hooks
-  const { tasks, loading: tasksLoading } = useTasks(datasetId);
+  const { tasks, totalTasks, loading: tasksLoading } = useTasks(datasetId);
   const {
     capabilities,
     loading: capabilitiesLoading,
@@ -175,6 +178,89 @@ export default function DatasetAnalysis({
         )}
       </div>
 
+      {/* Dataset Metadata */}
+      {overview && (
+        <div className="mb-4 px-3 py-2.5 bg-gray-50 dark:bg-gray-800/50 rounded-lg" data-testid="dataset-metadata">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Format / Gated / License badges */}
+            {overview.format_detected && (
+              <span className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                {overview.format_detected}
+              </span>
+            )}
+            {overview.gated && (
+              <span className="px-2 py-0.5 text-xs rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
+                Gated
+              </span>
+            )}
+            {overview.license && (
+              <span className="px-2 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
+                {overview.license}
+              </span>
+            )}
+
+            {/* Separator */}
+            {(overview.format_detected || overview.gated || overview.license) && (
+              <span className="w-px h-4 bg-gray-300 dark:bg-gray-600" />
+            )}
+
+            {/* Totals */}
+            {(() => {
+              const totalEpisodes = overview.total_episodes
+                ?? (tasks.length > 0 ? tasks.reduce((sum, t) => sum + (t.episode_count ?? 0), 0) : null);
+              return totalEpisodes != null && totalEpisodes > 0 ? (
+                <span className="text-xs text-gray-600 dark:text-gray-400">
+                  <span className="font-semibold">{totalEpisodes.toLocaleString()}</span> episodes
+                </span>
+              ) : null;
+            })()}
+            {overview.total_frames != null && (
+              <span className="text-xs text-gray-600 dark:text-gray-400">
+                <span className="font-semibold">{overview.total_frames.toLocaleString()}</span> frames
+              </span>
+            )}
+            {totalTasks > 0 && (
+              <span className="text-xs text-gray-600 dark:text-gray-400">
+                <span className="font-semibold">{totalTasks}</span> tasks
+              </span>
+            )}
+
+            {/* Environment / Perspective */}
+            {overview.environment && (
+              <span className="text-xs text-gray-600 dark:text-gray-400">
+                <span className="font-medium">Env:</span> {overview.environment}
+              </span>
+            )}
+            {overview.perspective && (
+              <span className="text-xs text-gray-600 dark:text-gray-400">
+                <span className="font-medium">View:</span> {overview.perspective}
+              </span>
+            )}
+
+            {/* Modalities */}
+            {overview.modalities && overview.modalities.length > 0 && (
+              <>
+                <span className="w-px h-4 bg-gray-300 dark:bg-gray-600" />
+                {overview.modalities.map((mod) => (
+                  <span
+                    key={mod}
+                    className={`px-2 py-0.5 text-xs rounded-full ${
+                      mod === "rgb" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300" :
+                      mod === "depth" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" :
+                      mod === "imu" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" :
+                      mod === "tactile" ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300" :
+                      "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
+                    }`}
+                  >
+                    {mod.toUpperCase()}
+                  </span>
+                ))}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-gray-200 dark:border-gray-700">
         <button
@@ -200,7 +286,7 @@ export default function DatasetAnalysis({
           data-testid="signal-comparison-tab"
           title={signalsDisabled ? capabilities?.signal_comparison_note : undefined}
         >
-          Signal Comparison
+          Action Insights
           {signalsDisabled && (
             <span className="ml-1.5 text-xs text-gray-400 dark:text-gray-500">(N/A)</span>
           )}
@@ -210,7 +296,7 @@ export default function DatasetAnalysis({
       {/* Signal comparison info banner when disabled */}
       {signalsDisabled && capabilities?.signal_comparison_note && activeTab === "frame-counts" && (
         <div className="mb-4 px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-sm text-blue-700 dark:text-blue-300">
-          <span className="font-medium">Signal Comparison unavailable:</span>{" "}
+          <span className="font-medium">Action Insights unavailable:</span>{" "}
           {capabilities.signal_comparison_note}
         </div>
       )}
@@ -305,7 +391,7 @@ export default function DatasetAnalysis({
             {signalState.phase === "no_signals" && signalState.noSignalsReason && (
               <div className="px-4 py-6 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-center">
                 <div className="text-sm text-blue-700 dark:text-blue-300 font-medium mb-1">
-                  Signal Comparison Not Available
+                  Action Insights Not Available
                 </div>
                 <div className="text-sm text-blue-600 dark:text-blue-400">
                   {signalState.noSignalsReason}

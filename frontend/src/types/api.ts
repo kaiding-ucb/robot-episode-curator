@@ -173,6 +173,8 @@ export interface DatasetOverview {
   estimated_hours?: number;
   estimated_clips?: number;
   task_count?: number;
+  total_episodes?: number;
+  total_frames?: number;
 
   // Cache metadata
   cached_at?: string;

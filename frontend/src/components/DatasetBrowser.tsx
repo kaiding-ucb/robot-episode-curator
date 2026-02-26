@@ -1,50 +1,9 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import type { Dataset, EpisodeMetadata, Task, DatasetOverview, Modality } from "@/types/api";
-import { useDatasets, useTasks, useTaskEpisodes, useDatasetOverview, removeDataset } from "@/hooks/useApi";
+import type { Dataset, EpisodeMetadata, Task, Modality } from "@/types/api";
+import { useDatasets, useTasks, useTaskEpisodes, removeDataset } from "@/hooks/useApi";
 import AddDatasetDialog from "./AddDatasetDialog";
-
-// Badge component for metadata display
-function OverviewBadge({
-  children,
-  color = "gray",
-}: {
-  children: React.ReactNode;
-  color?: "gray" | "blue" | "green" | "purple" | "red" | "yellow" | "orange";
-}) {
-  const colorClasses = {
-    gray: "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
-    blue: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
-    green: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300",
-    purple: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300",
-    red: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300",
-    yellow: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300",
-    orange: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300",
-  };
-  return (
-    <span className={`px-2 py-0.5 text-xs rounded-full ${colorClasses[color]}`}>
-      {children}
-    </span>
-  );
-}
-
-// Modality chip component
-function ModalityChip({ modality }: { modality: string }) {
-  const colors: Record<string, "green" | "purple" | "blue" | "orange" | "gray"> = {
-    rgb: "green",
-    depth: "purple",
-    imu: "blue",
-    tactile: "orange",
-    actions: "yellow" as "orange",
-    states: "gray",
-  };
-  return (
-    <OverviewBadge color={colors[modality] || "gray"}>
-      {modality.toUpperCase()}
-    </OverviewBadge>
-  );
-}
 
 interface DatasetBrowserProps {
   onSelectEpisode?: (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => void;
@@ -55,12 +14,10 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
   const { datasets, loading: loadingDatasets, error: datasetsError, refetch: refetchDatasets } = useDatasets();
   const [selectedDataset, setSelectedDataset] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
-  const [overviewExpanded, setOverviewExpanded] = useState(true);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [removingDataset, setRemovingDataset] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
-  const { overview, loading: loadingOverview, error: overviewError, refresh: refreshOverview } = useDatasetOverview(selectedDataset);
   const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError, hasMore: hasMoreTasks, loadMore: loadMoreTasks, searchQuery: taskSearchQuery, updateSearch: updateTaskSearch } = useTasks(selectedDataset);
   const { episodes, loading: loadingEpisodes, error: episodesError, hasMore, loadMore } = useTaskEpisodes(
     selectedDataset,
@@ -238,153 +195,6 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
         </ul>
       </div>
 
-      {/* Dataset Overview Section (shown when dataset selected) */}
-      {selectedDataset && (
-        <div className="border-b border-gray-200 dark:border-gray-700" data-testid="dataset-overview">
-          {/* Collapsible header */}
-          <button
-            onClick={() => setOverviewExpanded(!overviewExpanded)}
-            className="w-full px-4 py-2 flex items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
-            data-testid="overview-toggle"
-          >
-            <span className="text-sm font-semibold text-gray-700 dark:text-gray-200 truncate">
-              {selectedDatasetInfo?.name || "Overview"}
-            </span>
-            <svg
-              className={`w-4 h-4 text-gray-400 transition-transform ${overviewExpanded ? "rotate-180" : ""}`}
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-
-          {/* Expandable content */}
-          {overviewExpanded && (
-            <div className="px-4 pb-3 space-y-3">
-              {loadingOverview ? (
-                <div className="animate-pulse space-y-2">
-                  <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4"></div>
-                  <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-1/2"></div>
-                </div>
-              ) : overviewError ? (
-                <div className="text-xs text-red-500">
-                  {overviewError}
-                  <button
-                    onClick={refreshOverview}
-                    className="ml-2 text-blue-500 hover:underline"
-                  >
-                    Retry
-                  </button>
-                </div>
-              ) : overview ? (
-                <>
-                  {/* Format + Gated + License row */}
-                  <div className="flex flex-wrap gap-1.5" data-testid="overview-badges">
-                    {overview.format_detected && (
-                      <OverviewBadge color="blue">{overview.format_detected}</OverviewBadge>
-                    )}
-                    {overview.gated && (
-                      <OverviewBadge color="red">Gated</OverviewBadge>
-                    )}
-                    {overview.license && (
-                      <OverviewBadge color="yellow">{overview.license}</OverviewBadge>
-                    )}
-                  </div>
-
-                  {/* Environment + Perspective */}
-                  {(overview.environment || overview.perspective) && (
-                    <div className="flex flex-wrap gap-2 text-xs" data-testid="overview-environment">
-                      {overview.environment && (
-                        <span className="text-gray-600 dark:text-gray-400">
-                          <span className="font-medium">Env:</span> {overview.environment}
-                        </span>
-                      )}
-                      {overview.perspective && (
-                        <span className="text-gray-600 dark:text-gray-400">
-                          <span className="font-medium">View:</span> {overview.perspective}
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Scale info */}
-                  {(overview.estimated_hours || overview.estimated_clips || overview.task_count) && (
-                    <div className="flex flex-wrap gap-3 text-xs text-gray-600 dark:text-gray-400" data-testid="overview-scale">
-                      {overview.estimated_hours && (
-                        <span>
-                          <span className="font-medium">{overview.estimated_hours.toLocaleString()}h</span> duration
-                        </span>
-                      )}
-                      {overview.estimated_clips && (
-                        <span>
-                          <span className="font-medium">{overview.estimated_clips.toLocaleString()}</span> clips
-                        </span>
-                      )}
-                      {overview.task_count && (
-                        <span>
-                          <span className="font-medium">{overview.task_count}</span> tasks
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Modalities */}
-                  {overview.modalities && overview.modalities.length > 0 && (
-                    <div data-testid="overview-modalities">
-                      <div className="text-xs text-gray-500 mb-1">Modalities</div>
-                      <div className="flex flex-wrap gap-1">
-                        {overview.modalities.map((mod) => (
-                          <ModalityChip key={mod} modality={mod} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* README summary */}
-                  {overview.readme_summary && (
-                    <p
-                      className="text-xs text-gray-600 dark:text-gray-400 line-clamp-2"
-                      title={overview.readme_summary}
-                      data-testid="overview-summary"
-                    >
-                      {overview.readme_summary}
-                    </p>
-                  )}
-
-                  {/* Tags */}
-                  {overview.dataset_tags && overview.dataset_tags.length > 0 && (
-                    <div className="flex flex-wrap gap-1" data-testid="overview-tags">
-                      {overview.dataset_tags.slice(0, 5).map((tag) => (
-                        <span
-                          key={tag}
-                          className="px-1.5 py-0.5 text-xs bg-gray-50 dark:bg-gray-800 text-gray-500 rounded"
-                        >
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Refresh button */}
-                  <button
-                    onClick={refreshOverview}
-                    className="text-xs text-blue-500 hover:text-blue-700 flex items-center gap-1"
-                    data-testid="refresh-overview"
-                  >
-                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                    Refresh
-                  </button>
-                </>
-              ) : null}
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Task List (shown when dataset selected but no task selected) */}
       {selectedDataset && !selectedTask && (
         <div className="flex-1 overflow-auto">
@@ -528,7 +338,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                         selectedDataset,
                         episode.id,
                         episode.num_frames || 0,
-                        overview?.modalities as Modality[] | undefined,
+                        selectedDatasetInfo?.modalities as Modality[] | undefined,
                         `episode_${displayIndex}`
                       )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"

@@ -28,7 +28,7 @@ export default function EpisodeViewer({
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
-  const [activeStream, setActiveStream] = useState<"rgb" | "depth">("rgb");
+  const activeStream = "rgb" as const;
   const [activeChartTab, setActiveChartTab] = useState<"none" | "actions" | "imu">("none");
 
   // Deferred loading: SSE only starts after user clicks Play
@@ -46,7 +46,7 @@ export default function EpisodeViewer({
   const [initialStatusChecked, setInitialStatusChecked] = useState(false);
 
   // Check available modalities
-  const hasDepth = availableModalities.includes("depth");
+  // depth playback not yet supported — toggle removed
   const hasImu = availableModalities.includes("imu");
   const hasActions = availableModalities.includes("actions");
 
@@ -279,7 +279,7 @@ export default function EpisodeViewer({
     setCurrentFrame(0);
     setPlaying(false);
     setPlayRequested(false); // Reset deferred loading on episode change
-    setActiveStream("rgb"); // Reset to RGB when episode changes
+    // activeStream is always "rgb" (depth playback not supported)
     // Reset caching status to prevent stale state from enabling SSE on first render
     setCachingStatus({ status: null });
     cachingTriggeredRef.current = false; // Allow caching for new episode
@@ -486,33 +486,6 @@ export default function EpisodeViewer({
           </div>
         )}
 
-        {/* Stream toggle - only if depth is available */}
-        {hasDepth && (
-          <div className="absolute top-2 right-2 flex gap-1">
-            <button
-              onClick={() => setActiveStream("rgb")}
-              className={`px-3 py-1 text-xs rounded-l transition-colors ${
-                activeStream === "rgb"
-                  ? "bg-blue-500 text-white"
-                  : "bg-black/50 text-gray-300 hover:bg-black/70"
-              }`}
-              data-testid="stream-rgb-btn"
-            >
-              RGB
-            </button>
-            <button
-              onClick={() => setActiveStream("depth")}
-              className={`px-3 py-1 text-xs rounded-r transition-colors ${
-                activeStream === "depth"
-                  ? "bg-purple-500 text-white"
-                  : "bg-black/50 text-gray-300 hover:bg-black/70"
-              }`}
-              data-testid="stream-depth-btn"
-            >
-              Depth
-            </button>
-          </div>
-        )}
 
       </div>
 

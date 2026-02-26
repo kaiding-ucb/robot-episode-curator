@@ -60,19 +60,20 @@ class TestParallelizedLeRobotMetadata:
         from api.routes.datasets import (
             fetch_lerobot_info,
             fetch_lerobot_tasks_meta,
-            fetch_lerobot_episode_task_map,
+            get_episode_task_map,
             fetch_lerobot_episodes_meta,
             detect_lerobot_data_branch,
         )
 
         start = time.monotonic()
-        info, tasks_df, ep_task_map, episodes_df, data_branch = await asyncio.gather(
+        info, tasks_df, episodes_df, data_branch = await asyncio.gather(
             fetch_lerobot_info(self.LEROBOT_REPO),
             fetch_lerobot_tasks_meta(self.LEROBOT_REPO),
-            fetch_lerobot_episode_task_map(self.LEROBOT_REPO),
             fetch_lerobot_episodes_meta(self.LEROBOT_REPO),
             detect_lerobot_data_branch(self.LEROBOT_REPO),
         )
+        # Derive episode-task map from already-fetched episodes_df (fast, synchronous)
+        ep_task_map = await get_episode_task_map(self.LEROBOT_REPO, episodes_df=episodes_df)
         elapsed = time.monotonic() - start
 
         # All values should be populated

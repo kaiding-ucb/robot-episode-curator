@@ -46,7 +46,7 @@ class LeRobotAdapter(StreamingAdapter):
         """List tasks using LeRobot metadata parquet files."""
         from api.routes.datasets import (
             fetch_lerobot_tasks_meta,
-            fetch_lerobot_episode_task_map,
+            get_episode_task_map,
             fetch_lerobot_info,
         )
 
@@ -62,8 +62,8 @@ class LeRobotAdapter(StreamingAdapter):
                         task_col = col
                         break
 
-            # Get episode-task mapping for counts
-            ep_task_map = await fetch_lerobot_episode_task_map(repo_id, path_prefix=prefix)
+            # Get episode-task mapping for counts (fast path via episodes meta)
+            ep_task_map = await get_episode_task_map(repo_id, path_prefix=prefix)
             task_episode_counts: Dict[int, int] = {}
             if ep_task_map:
                 for _, task_idx in ep_task_map.items():
@@ -108,7 +108,7 @@ class LeRobotAdapter(StreamingAdapter):
         from api.routes.datasets import (
             fetch_lerobot_tasks_meta,
             fetch_lerobot_episodes_meta,
-            fetch_lerobot_episode_task_map,
+            get_episode_task_map,
             fetch_lerobot_info,
         )
 
@@ -144,8 +144,8 @@ class LeRobotAdapter(StreamingAdapter):
             if task_index is None:
                 return [], 0
 
-            # Get episode->task mapping
-            ep_task_map = await fetch_lerobot_episode_task_map(repo_id, path_prefix=prefix)
+            # Get episode->task mapping (fast path via already-fetched episodes_df)
+            ep_task_map = await get_episode_task_map(repo_id, path_prefix=prefix, episodes_df=episodes_df)
             if ep_task_map is None:
                 return [], 0
 
@@ -205,7 +205,7 @@ class LeRobotAdapter(StreamingAdapter):
                 return episodes, total_episodes
 
             # Multi-task without metadata
-            ep_task_map = await fetch_lerobot_episode_task_map(repo_id, path_prefix=prefix)
+            ep_task_map = await get_episode_task_map(repo_id, path_prefix=prefix)
             if ep_task_map:
                 task_ep_indices = sorted([
                     ep_idx for ep_idx, t_idx in ep_task_map.items()
