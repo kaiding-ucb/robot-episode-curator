@@ -180,8 +180,7 @@ function bandWidthColor(ratio: number): string {
 
 interface BandMetrics {
   bandCoverage: number;
-  cv: number;
-  label: "Tight" | "Moderate" | "Loose";
+  label: "Low Variance" | "Med Variance" | "High Variance";
   color: string;
 }
 
@@ -190,37 +189,30 @@ function computeBandMetrics(
   batchRange: { min: number; max: number }
 ): BandMetrics {
   const len = envelope.mean.length;
-  if (len === 0) return { bandCoverage: 0, cv: 0, label: "Tight", color: "#22c55e" };
+  if (len === 0) return { bandCoverage: 0, label: "Low Variance", color: "#22c55e" };
 
   let bandWidthSum = 0;
-  let stdSum = 0;
-  let absMuSum = 0;
   for (let i = 0; i < len; i++) {
     bandWidthSum += envelope.upper[i] - envelope.lower[i];
-    stdSum += envelope.std[i];
-    absMuSum += Math.abs(envelope.mean[i]);
   }
   const meanBandWidth = bandWidthSum / len;
   const rangeSpan = batchRange.max - batchRange.min || 1;
   const bandCoverage = meanBandWidth / rangeSpan;
 
-  const meanAbsMu = absMuSum / len;
-  const cv = meanAbsMu > 0 ? (stdSum / len) / meanAbsMu : 0;
-
-  let label: "Tight" | "Moderate" | "Loose";
+  let label: "Low Variance" | "Med Variance" | "High Variance";
   let color: string;
   if (bandCoverage < 0.25) {
-    label = "Tight";
+    label = "Low Variance";
     color = "#22c55e";
   } else if (bandCoverage < 0.5) {
-    label = "Moderate";
+    label = "Med Variance";
     color = "#eab308";
   } else {
-    label = "Loose";
+    label = "High Variance";
     color = "#ef4444";
   }
 
-  return { bandCoverage, cv, label, color };
+  return { bandCoverage, label, color };
 }
 
 // Colors for different episodes in overlay view
@@ -571,24 +563,51 @@ function OverlayPanel({
                 color: bandMetrics.color,
                 backgroundColor: `${bandMetrics.color}15`,
               }}
+              title="The normal range covers this percentage of the full action range. Lower = more consistent episodes."
             >
-              {bandMetrics.label}: {Math.round(bandMetrics.bandCoverage * 100)}%
-            </span>
-            <span className="text-[10px] text-gray-400 font-mono">
-              CV {bandMetrics.cv.toFixed(2)}
+              {bandMetrics.label} · {Math.round(bandMetrics.bandCoverage * 100)}%
             </span>
           </div>
         )}
       </div>
+      {/* Inline chart legend */}
+      {envelope && (
+        <div className="flex items-center gap-3 mb-0.5" style={{ height: 14 }}>
+          <div className="flex items-center gap-1">
+            <svg width="16" height="6" viewBox="0 0 16 6">
+              <line x1="0" y1="3" x2="16" y2="3" stroke="#e2e8f0" strokeWidth="1.5" />
+            </svg>
+            <span className="text-[10px] text-gray-400">median</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <svg width="14" height="8" viewBox="0 0 14 8">
+              <rect x="0" y="0" width="14" height="8" fill={bandMetrics?.color || "#3b82f6"} opacity="0.3" rx="1" />
+            </svg>
+            <span className="text-[10px] text-gray-400">normal range</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <svg width="16" height="6" viewBox="0 0 16 6">
+              <line x1="0" y1="3" x2="16" y2="3" stroke="#3b82f6" strokeWidth="0.8" opacity="0.5" />
+            </svg>
+            <span className="text-[10px] text-gray-400">episodes</span>
+          </div>
+        </div>
+      )}
       {outliers.length > 0 && (
         <div className="mb-1">
           {outliers.map((o) => (
             <div
               key={o.label}
-              className={`text-[10px] text-amber-500 dark:text-amber-400 font-mono ${onInspect ? "cursor-pointer hover:underline" : ""}`}
+              className={`group text-[10px] text-amber-500 dark:text-amber-400 font-mono ${onInspect ? "cursor-pointer hover:underline" : ""}`}
               onClick={onInspect ? () => onInspect(o.maxDeviationIdx) : undefined}
+              title={onInspect ? "Click to compare frames at the point of maximum deviation" : undefined}
             >
-              {o.label}: outlier ({o.pct}% outside band)
+              {o.label}: outlier ({o.pct}% outside normal range)
+              {onInspect && (
+                <span className="text-amber-400/60 group-hover:text-amber-300 ml-1 transition-colors">
+                  → inspect
+                </span>
+              )}
             </div>
           ))}
         </div>
@@ -627,11 +646,25 @@ function OverlayPanel({
           />
         )}
       </svg>
+      {/* Hot zone click hint */}
+      {hotZones.length > 0 && onInspect && (
+        <div className="text-[8px] text-red-400 bg-gray-100 dark:bg-gray-700 px-1 py-0.5 text-center">
+          ▼ Click highlighted zones below to compare frames
+        </div>
+      )}
       {/* Sigma profile bar with hot zone overlays */}
       {envelopeRender?.sigmaBar && (
+        <div className="flex items-stretch">
+          <div
+            className="flex items-center justify-center bg-gray-100 dark:bg-gray-700 rounded-bl text-[8px] text-gray-400 select-none shrink-0"
+            style={{ width: 38 }}
+            title="Shows how much actions vary between episodes at each timestep"
+          >
+            Variance
+          </div>
         <svg
           viewBox={`0 0 ${w} 20`}
-          className={`w-full bg-gray-100 dark:bg-gray-700 rounded-b ${onInspect ? "cursor-crosshair" : ""}`}
+          className={`w-full bg-gray-100 dark:bg-gray-700 rounded-br ${onInspect ? "cursor-crosshair" : ""}`}
           style={{ height: 20 }}
           preserveAspectRatio="none"
           onClick={onInspect ? (e) => {
@@ -657,29 +690,66 @@ function OverlayPanel({
               />
             );
           })}
+          {/* Hot zone hover styles */}
+          <defs>
+            <style>{`
+              .hot-zone-group:hover .hz-overlay { opacity: 0.4; }
+              .hot-zone-group:hover .hz-border-top { stroke: #ef4444; stroke-opacity: 1; }
+              .hot-zone-group:hover .hz-border-bottom { stroke: #ef4444; stroke-opacity: 1; }
+            `}</style>
+          </defs>
           {/* Hot zone overlays */}
           {hotZones.map((zone, i) => {
             const x1 = (zone.start / RESAMPLE_LEN) * w;
             const x2 = ((zone.end + 1) / RESAMPLE_LEN) * w;
+            const zoneW = x2 - x1;
             return (
-              <rect
+              <g
                 key={`hz-${i}`}
-                x={x1}
-                y={0}
-                width={x2 - x1}
-                height={20}
-                fill="#ef4444"
-                opacity={0.2 + zone.peakVariance * 0.15}
-                className="cursor-pointer"
+                className={`hot-zone-group ${onInspect ? "cursor-pointer" : ""}`}
                 onClick={onInspect ? (e) => {
                   e.stopPropagation();
                   const mid = Math.round((zone.start + zone.end) / 2);
                   onInspect(mid);
                 } : undefined}
-              />
+              >
+                {/* Dark overlay to dim sigma bar underneath */}
+                <rect
+                  className="hz-overlay"
+                  x={x1} y={0} width={zoneW} height={20}
+                  fill="#1e293b" opacity="0.25"
+                />
+                {/* Dashed red top border */}
+                <line
+                  className="hz-border-top"
+                  x1={x1} y1={1} x2={x2} y2={1}
+                  stroke="#ef4444" strokeWidth="2" strokeDasharray="4 2"
+                  vectorEffect="non-scaling-stroke" strokeOpacity="0.8"
+                />
+                {/* Solid red bottom border */}
+                <line
+                  className="hz-border-bottom"
+                  x1={x1} y1={19} x2={x2} y2={19}
+                  stroke="#ef4444" strokeWidth="1"
+                  vectorEffect="non-scaling-stroke" strokeOpacity="0.7"
+                />
+                {/* Left bracket */}
+                <line
+                  x1={x1} y1={0} x2={x1} y2={20}
+                  stroke="#ef4444" strokeWidth="1"
+                  vectorEffect="non-scaling-stroke" opacity="0.6"
+                />
+                {/* Right bracket */}
+                <line
+                  x1={x2} y1={0} x2={x2} y2={20}
+                  stroke="#ef4444" strokeWidth="1"
+                  vectorEffect="non-scaling-stroke" opacity="0.6"
+                />
+              </g>
             );
           })}
         </svg>
+        </div>
       )}
     </div>
   );
@@ -897,7 +967,6 @@ function FrameComparisonStrip({
   episodes,
   episodeList,
   datasetId,
-  traceColors,
   onNavigate,
   onClose,
   onIndexChange,
@@ -906,7 +975,6 @@ function FrameComparisonStrip({
   episodes: Map<string, EpisodeSignalData>;
   episodeList: [string, EpisodeSignalData][];
   datasetId: string | null;
-  traceColors: Map<string, string>;
   onNavigate: (episodeId: string, frameNumber: number) => void;
   onClose: () => void;
   onIndexChange: (newIndex: number) => void;
@@ -1004,8 +1072,7 @@ function FrameComparisonStrip({
     >
       <div className="flex items-center justify-between mb-2">
         <div className="text-xs font-medium text-gray-500">
-          Frame Comparison — position {progressPct}%
-          <span className="text-[10px] text-gray-400 ml-2">(Arrow keys to scrub, Shift for large jumps, Esc to close)</span>
+          Frame Comparison
         </div>
         <button
           onClick={onClose}
@@ -1014,19 +1081,49 @@ function FrameComparisonStrip({
           Close
         </button>
       </div>
+      {/* Scrub bar */}
+      <div className="flex items-center gap-2 mb-2">
+        <button
+          onClick={() => onIndexChange(Math.max(0, resampledIndex - 3))}
+          className="text-gray-400 hover:text-gray-200 text-sm px-1.5 py-0.5 rounded bg-gray-700 hover:bg-gray-600 transition-colors shrink-0"
+          title="Previous frames (← arrow key, Shift for larger steps)"
+        >
+          ◀
+        </button>
+        <div className="relative flex-1 h-5 flex items-center group">
+          <input
+            type="range"
+            min={0}
+            max={RESAMPLE_LEN - 1}
+            value={resampledIndex}
+            onChange={(e) => onIndexChange(Number(e.target.value))}
+            className="w-full h-1.5 rounded-full appearance-none cursor-pointer bg-gray-600 accent-blue-500
+              [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+              [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:cursor-grab
+              [&::-webkit-slider-thumb]:active:cursor-grabbing"
+          />
+          <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 text-[9px] text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap">
+            {progressPct}% · frame position
+          </div>
+        </div>
+        <button
+          onClick={() => onIndexChange(Math.min(RESAMPLE_LEN - 1, resampledIndex + 3))}
+          className="text-gray-400 hover:text-gray-200 text-sm px-1.5 py-0.5 rounded bg-gray-700 hover:bg-gray-600 transition-colors shrink-0"
+          title="Next frames (→ arrow key, Shift for larger steps)"
+        >
+          ▶
+        </button>
+      </div>
       <div className="grid grid-cols-5 gap-2">
         {episodeList.map(([epId, epData]) => {
           const totalFrames = epData.total_frames ?? epData.actions?.actions?.length ?? 0;
           const frameIdx = totalFrames > 0 ? Math.round((resampledIndex / (RESAMPLE_LEN - 1)) * Math.max(0, totalFrames - 1)) : 0;
           const thumb = thumbnails.get(epId);
           const isLoading = loading.has(epId);
-          const color = traceColors.get(epId) || "#6b7280";
-
           return (
             <div
               key={epId}
               className="relative rounded overflow-hidden"
-              style={{ borderLeft: `3px solid ${color}` }}
             >
               <div className="aspect-video bg-gray-200 dark:bg-gray-700">
                 {isLoading ? (
@@ -1170,15 +1267,6 @@ export default function SignalComparisonChart({
     return { positionTraces, rotationTraces, accelTraces, gyroTraces };
   }, [episodeList, precomputed]);
 
-  // Build episode-id → color map for the frame comparison strip
-  const traceColors = useMemo(() => {
-    const map = new Map<string, string>();
-    episodeList.forEach(([id], i) => {
-      map.set(id, EPISODE_COLORS[i % EPISODE_COLORS.length]);
-    });
-    return map;
-  }, [episodeList]);
-
   // Handle navigate from frame comparison strip
   const handleStripNavigate = useCallback((episodeId: string, frameNumber: number) => {
     if (!onNavigateToEpisode || !datasetId) return;
@@ -1240,7 +1328,6 @@ export default function SignalComparisonChart({
                 episodes={episodes}
                 episodeList={episodeList}
                 datasetId={datasetId}
-                traceColors={traceColors}
                 onNavigate={handleStripNavigate}
                 onClose={() => setInspectIndex(null)}
                 onIndexChange={setInspectIndex}
