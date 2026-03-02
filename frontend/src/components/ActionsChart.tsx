@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import { useActionsData } from "@/hooks/useApi";
+import { classifyActionDimensions } from "@/utils/actionClassification";
 
 interface ActionsChartProps {
   episodeId: string | null;
@@ -22,6 +23,17 @@ function detectGripperEvents(gripperData: number[], threshold: number = 0.3): nu
   return events;
 }
 
+// Compute magnitude from multi-dimensional action data
+function computeMagnitude(actions: number[][], indices: number[]): number[] {
+  return actions.map((a) => {
+    let sum = 0;
+    for (const i of indices) {
+      if (i < a.length) sum += a[i] * a[i];
+    }
+    return Math.sqrt(sum);
+  });
+}
+
 export default function ActionsChart({
   episodeId,
   datasetId,
@@ -36,81 +48,55 @@ export default function ActionsChart({
     return (currentFrame / totalFrames) * 100;
   }, [currentFrame, totalFrames]);
 
-  // Process actions into meaningful signals
-  const { positionMag, rotationMag, gripperData, gripperEvents, hasPosition, hasRotation, hasGripper } = useMemo(() => {
+  // Process actions into meaningful signals using shared classification
+  const {
+    positionMag, rotationMag, gripperData, gripper2Data, gripperEvents, gripper2Events,
+    hasPosition, hasRotation, hasGripper, hasGripper2, classification
+  } = useMemo(() => {
     if (!actionsData || actionsData.actions.length === 0) {
       return {
-        positionMag: [], rotationMag: [], gripperData: [], gripperEvents: [],
-        hasPosition: false, hasRotation: false, hasGripper: false
+        positionMag: [], rotationMag: [], gripperData: [], gripper2Data: [],
+        gripperEvents: [], gripper2Events: [],
+        hasPosition: false, hasRotation: false, hasGripper: false, hasGripper2: false,
+        classification: undefined
       };
     }
 
     const dims = actionsData.actions[0].length;
-    const labels = actionsData.dimension_labels || [];
+    const labels = actionsData.dimension_labels ?? null;
+    const cls = classifyActionDimensions(labels, dims);
 
-    // Try to identify dimensions by labels or assume standard 7D format
-    // Standard: [x, y, z, rx, ry, rz, gripper]
-    let posIndices = [0, 1, 2]; // x, y, z
-    let rotIndices = [3, 4, 5]; // rx, ry, rz
-    let gripperIdx = dims >= 7 ? 6 : -1;
+    const posMag = computeMagnitude(actionsData.actions, cls.group1.indices);
+    const rotMag = computeMagnitude(actionsData.actions, cls.group2.indices);
 
-    // Override if labels suggest different structure
-    if (labels.length > 0) {
-      const lowerLabels = labels.map(l => l.toLowerCase());
-      const xIdx = lowerLabels.findIndex(l => l === 'x' || l.includes('pos_x'));
-      const yIdx = lowerLabels.findIndex(l => l === 'y' || l.includes('pos_y'));
-      const zIdx = lowerLabels.findIndex(l => l === 'z' || l.includes('pos_z'));
-      const rxIdx = lowerLabels.findIndex(l => l === 'rx' || l.includes('rot_x') || l.includes('roll'));
-      const ryIdx = lowerLabels.findIndex(l => l === 'ry' || l.includes('rot_y') || l.includes('pitch'));
-      const rzIdx = lowerLabels.findIndex(l => l === 'rz' || l.includes('rot_z') || l.includes('yaw'));
-      const gIdx = lowerLabels.findIndex(l => l.includes('gripper') || l.includes('grip'));
+    // Gripper 1
+    const grip: number[] = cls.grippers.length > 0
+      ? actionsData.actions.map((a) => (cls.grippers[0].index < a.length ? a[cls.grippers[0].index] : 0))
+      : [];
+    const gripMin = grip.length > 0 ? Math.min(...grip) : 0;
+    const gripMax = grip.length > 0 ? Math.max(...grip) : 0;
+    const gripHasVariation = grip.length > 0 && (gripMax - gripMin) > 0.01;
 
-      if (xIdx >= 0 && yIdx >= 0 && zIdx >= 0) posIndices = [xIdx, yIdx, zIdx];
-      if (rxIdx >= 0 && ryIdx >= 0 && rzIdx >= 0) rotIndices = [rxIdx, ryIdx, rzIdx];
-      if (gIdx >= 0) gripperIdx = gIdx;
-    }
-
-    // Extract and compute magnitudes
-    const posMag: number[] = [];
-    const rotMag: number[] = [];
-    const grip: number[] = [];
-
-    for (const action of actionsData.actions) {
-      // Position magnitude
-      if (posIndices.every(i => i < dims)) {
-        const px = action[posIndices[0]] || 0;
-        const py = action[posIndices[1]] || 0;
-        const pz = action[posIndices[2]] || 0;
-        posMag.push(Math.sqrt(px * px + py * py + pz * pz));
-      }
-
-      // Rotation magnitude
-      if (rotIndices.every(i => i < dims)) {
-        const rx = action[rotIndices[0]] || 0;
-        const ry = action[rotIndices[1]] || 0;
-        const rz = action[rotIndices[2]] || 0;
-        rotMag.push(Math.sqrt(rx * rx + ry * ry + rz * rz));
-      }
-
-      // Gripper
-      if (gripperIdx >= 0 && gripperIdx < dims) {
-        grip.push(action[gripperIdx]);
-      }
-    }
-
-    // Check if gripper has actual variation (not constant throughout)
-    const gripperMin = grip.length > 0 ? Math.min(...grip) : 0;
-    const gripperMax = grip.length > 0 ? Math.max(...grip) : 0;
-    const gripperHasVariation = grip.length > 0 && (gripperMax - gripperMin) > 0.01;
+    // Gripper 2
+    const grip2: number[] = cls.grippers.length > 1
+      ? actionsData.actions.map((a) => (cls.grippers[1].index < a.length ? a[cls.grippers[1].index] : 0))
+      : [];
+    const grip2Min = grip2.length > 0 ? Math.min(...grip2) : 0;
+    const grip2Max = grip2.length > 0 ? Math.max(...grip2) : 0;
+    const grip2HasVariation = grip2.length > 0 && (grip2Max - grip2Min) > 0.01;
 
     return {
       positionMag: posMag,
       rotationMag: rotMag,
       gripperData: grip,
-      gripperEvents: gripperHasVariation ? detectGripperEvents(grip) : [],
+      gripper2Data: grip2,
+      gripperEvents: gripHasVariation ? detectGripperEvents(grip) : [],
+      gripper2Events: grip2HasVariation ? detectGripperEvents(grip2) : [],
       hasPosition: posMag.length > 0,
       hasRotation: rotMag.length > 0,
-      hasGripper: gripperHasVariation,  // Only show gripper if it actually varies
+      hasGripper: gripHasVariation,
+      hasGripper2: grip2HasVariation,
+      classification: cls,
     };
   }, [actionsData]);
 
@@ -156,14 +142,15 @@ export default function ActionsChart({
 
   const chartHeight = 50;
   const dataLength = actionsData.actions.length;
+  const totalGripperEvents = gripperEvents.length + gripper2Events.length;
 
   return (
     <div className="p-2 bg-gray-50 dark:bg-gray-800 rounded" data-testid="actions-chart">
       <div className="text-xs text-gray-500 mb-2 flex items-center justify-between">
         <span>Actions</span>
-        {gripperEvents.length > 0 && (
+        {totalGripperEvents > 0 && (
           <span className="text-green-600 dark:text-green-400">
-            {gripperEvents.length} gripper event{gripperEvents.length !== 1 ? 's' : ''}
+            {totalGripperEvents} gripper event{totalGripperEvents !== 1 ? 's' : ''}
           </span>
         )}
       </div>
@@ -174,34 +161,46 @@ export default function ActionsChart({
         className="w-full h-14 bg-gray-100 dark:bg-gray-700 rounded"
         preserveAspectRatio="none"
       >
-        {/* Position magnitude (blue) */}
+        {/* Group 1 magnitude (blue) */}
         {hasPosition && (
           <path
             d={createPath(positionMag, chartHeight)}
             fill="none"
-            stroke="#3b82f6"
+            stroke={classification?.group1.color ?? "#3b82f6"}
             strokeWidth="1"
             vectorEffect="non-scaling-stroke"
           />
         )}
 
-        {/* Rotation magnitude (purple) */}
+        {/* Group 2 magnitude (purple) */}
         {hasRotation && (
           <path
             d={createPath(rotationMag, chartHeight)}
             fill="none"
-            stroke="#8b5cf6"
+            stroke={classification?.group2.color ?? "#8b5cf6"}
             strokeWidth="1"
             vectorEffect="non-scaling-stroke"
           />
         )}
 
-        {/* Gripper state (green, dashed) */}
+        {/* Gripper 1 state (green, dashed) */}
         {hasGripper && (
           <path
             d={createPath(gripperData, chartHeight)}
             fill="none"
-            stroke="#22c55e"
+            stroke={classification?.grippers[0]?.color ?? "#22c55e"}
+            strokeWidth="0.8"
+            strokeDasharray="2,1"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+
+        {/* Gripper 2 state (orange, dashed) */}
+        {hasGripper2 && (
+          <path
+            d={createPath(gripper2Data, chartHeight)}
+            fill="none"
+            stroke={classification?.grippers[1]?.color ?? "#f97316"}
             strokeWidth="0.8"
             strokeDasharray="2,1"
             vectorEffect="non-scaling-stroke"
@@ -218,7 +217,26 @@ export default function ActionsChart({
               y1="0"
               x2={xPos}
               y2={chartHeight}
-              stroke="#22c55e"
+              stroke={classification?.grippers[0]?.color ?? "#22c55e"}
+              strokeWidth="1"
+              strokeDasharray="1,2"
+              vectorEffect="non-scaling-stroke"
+              opacity="0.7"
+            />
+          );
+        })}
+
+        {/* Gripper 2 event markers */}
+        {gripper2Events.map((frameIdx) => {
+          const xPos = (frameIdx / Math.max(dataLength - 1, 1)) * 100;
+          return (
+            <line
+              key={`gripper2-event-${frameIdx}`}
+              x1={xPos}
+              y1="0"
+              x2={xPos}
+              y2={chartHeight}
+              stroke={classification?.grippers[1]?.color ?? "#f97316"}
               strokeWidth="1"
               strokeDasharray="1,2"
               vectorEffect="non-scaling-stroke"
@@ -243,20 +261,26 @@ export default function ActionsChart({
       <div className="flex justify-center gap-4 mt-2 text-xs">
         {hasPosition && (
           <span className="flex items-center gap-1">
-            <span className="w-3 h-0.5 bg-blue-500 rounded"></span>
-            Position
+            <span className="w-3 h-0.5 rounded" style={{ backgroundColor: classification?.group1.color ?? "#3b82f6" }}></span>
+            {classification?.group1.label ?? "Position"}
           </span>
         )}
         {hasRotation && (
           <span className="flex items-center gap-1">
-            <span className="w-3 h-0.5 bg-purple-500 rounded"></span>
-            Rotation
+            <span className="w-3 h-0.5 rounded" style={{ backgroundColor: classification?.group2.color ?? "#8b5cf6" }}></span>
+            {classification?.group2.label ?? "Rotation"}
           </span>
         )}
         {hasGripper && (
           <span className="flex items-center gap-1">
-            <span className="w-3 h-0.5 bg-green-500 rounded" style={{ borderStyle: 'dashed' }}></span>
-            Gripper
+            <span className="w-3 h-0.5 rounded" style={{ backgroundColor: classification?.grippers[0]?.color ?? "#22c55e", borderStyle: 'dashed' }}></span>
+            {classification?.grippers[0]?.label ?? "Gripper"}
+          </span>
+        )}
+        {hasGripper2 && classification?.grippers[1] && (
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-0.5 rounded" style={{ backgroundColor: classification.grippers[1].color, borderStyle: 'dashed' }}></span>
+            {classification.grippers[1].label}
           </span>
         )}
       </div>

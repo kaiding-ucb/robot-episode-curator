@@ -2,6 +2,7 @@
 
 import { useMemo, useState, useEffect, useRef, useCallback } from "react";
 import type { EpisodeSignalData, EpisodeStub } from "@/types/analysis";
+import { classifyActionDimensions, type ActionGrouping } from "@/utils/actionClassification";
 
 interface SignalComparisonChartProps {
   episodes: Map<string, EpisodeSignalData>;
@@ -231,9 +232,10 @@ const EPISODE_COLORS = [
 
 // Precomputed magnitude arrays per episode (computed once, reused everywhere)
 interface PrecomputedEpisodeSignals {
-  position: number[];
-  rotation: number[];
-  gripper: number[];
+  position: number[];   // group1 magnitude (position OR left arm OR joints 0-N/2)
+  rotation: number[];   // group2 magnitude (rotation OR right arm OR joints N/2-M)
+  gripper: number[];    // first gripper signal
+  gripper2: number[];   // second gripper signal (dual-arm only)
   accel: number[];
   gyro: number[];
 }
@@ -243,6 +245,7 @@ interface BatchRanges {
   position: { min: number; max: number };
   rotation: { min: number; max: number };
   gripper: { min: number; max: number };
+  gripper2: { min: number; max: number };
   accel: { min: number; max: number };
   gyro: { min: number; max: number };
 }
@@ -307,9 +310,10 @@ interface EpisodeChartRowProps {
   episodeData: EpisodeSignalData;
   batchRanges: BatchRanges;
   precomputedSignals?: PrecomputedEpisodeSignals;
+  classification?: ActionGrouping;
 }
 
-function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSignals }: EpisodeChartRowProps) {
+function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSignals, classification }: EpisodeChartRowProps) {
   const { actionTraces, imuTraces } = useMemo(() => {
     const actionTraces: SignalTrace[] = [];
     const imuTraces: SignalTrace[] = [];
@@ -318,26 +322,37 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSigna
       // Use precomputed magnitude arrays — no recomputation
       if (precomputedSignals.position.length > 0) {
         actionTraces.push({
-          label: "Position",
+          label: classification?.group1.label ?? "Position",
           data: precomputedSignals.position,
           normalized: normalizeBatch(precomputedSignals.position, batchRanges.position.min, batchRanges.position.max),
-          color: "#3b82f6",
+          color: classification?.group1.color ?? "#3b82f6",
         });
       }
       if (precomputedSignals.rotation.length > 0) {
         actionTraces.push({
-          label: "Rotation",
+          label: classification?.group2.label ?? "Rotation",
           data: precomputedSignals.rotation,
           normalized: normalizeBatch(precomputedSignals.rotation, batchRanges.rotation.min, batchRanges.rotation.max),
-          color: "#8b5cf6",
+          color: classification?.group2.color ?? "#8b5cf6",
         });
       }
       if (precomputedSignals.gripper.length > 0) {
+        const gripLabel = classification?.grippers[0]?.label ?? "Gripper";
         actionTraces.push({
-          label: "Gripper",
+          label: gripLabel,
           data: precomputedSignals.gripper,
           normalized: normalizeBatch(precomputedSignals.gripper, batchRanges.gripper.min, batchRanges.gripper.max),
-          color: "#22c55e",
+          color: classification?.grippers[0]?.color ?? "#22c55e",
+          dashed: true,
+        });
+      }
+      if (precomputedSignals.gripper2.length > 0) {
+        const gripLabel = classification?.grippers[1]?.label ?? "Gripper 2";
+        actionTraces.push({
+          label: gripLabel,
+          data: precomputedSignals.gripper2,
+          normalized: normalizeBatch(precomputedSignals.gripper2, batchRanges.gripper2.min, batchRanges.gripper2.max),
+          color: classification?.grippers[1]?.color ?? "#f97316",
           dashed: true,
         });
       }
@@ -360,7 +375,7 @@ function EpisodeChartRow({ episodeId, episodeData, batchRanges, precomputedSigna
     }
 
     return { actionTraces, imuTraces };
-  }, [precomputedSignals, batchRanges]);
+  }, [precomputedSignals, batchRanges, classification]);
 
   const hasError = episodeData.actions?.error || episodeData.imu?.error;
   const frameCount = episodeData.total_frames ?? episodeData.actions?.actions?.length ?? 0;
@@ -1198,18 +1213,33 @@ export default function SignalComparisonChart({
 
   const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId, sseFirstFrames);
 
+  // Derive action classification from first episode with labels (all episodes in a task share the same action space)
+  const classification: ActionGrouping | undefined = useMemo(() => {
+    for (const [, ep] of episodeList) {
+      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
+        const dims = ep.actions.actions[0].length;
+        return classifyActionDimensions(ep.actions.dimension_labels ?? null, dims);
+      }
+    }
+    return undefined;
+  }, [episodeList]);
+
   // Single precomputation pass: compute all magnitudes once per episode
   const precomputed = useMemo(() => {
     const map = new Map<string, PrecomputedEpisodeSignals>();
     for (const [id, ep] of episodeList) {
       const signals: PrecomputedEpisodeSignals = {
-        position: [], rotation: [], gripper: [], accel: [], gyro: [],
+        position: [], rotation: [], gripper: [], gripper2: [], accel: [], gyro: [],
       };
-      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
-        const dims = ep.actions.actions[0].length;
-        signals.position = computeMagnitude(ep.actions.actions, [0, 1, 2]);
-        if (dims > 3) signals.rotation = computeMagnitude(ep.actions.actions, [3, 4, 5]);
-        if (dims > 6) signals.gripper = computeGripperSignal(ep.actions.actions, 6);
+      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0 && classification) {
+        signals.position = computeMagnitude(ep.actions.actions, classification.group1.indices);
+        signals.rotation = computeMagnitude(ep.actions.actions, classification.group2.indices);
+        if (classification.grippers.length > 0) {
+          signals.gripper = computeGripperSignal(ep.actions.actions, classification.grippers[0].index);
+        }
+        if (classification.grippers.length > 1) {
+          signals.gripper2 = computeGripperSignal(ep.actions.actions, classification.grippers[1].index);
+        }
       }
       if (ep.imu && !ep.imu.error && ep.imu.timestamps?.length > 0) {
         signals.accel = computeIMUMagnitude(ep.imu.accel_x, ep.imu.accel_y, ep.imu.accel_z);
@@ -1218,13 +1248,14 @@ export default function SignalComparisonChart({
       map.set(id, signals);
     }
     return map;
-  }, [episodeList]);
+  }, [episodeList, classification]);
 
   // Derive batch ranges from precomputed magnitudes (no recomputation)
   const batchRanges: BatchRanges = useMemo(() => {
     const allPosition: number[][] = [];
     const allRotation: number[][] = [];
     const allGripper: number[][] = [];
+    const allGripper2: number[][] = [];
     const allAccel: number[][] = [];
     const allGyro: number[][] = [];
 
@@ -1232,6 +1263,7 @@ export default function SignalComparisonChart({
       if (signals.position.length > 0) allPosition.push(signals.position);
       if (signals.rotation.length > 0) allRotation.push(signals.rotation);
       if (signals.gripper.length > 0) allGripper.push(signals.gripper);
+      if (signals.gripper2.length > 0) allGripper2.push(signals.gripper2);
       if (signals.accel.length > 0) allAccel.push(signals.accel);
       if (signals.gyro.length > 0) allGyro.push(signals.gyro);
     }
@@ -1240,6 +1272,7 @@ export default function SignalComparisonChart({
       position: getBatchRange(allPosition),
       rotation: getBatchRange(allRotation),
       gripper: getBatchRange(allGripper),
+      gripper2: getBatchRange(allGripper2),
       accel: getBatchRange(allAccel),
       gyro: getBatchRange(allGyro),
     };
@@ -1266,6 +1299,21 @@ export default function SignalComparisonChart({
 
     return { positionTraces, rotationTraces, accelTraces, gyroTraces };
   }, [episodeList, precomputed]);
+
+  // Check if any episode actually has gripper data (for conditional legend)
+  const hasGripperData = useMemo(() => {
+    for (const [, signals] of precomputed) {
+      if (signals.gripper.length > 0) return true;
+    }
+    return false;
+  }, [precomputed]);
+
+  const hasGripper2Data = useMemo(() => {
+    for (const [, signals] of precomputed) {
+      if (signals.gripper2.length > 0) return true;
+    }
+    return false;
+  }, [precomputed]);
 
   // Handle navigate from frame comparison strip
   const handleStripNavigate = useCallback((episodeId: string, frameNumber: number) => {
@@ -1315,9 +1363,9 @@ export default function SignalComparisonChart({
               ))}
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <OverlayPanel title="Position Magnitude (x,y,z)" traces={positionTraces} batchRange={batchRanges.position} onInspect={setInspectIndex} />
+              <OverlayPanel title={`${classification?.group1.label ?? "Position"} Magnitude`} traces={positionTraces} batchRange={batchRanges.position} onInspect={setInspectIndex} />
               <OverlayPanel title="Accelerometer Magnitude" traces={accelTraces} batchRange={batchRanges.accel} onInspect={setInspectIndex} />
-              <OverlayPanel title="Rotation Magnitude" traces={rotationTraces} batchRange={batchRanges.rotation} onInspect={setInspectIndex} />
+              <OverlayPanel title={`${classification?.group2.label ?? "Rotation"} Magnitude`} traces={rotationTraces} batchRange={batchRanges.rotation} onInspect={setInspectIndex} />
               <OverlayPanel title="Gyroscope Magnitude" traces={gyroTraces} batchRange={batchRanges.gyro} onInspect={setInspectIndex} />
             </div>
 
@@ -1347,15 +1395,28 @@ export default function SignalComparisonChart({
               <div className="flex items-center gap-2">
                 <span className="text-xs font-medium text-gray-500">Actions</span>
                 <span className="flex items-center gap-1 text-[10px] text-gray-400">
-                  <span className="inline-block w-2.5 h-0.5 rounded bg-blue-500" />
-                  Position
-                  <span className="inline-block w-2.5 h-0.5 rounded bg-purple-500 ml-1" />
-                  Rotation
-                  <span
-                    className="inline-block w-2.5 h-0.5 rounded bg-green-500 ml-1"
-                    style={{ borderBottom: "1px dashed #22c55e" }}
-                  />
-                  Gripper
+                  <span className="inline-block w-2.5 h-0.5 rounded" style={{ backgroundColor: classification?.group1.color ?? "#3b82f6" }} />
+                  {classification?.group1.label ?? "Position"}
+                  <span className="inline-block w-2.5 h-0.5 rounded ml-1" style={{ backgroundColor: classification?.group2.color ?? "#8b5cf6" }} />
+                  {classification?.group2.label ?? "Rotation"}
+                  {hasGripperData && (
+                    <>
+                      <span
+                        className="inline-block w-2.5 h-0.5 rounded ml-1"
+                        style={{ backgroundColor: classification?.grippers[0]?.color ?? "#22c55e", borderBottom: `1px dashed ${classification?.grippers[0]?.color ?? "#22c55e"}` }}
+                      />
+                      {classification?.grippers[0]?.label ?? "Gripper"}
+                    </>
+                  )}
+                  {hasGripper2Data && classification?.grippers[1] && (
+                    <>
+                      <span
+                        className="inline-block w-2.5 h-0.5 rounded ml-1"
+                        style={{ backgroundColor: classification.grippers[1].color, borderBottom: `1px dashed ${classification.grippers[1].color}` }}
+                      />
+                      {classification.grippers[1].label}
+                    </>
+                  )}
                 </span>
               </div>
             </div>
@@ -1381,6 +1442,7 @@ export default function SignalComparisonChart({
                 episodeData={data}
                 batchRanges={batchRanges}
                 precomputedSignals={precomputed.get(id)}
+                classification={classification}
               />
             ))}
           </div>

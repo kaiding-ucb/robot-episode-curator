@@ -1565,6 +1565,23 @@ class ActionsData(BaseModel):
     error: Optional[str] = None
 
 
+def _extract_feature_names(feature_info: dict) -> Optional[List[str]]:
+    """Extract dimension names from a LeRobot feature definition.
+
+    Handles two formats found in info.json:
+    - Flat list: {"names": ["x", "y", "z"]}
+    - Nested dict: {"names": {"motors": ["left_waist", ...]}}
+    """
+    names = feature_info.get("names")
+    if isinstance(names, list):
+        return names
+    if isinstance(names, dict):
+        for v in names.values():
+            if isinstance(v, list):
+                return v
+    return None
+
+
 @router.get("/{episode_id:path}/imu", response_model=IMUData)
 async def get_imu_data(
     episode_id: str,
@@ -1709,11 +1726,27 @@ async def _get_lerobot_actions(
         else:
             actions.append([float(a)])
 
-    # Infer dimension labels
+    # Infer dimension labels — prefer real names from info.json metadata
+    # Try 'action' first, then the same fallback columns the extractor uses
     dimension_labels = None
     if actions:
         num_dims = len(actions[0])
-        if num_dims == 7:
+        _meta_names = None
+        if info:
+            features = info.get("features") or {}
+            for col in ["action", "observation.state", "end_pose", "start_pos"]:
+                feat = features.get(col)
+                if feat:
+                    names = _extract_feature_names(feat)
+                    if names:
+                        # If using a non-action column and gripper_width exists, append "gripper"
+                        if col != "action" and "gripper_width" in features:
+                            names = list(names) + ["gripper"]
+                        _meta_names = names
+                        break
+        if _meta_names and len(_meta_names) == num_dims:
+            dimension_labels = list(_meta_names)
+        elif num_dims == 7:
             dimension_labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
         elif num_dims == 8:
             dimension_labels = ["x", "y", "z", "rx", "ry", "rz", "state", "gripper"]
@@ -1721,6 +1754,8 @@ async def _get_lerobot_actions(
             dimension_labels = ["x", "y", "z", "rx", "ry", "rz"]
         elif num_dims == 3:
             dimension_labels = ["x", "y", "z"]
+        else:
+            dimension_labels = [f"dim_{i}" for i in range(num_dims)]
 
     return ActionsData(
         timestamps=timestamps,
@@ -1807,6 +1842,8 @@ async def get_actions_data(
             dimension_labels = ["x", "y", "z", "rx", "ry", "rz"]
         elif num_dims == 3:
             dimension_labels = ["x", "y", "z"]
+        elif num_dims > 0:
+            dimension_labels = [f"dim_{i}" for i in range(num_dims)]
 
         return ActionsData(
             timestamps=timestamps,

@@ -458,6 +458,23 @@ async def _download_parquet(
         return pd.read_parquet(io.BytesIO(response.content))
 
 
+def _extract_feature_names(feature_info: dict) -> Optional[List[str]]:
+    """Extract dimension names from a LeRobot feature definition.
+
+    Handles two formats found in info.json:
+    - Flat list: {"names": ["x", "y", "z"]}
+    - Nested dict: {"names": {"motors": ["left_waist", ...]}}
+    """
+    names = feature_info.get("names")
+    if isinstance(names, list):
+        return names
+    if isinstance(names, dict):
+        for v in names.values():
+            if isinstance(v, list):
+                return v
+    return None
+
+
 async def _extract_lerobot_episodes(
     client: httpx.AsyncClient,
     repo_id: str,
@@ -468,6 +485,7 @@ async def _extract_lerobot_episodes(
     filter_task_index: Optional[int] = None,
     branch: str = "main",
     max_frames_per_episode: int = 500,
+    action_feature_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Download LeRobot Parquet files and extract per-episode action data.
@@ -622,10 +640,12 @@ async def _extract_lerobot_episodes(
             actions_data["timestamps"] = timestamps
             actions_data["actions"] = actions
 
-            # Infer dimension labels
+            # Infer dimension labels — prefer real names from info.json metadata
             if actions:
                 num_dims = len(actions[0])
-                if num_dims == 7:
+                if action_feature_names and len(action_feature_names) == num_dims:
+                    actions_data["dimension_labels"] = list(action_feature_names)
+                elif num_dims == 7:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
                 elif num_dims == 8:
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz", "state", "gripper"]
@@ -633,6 +653,8 @@ async def _extract_lerobot_episodes(
                     actions_data["dimension_labels"] = ["x", "y", "z", "rx", "ry", "rz"]
                 elif num_dims == 3:
                     actions_data["dimension_labels"] = ["x", "y", "z"]
+                else:
+                    actions_data["dimension_labels"] = [f"dim_{i}" for i in range(num_dims)]
         else:
             actions_data = {"error": "No action or state column in Parquet data"}
 
@@ -1334,6 +1356,24 @@ async def get_signals_comparison(
                     except Exception as e:
                         logger.info(f"Tree API failed for data/ directory ({e}), no data files found")
 
+                # Extract real action dimension names from info.json features
+                # Try 'action' first, then the same fallback columns the extractor uses
+                _action_names = None
+                _used_col = None
+                if info:
+                    features = info.get("features") or {}
+                    for col in ["action", "observation.state", "end_pose", "start_pos"]:
+                        feat = features.get(col)
+                        if feat:
+                            names = _extract_feature_names(feat)
+                            if names:
+                                _action_names = names
+                                _used_col = col
+                                break
+                    # If using a non-action column and gripper_width exists, append "gripper"
+                    if _action_names and _used_col and _used_col != "action" and "gripper_width" in features:
+                        _action_names = list(_action_names) + ["gripper"]
+
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     episodes = await _extract_lerobot_episodes(
                         client, repo_id, data_files, headers,
@@ -1342,6 +1382,7 @@ async def get_signals_comparison(
                         filter_task_index=task_index if use_task_index_filter else None,
                         branch=data_branch,
                         max_frames_per_episode=resolution,
+                        action_feature_names=_action_names,
                     )
 
                 # Sort by global index, then re-index to task-local indices
