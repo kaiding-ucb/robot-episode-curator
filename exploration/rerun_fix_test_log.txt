@@ -1,0 +1,38 @@
+== STAGE A: SEQUENTIAL (baseline, one at a time) ==
+  OK                 1.7s  frames=110  libero/task1_mug-plate ep0  (generated)
+  OK                 1.5s  frames=96  libero/task1_mug-plate ep1  (generated)
+  OK                 1.8s  frames=135  libero/task1_mug-plate ep2  (generated)
+  OK                 1.6s  frames=138  libero/task2_mug-chocolate ep0  (generated)
+  OK                 1.4s  frames=100  libero/task2_mug-chocolate ep1  (generated)
+  OK                 1.8s  frames=85  libero/task2_mug-chocolate ep2  (generated)
+  OK                 6.4s  frames=400  umi ep0  (generated)
+  OK                 1.1s  frames=381  umi ep5 (flagged)  (generated)
+  OK                 1.0s  frames=369  umi ep6 (flagged)  (generated)
+  OK                 4.6s  frames=166  droid ep0  (generated)
+  OK                 0.9s  frames=238  droid ep1  (generated)
+  OK                 0.9s  frames=142  droid ep2  (generated)
+Sequential total: 24.7s
+
+== STAGE B: CONCURRENT x12 (stress test of 'backend stuck' regression) ==
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep1
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep0
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep0
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep2
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep1
+  OK                 0.0s  frames=None  umi ep5 (flagged)
+  OK                 0.0s  frames=None  umi ep0
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep2
+  OK                 0.0s  frames=None  umi ep6 (flagged)
+  OK                 0.0s  frames=None  droid ep1
+  OK                 0.0s  frames=None  droid ep0
+  OK                 0.0s  frames=None  droid ep2
+Concurrent total: 0.0s
+
+== STAGE C: RAPID SWITCH (same dataset, episodes fired at 200ms spacing, earlier responses should dedup/abort) ==
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep2
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep1
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep1
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep2
+  OK                 0.0s  frames=None  libero/task1_mug-plate ep0
+  OK                 0.0s  frames=None  libero/task2_mug-chocolate ep0
+Rapid total: 1.2s

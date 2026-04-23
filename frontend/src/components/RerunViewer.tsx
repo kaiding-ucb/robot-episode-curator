@@ -1,86 +1,244 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import dynamic from "next/dynamic";
-
-// Dynamic import to avoid SSR issues with WebAssembly
-const WebViewer = dynamic(
-  () => import("@rerun-io/web-viewer-react").then((mod) => mod.default),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex items-center justify-center h-full bg-gray-900 text-gray-400">
-        <div className="text-center">
-          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-          <p>Loading Rerun Viewer...</p>
-        </div>
-      </div>
-    )
-  }
-);
+import { useState, useEffect, useCallback, useRef } from "react";
 
 interface RerunViewerProps {
   datasetId: string | null;
   episodeId: string | null;
   onClose?: () => void;
+  comparisonRrdUrl?: string | null;
 }
 
-export default function RerunViewer({ datasetId, episodeId, onClose }: RerunViewerProps) {
+// Module-level singleton — survives React Strict Mode mount→unmount→remount
+// without losing the WebGL context.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let globalViewer: any = null;
+let globalCanvas: HTMLCanvasElement | null = null;
+let currentRrdUrl: string | null = null;
+let cleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Suppress wasm-bindgen externref_shim errors that fire from async callbacks
+// of an *old* Rerun recording whose WASM slot was freed when we switched
+// rrds. These are cosmetic — the viewer recovers on its own — but Next.js
+// devtools surfaces them as a big error overlay.
+let errorHandlerInstalled = false;
+function installErrorSuppressor() {
+  if (errorHandlerInstalled || typeof window === "undefined") return;
+  errorHandlerInstalled = true;
+  const isRerunBenignError = (msg: unknown): boolean => {
+    const s = typeof msg === "string" ? msg : (msg instanceof Error ? msg.message : String(msg ?? ""));
+    // (a) Stale externref from an old recording's async WASM callback
+    // (b) Mid-flight rrd fetch aborted because the user switched episodes
+    return (
+      /closure\d+_externref_shim/.test(s) ||
+      /ERR_CONTENT_LENGTH_MISMATCH/.test(s) ||
+      (/(Failed to fetch|network error|NetworkError)/i.test(s) && /\.rrd/.test(s))
+    );
+  };
+  window.addEventListener("error", (e) => {
+    if (isRerunBenignError(e.error?.message ?? e.message)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, true);
+  window.addEventListener("unhandledrejection", (e) => {
+    if (isRerunBenignError(e.reason?.message ?? e.reason)) {
+      e.preventDefault();
+    }
+  }, true);
+}
+
+// Hide everything except the viewport (cameras + state + action views) and
+// the bottom time controls. Applied both via the backend blueprint and here
+// as a belt-and-suspenders in case the .rrd is loaded from an older cache.
+function applyPanelOverrides(viewer: { override_panel_state?: (p: string, s: string) => void } | null) {
+  if (!viewer?.override_panel_state) return;
+  try { viewer.override_panel_state("blueprint", "hidden"); } catch { /* ignore */ }
+  try { viewer.override_panel_state("selection", "hidden"); } catch { /* ignore */ }
+  try { viewer.override_panel_state("time", "collapsed"); } catch { /* ignore */ }
+}
+
+function RerunCanvas({ rrdUrl }: { rrdUrl: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    installErrorSuppressor();
+    const container = containerRef.current;
+    if (!container) return;
+
+    // Cancel any pending cleanup from a previous unmount (Strict Mode remount)
+    if (cleanupTimer) {
+      clearTimeout(cleanupTimer);
+      cleanupTimer = null;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      const rerun = await import("@rerun-io/web-viewer");
+      if (cancelled) return;
+
+      if (!globalViewer) {
+        // First time — create the viewer
+        globalViewer = new rerun.WebViewer();
+        await globalViewer.start(null, container, {
+          width: "100%",
+          height: "100%",
+          hide_welcome_screen: true,
+        });
+        globalCanvas = container.querySelector("canvas");
+        applyPanelOverrides(globalViewer);
+      } else {
+        // Re-attach existing canvas to new container on remount
+        if (globalCanvas && globalCanvas.parentElement !== container) {
+          container.appendChild(globalCanvas);
+        }
+        applyPanelOverrides(globalViewer);
+      }
+
+      if (cancelled) return;
+
+      // Close the previous recording before opening a new one — otherwise Rerun
+      // keeps both loaded and the metadata panel may continue showing the stale
+      // episode (root cause of the "episode_1 header / episode_18 metadata" bug).
+      //
+      // Wrap in try/catch: on rapid episode switching, a pending load handler
+      // from the previous rrd can fire after we call close(), with a stale
+      // externref into freed WASM memory. Swallow and continue — open() will
+      // reset viewer state for the new recording.
+      if (currentRrdUrl && currentRrdUrl !== rrdUrl) {
+        try { globalViewer.close(currentRrdUrl); } catch (e) {
+          console.warn("[RerunViewer] close() on previous rrd raised:", e);
+        }
+      }
+      try {
+        globalViewer.open(rrdUrl);
+        currentRrdUrl = rrdUrl;
+      } catch (e) {
+        console.error("[RerunViewer] open() raised — recreating viewer:", e);
+        try { globalViewer?.stop(); } catch { /* ignore */ }
+        globalViewer = null;
+        globalCanvas = null;
+        currentRrdUrl = null;
+        // Recreate on next tick
+        globalViewer = new rerun.WebViewer();
+        await globalViewer.start(null, container, {
+          width: "100%",
+          height: "100%",
+          hide_welcome_screen: true,
+        });
+        globalCanvas = container.querySelector("canvas");
+        applyPanelOverrides(globalViewer);
+        globalViewer.open(rrdUrl);
+        currentRrdUrl = rrdUrl;
+      }
+    })().catch((err) => {
+      if (!cancelled) {
+        console.error("[RerunViewer] Failed to start viewer:", err);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      // Delay cleanup to distinguish Strict Mode remount from true unmount.
+      // If the component remounts within 200ms, the timer is cancelled above.
+      cleanupTimer = setTimeout(() => {
+        if (!document.querySelector("[data-rerun-container]")) {
+          try { globalViewer?.stop(); } catch { /* ignore */ }
+          globalViewer = null;
+          globalCanvas = null;
+          currentRrdUrl = null;
+        }
+        cleanupTimer = null;
+      }, 200);
+    };
+  }, [rrdUrl]);
+
+  return (
+    <div
+      ref={containerRef}
+      data-rerun-container
+      style={{ width: "100%", height: "100%", position: "relative" }}
+    />
+  );
+}
+
+export default function RerunViewer({ datasetId, episodeId, onClose, comparisonRrdUrl }: RerunViewerProps) {
   const [rrdUrl, setRrdUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generationProgress, setGenerationProgress] = useState<string>("");
 
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001/api";
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  const abortRef = useRef<AbortController | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
 
-  const generateRrd = useCallback(async () => {
-    if (!datasetId || !episodeId) return;
+  useEffect(() => {
+    // If a comparison URL is provided, use it directly
+    if (comparisonRrdUrl) {
+      setRrdUrl(comparisonRrdUrl);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    if (!datasetId || !episodeId) {
+      setRrdUrl(null);
+      return;
+    }
+
+    // Cancel any in-flight request from a previous episode. Without this,
+    // rapid episode clicks stack concurrent generate_rrd calls; the late
+    // responses arrive after the user has moved on and stomp the current
+    // rrdUrl, which in turn triggers a WASM open() on a stale handle.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     setLoading(true);
     setError(null);
     setGenerationProgress("Generating Rerun recording...");
 
-    try {
-      // Request RRD generation from backend
-      const response = await fetch(
-        `${apiBaseUrl}/rerun/generate/${encodeURIComponent(episodeId)}?dataset_id=${encodeURIComponent(datasetId)}`,
-        { method: "POST" }
-      );
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || `Failed to generate RRD: ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      if (data.rrd_url) {
-        // Construct full URL for the RRD file
+    (async () => {
+      try {
+        const response = await fetch(
+          `${apiBaseUrl}/rerun/generate/${encodeURIComponent(episodeId)}?dataset_id=${encodeURIComponent(datasetId)}&max_frames=0`,
+          { method: "POST", signal: controller.signal }
+        );
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.detail || `Failed to generate RRD: ${response.status}`);
+        }
+        const data = await response.json();
+        if (controller.signal.aborted) return;
+        if (!data.rrd_url) throw new Error("No RRD URL returned");
         const baseUrl = apiBaseUrl.replace("/api", "");
-        const fullRrdUrl = `${baseUrl}${data.rrd_url}`;
-        console.log("[RerunViewer] Generated RRD URL:", fullRrdUrl);
-        console.log("[RerunViewer] Response data:", data);
+        const sep = data.rrd_url.includes("?") ? "&" : "?";
+        const fullRrdUrl = `${baseUrl}${data.rrd_url}${sep}v=${encodeURIComponent(episodeId)}_${Date.now()}`;
         setRrdUrl(fullRrdUrl);
         setGenerationProgress("");
-      } else {
-        throw new Error("No RRD URL returned");
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        // Ignore AbortError — that's our own cancellation, not a real failure
+        if (err instanceof Error && err.name === "AbortError") return;
+        setError(msg || "Failed to generate Rerun recording");
+        setGenerationProgress("");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to generate Rerun recording");
-      setGenerationProgress("");
-    } finally {
-      setLoading(false);
-    }
-  }, [datasetId, episodeId, apiBaseUrl]);
+    })();
 
-  // Generate RRD when episode changes
-  useEffect(() => {
-    if (datasetId && episodeId) {
-      generateRrd();
-    } else {
-      setRrdUrl(null);
-    }
-  }, [datasetId, episodeId, generateRrd]);
+    return () => {
+      controller.abort();
+    };
+  }, [datasetId, episodeId, comparisonRrdUrl, apiBaseUrl, retryNonce]);
+
+  const generateRrd = useCallback(() => {
+    abortRef.current?.abort();
+    setError(null);
+    setRrdUrl(null);
+    setRetryNonce((n) => n + 1);
+  }, []);
 
   if (!episodeId) {
     return (
@@ -157,7 +315,6 @@ export default function RerunViewer({ datasetId, episodeId, onClose }: RerunView
 
   return (
     <div className="relative h-full w-full bg-gray-900">
-      {/* Close button */}
       {onClose && (
         <button
           onClick={onClose}
@@ -170,20 +327,7 @@ export default function RerunViewer({ datasetId, episodeId, onClose }: RerunView
         </button>
       )}
 
-      {/* Debug: Show RRD URL */}
-      <div className="absolute bottom-2 left-2 z-10 bg-black/80 text-green-400 text-xs px-2 py-1 rounded font-mono max-w-md truncate">
-        RRD: {rrdUrl}
-      </div>
-
-      {/* Rerun WebViewer */}
-      <WebViewer
-        width="100%"
-        height="100%"
-        rrd={rrdUrl}
-        hide_welcome_screen={true}
-        onReady={() => console.log("[RerunViewer] Viewer ready")}
-        onRecordingOpen={(event) => console.log("[RerunViewer] Recording opened:", event)}
-      />
+      <RerunCanvas rrdUrl={rrdUrl} />
     </div>
   );
 }
