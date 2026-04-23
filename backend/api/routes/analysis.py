@@ -922,14 +922,14 @@ async def _lerobot_frame_counts_for_task(
     fps = info.get("fps", 30) if info else 30
 
     episode_counts = []
-    for local_idx, (_, row) in enumerate(task_episodes.iterrows()):
+    for _, row in task_episodes.iterrows():
         ep_idx = int(row["episode_index"])
         length = int(row["length"]) if "length" in row.index else 0
         episode_counts.append(EpisodeFrameCount(
-            episode_id=f"episode_{local_idx}",
+            episode_id=f"episode_{ep_idx}",
             estimated_frames=length,
             size_bytes=0,
-            file_name=f"episode_{local_idx} ({length} frames, {length/fps:.1f}s)",
+            file_name=f"episode_{ep_idx} ({length} frames, {length/fps:.1f}s)",
         ))
 
     stats = _compute_statistics(episode_counts)
@@ -1042,12 +1042,12 @@ async def _lerobot_frame_counts_from_api(
 
     # Build frame count distribution from API data
     episode_counts = []
-    for local_idx, (ep_idx, length) in enumerate(sorted(episode_lengths.items())):
+    for ep_idx, length in sorted(episode_lengths.items()):
         episode_counts.append(EpisodeFrameCount(
-            episode_id=f"episode_{local_idx}",
+            episode_id=f"episode_{ep_idx}",
             estimated_frames=length,
             size_bytes=0,
-            file_name=f"episode_{local_idx} ({length} frames, {length/fps:.1f}s)",
+            file_name=f"episode_{ep_idx} ({length} frames, {length/fps:.1f}s)",
         ))
 
     stats = _compute_statistics(episode_counts)
@@ -1385,13 +1385,13 @@ async def get_signals_comparison(
                         action_feature_names=_action_names,
                     )
 
-                # Sort by global index, then re-index to task-local indices
+                # Sort by global index; keep episode_id = f"episode_{global}" so
+                # labels match the LeftSidebar and the /tasks/{task}/episodes API.
                 episodes.sort(key=lambda ep: ep.get("global_episode_index") or 0)
                 for i, ep in enumerate(episodes):
                     global_idx = ep.get("global_episode_index")
                     ep["total_frames"] = ep_frame_counts.get(global_idx) if global_idx is not None else None
                     ep["episode_index"] = i
-                    ep["episode_id"] = f"episode_{i}"
 
                 total = len(episodes)
                 yield f"data: {json.dumps({'type': 'total', 'total_episodes': total})}\n\n"
