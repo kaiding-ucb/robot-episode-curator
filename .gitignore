@@ -28,3 +28,9 @@ test-results/
 .env
 .env.local
 *.log
+
+# Repo-root debug screenshots (Playwright runs, manual captures, verification snapshots)
+/*.png
+/*.jpg
+/*.jpeg
+
