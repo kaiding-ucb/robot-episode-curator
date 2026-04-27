@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useFrameCounts, useSignalComparison, useDatasetCapabilities } from "@/hooks/useDatasetAnalysis";
-import { useDatasets, useTasks, useDatasetOverview } from "@/hooks/useApi";
+import { useFrameCounts, useSignalComparison, useDatasetCapabilities, useMetaSummary } from "@/hooks/useDatasetAnalysis";
+import { useDatasets, useTasks } from "@/hooks/useApi";
 import FrameCountChart from "./FrameCountChart";
 import { PhaseAwarePanel } from "./PhaseAwarePanel";
+import SummaryPanel from "./SummaryPanel";
 
 interface DatasetAnalysisProps {
   datasetId: string | null;
@@ -16,14 +17,14 @@ interface DatasetAnalysisProps {
   onViewComparisonInRerun?: (rrdUrl: string) => void;
 }
 
-type AnalysisTab = "frame-counts" | "signal-comparison";
+type AnalysisTab = "summary" | "frame-counts" | "signal-comparison";
 
 export default function DatasetAnalysis({
   datasetId: initialDatasetId,
   onClose,
   onNavigateToEpisode,
 }: DatasetAnalysisProps) {
-  const [activeTab, setActiveTab] = useState<AnalysisTab>("frame-counts");
+  const [activeTab, setActiveTab] = useState<AnalysisTab>("summary");
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [chosenDatasetId, setChosenDatasetId] = useState<string | null>(initialDatasetId);
 
@@ -39,11 +40,8 @@ export default function DatasetAnalysis({
   // Dataset list for the picker
   const { datasets } = useDatasets();
 
-  // Dataset overview for metadata display
-  const { overview } = useDatasetOverview(datasetId);
-
   // Data hooks
-  const { tasks, totalTasks, loading: tasksLoading } = useTasks(datasetId);
+  const { tasks, loading: tasksLoading } = useTasks(datasetId);
   const {
     capabilities,
     fetchCapabilities,
@@ -56,23 +54,33 @@ export default function DatasetAnalysis({
     fetchFrameCounts,
     reset: resetFrameCounts,
   } = useFrameCounts();
+  const {
+    data: metaSummary,
+    loading: metaSummaryLoading,
+    error: metaSummaryError,
+    fetchSummary: fetchMetaSummary,
+    reset: resetMetaSummary,
+  } = useMetaSummary();
   // Legacy SSE-based signal-comparison hook is still wired so any in-flight
   // analysis is aborted on dataset/task change. Only the cancel/reset
   // handlers are consumed; the streamed signal data is no longer rendered.
   const { cancelAnalysis, reset: resetSignals } = useSignalComparison();
 
-  // Clear all stale data and fetch capabilities when dataset changes
+  // Clear all stale data and fetch capabilities + meta summary when dataset changes
   useEffect(() => {
     if (datasetId) {
       resetFrameCounts();
       resetSignals();
+      resetMetaSummary();
       fetchCapabilities(datasetId);
+      fetchMetaSummary(datasetId);
     } else {
       resetCapabilities();
       resetFrameCounts();
       resetSignals();
+      resetMetaSummary();
     }
-  }, [datasetId, fetchCapabilities, resetCapabilities, resetFrameCounts, resetSignals]);
+  }, [datasetId, fetchCapabilities, resetCapabilities, resetFrameCounts, resetSignals, fetchMetaSummary, resetMetaSummary]);
 
   // If signal comparison not supported, default to frame-counts tab
   useEffect(() => {
@@ -80,6 +88,13 @@ export default function DatasetAnalysis({
       setActiveTab("frame-counts");
     }
   }, [capabilities, activeTab]);
+
+  // If summary unavailable for this dataset, fall back to frame-counts
+  useEffect(() => {
+    if (metaSummary && metaSummary.source === "unavailable" && activeTab === "summary") {
+      setActiveTab("frame-counts");
+    }
+  }, [metaSummary, activeTab]);
 
   // Auto-select first task when tasks load (only after fetch completes)
   useEffect(() => {
@@ -172,91 +187,29 @@ export default function DatasetAnalysis({
         )}
       </div>
 
-      {/* Dataset Metadata */}
-      {overview && (
-        <div className="mb-4 px-3 py-2.5 bg-gray-50 dark:bg-gray-800/50 rounded-lg" data-testid="dataset-metadata">
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Format / Gated / License badges */}
-            {overview.format_detected && (
-              <span className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-                {overview.format_detected}
-              </span>
-            )}
-            {overview.gated && (
-              <span className="px-2 py-0.5 text-xs rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
-                Gated
-              </span>
-            )}
-            {overview.license && (
-              <span className="px-2 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
-                {overview.license}
-              </span>
-            )}
-
-            {/* Separator */}
-            {(overview.format_detected || overview.gated || overview.license) && (
-              <span className="w-px h-4 bg-gray-300 dark:bg-gray-600" />
-            )}
-
-            {/* Totals */}
-            {(() => {
-              const totalEpisodes = overview.total_episodes
-                ?? (tasks.length > 0 ? tasks.reduce((sum, t) => sum + (t.episode_count ?? 0), 0) : null);
-              return totalEpisodes != null && totalEpisodes > 0 ? (
-                <span className="text-xs text-gray-600 dark:text-gray-400">
-                  <span className="font-semibold">{totalEpisodes.toLocaleString()}</span> episodes
-                </span>
-              ) : null;
-            })()}
-            {overview.total_frames != null && (
-              <span className="text-xs text-gray-600 dark:text-gray-400">
-                <span className="font-semibold">{overview.total_frames.toLocaleString()}</span> frames
-              </span>
-            )}
-            {totalTasks > 0 && (
-              <span className="text-xs text-gray-600 dark:text-gray-400">
-                <span className="font-semibold">{totalTasks}</span> tasks
-              </span>
-            )}
-
-            {/* Environment / Perspective */}
-            {overview.environment && (
-              <span className="text-xs text-gray-600 dark:text-gray-400">
-                <span className="font-medium">Env:</span> {overview.environment}
-              </span>
-            )}
-            {overview.perspective && (
-              <span className="text-xs text-gray-600 dark:text-gray-400">
-                <span className="font-medium">View:</span> {overview.perspective}
-              </span>
-            )}
-
-            {/* Modalities */}
-            {overview.modalities && overview.modalities.length > 0 && (
-              <>
-                <span className="w-px h-4 bg-gray-300 dark:bg-gray-600" />
-                {overview.modalities.map((mod) => (
-                  <span
-                    key={mod}
-                    className={`px-2 py-0.5 text-xs rounded-full ${
-                      mod === "rgb" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300" :
-                      mod === "depth" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" :
-                      mod === "imu" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" :
-                      mod === "tactile" ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300" :
-                      "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
-                    }`}
-                  >
-                    {mod.toUpperCase()}
-                  </span>
-                ))}
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-gray-200 dark:border-gray-700">
+        {(() => {
+          const summaryDisabled = metaSummary !== null && metaSummary.source === "unavailable";
+          return (
+            <button
+              onClick={() => !summaryDisabled && setActiveTab("summary")}
+              className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
+                summaryDisabled
+                  ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
+                  : activeTab === "summary"
+                    ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                    : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+              }`}
+              data-testid="summary-tab"
+            >
+              Summary
+              {summaryDisabled && (
+                <span className="ml-1.5 text-xs text-gray-400 dark:text-gray-500">(N/A)</span>
+              )}
+            </button>
+          );
+        })()}
         <button
           onClick={() => setActiveTab("frame-counts")}
           className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
@@ -297,6 +250,18 @@ export default function DatasetAnalysis({
 
       {/* Tab Content */}
       <div className="min-h-[300px]">
+        {activeTab === "summary" && (
+          <SummaryPanel
+            summary={metaSummary}
+            loading={metaSummaryLoading}
+            error={metaSummaryError}
+            onTaskSelected={(taskName) => {
+              setSelectedTask(taskName);
+              setActiveTab("frame-counts");
+            }}
+          />
+        )}
+
         {activeTab === "frame-counts" && (
           <div>
             {frameCountLoading && (

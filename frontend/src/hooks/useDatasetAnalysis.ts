@@ -9,6 +9,7 @@ import type {
   SignalAnalysisState,
   DatasetCapabilities,
 } from "@/types/analysis";
+import type { MetaSummaryResponse } from "@/types/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
@@ -90,6 +91,39 @@ export function useFrameCounts() {
   }, []);
 
   return { data, loading, error, fetchFrameCounts, reset };
+}
+
+/**
+ * Fetch LeRobot meta/info.json + tasks.parquet for the Summary tab.
+ */
+export function useMetaSummary() {
+  const [data, setData] = useState<MetaSummaryResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchSummary = useCallback(async (datasetId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/datasets/${datasetId}/meta-summary`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result: MetaSummaryResponse = await res.json();
+      setData(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch meta summary");
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    setData(null);
+    setLoading(false);
+    setError(null);
+  }, []);
+
+  return { data, loading, error, fetchSummary, reset };
 }
 
 /**

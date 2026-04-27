@@ -180,6 +180,20 @@ export interface DatasetOverview {
   cached_at?: string;
 }
 
+// === META SUMMARY TYPES (Summary tab) ===
+export interface MetaTaskRow {
+  task_index: number;
+  task_description: string;
+  episode_count?: number;
+}
+
+export interface MetaSummaryResponse {
+  info: Record<string, unknown> | null;
+  tasks: MetaTaskRow[];
+  path_prefix: string | null;
+  source: "lerobot_meta" | "unavailable";
+}
+
 // === MULTI-SUBDATASET TYPES (Phase 4) ===
 export interface SubdatasetInfo {
   name: string;

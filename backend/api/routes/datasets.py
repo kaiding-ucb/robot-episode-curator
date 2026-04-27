@@ -1735,6 +1735,88 @@ async def get_dataset_overview(
     return overview
 
 
+# === Meta Summary Endpoint ===
+
+
+class MetaTaskRow(BaseModel):
+    task_index: int
+    task_description: str
+    episode_count: Optional[int] = None
+
+
+class MetaSummaryResponse(BaseModel):
+    info: Optional[Dict[str, Any]] = None
+    tasks: List[MetaTaskRow] = []
+    path_prefix: Optional[str] = None
+    source: str  # "lerobot_meta" | "unavailable"
+
+
+@router.get("/{dataset_id}/meta-summary", response_model=MetaSummaryResponse)
+async def get_meta_summary(dataset_id: str):
+    """
+    Return raw LeRobot meta/info.json plus tasks (from meta/tasks.parquet) for a dataset.
+
+    Used by the Summary tab in Dataset Analysis to visualize the meta folder
+    without re-fetching from HuggingFace (uses cached helpers).
+    """
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
+
+    config = all_datasets[dataset_id]
+    repo_id = config.get("repo_id")
+    if not repo_id:
+        return MetaSummaryResponse(source="unavailable")
+
+    if not await is_lerobot_dataset(config):
+        return MetaSummaryResponse(source="unavailable")
+
+    info = await fetch_lerobot_info(repo_id)
+    tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+
+    rows: List[MetaTaskRow] = []
+    if tasks_df is not None:
+        # Episode-count per task (best-effort, may be None for some formats)
+        ep_counts: Dict[int, int] = {}
+        try:
+            ep_task_map = await get_episode_task_map(repo_id)
+            if ep_task_map:
+                for _, t_idx in ep_task_map.items():
+                    ep_counts[t_idx] = ep_counts.get(t_idx, 0) + 1
+        except Exception as e:
+            logger.warning(f"meta-summary: episode-task map failed for {dataset_id}: {e}")
+
+        task_col = "task_description" if "task_description" in tasks_df.columns else None
+        if task_col is None:
+            for col in tasks_df.columns:
+                if col != "task_index":
+                    task_col = col
+                    break
+
+        for _, row in tasks_df.iterrows():
+            try:
+                t_idx = int(row["task_index"])
+            except Exception:
+                continue
+            desc = str(row[task_col]).strip() if task_col else f"Untitled (task {t_idx})"
+            rows.append(MetaTaskRow(
+                task_index=t_idx,
+                task_description=desc or f"Untitled (task {t_idx})",
+                episode_count=ep_counts.get(t_idx),
+            ))
+        rows.sort(key=lambda r: r.task_index)
+
+    if info is None and not rows:
+        return MetaSummaryResponse(source="unavailable")
+
+    return MetaSummaryResponse(
+        info=info,
+        tasks=rows,
+        path_prefix=None,
+        source="lerobot_meta",
+    )
+
+
 # === Probe and Add Dataset Endpoints ===
 
 
