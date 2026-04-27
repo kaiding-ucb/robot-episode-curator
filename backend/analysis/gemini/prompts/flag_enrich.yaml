@@ -1,0 +1,84 @@
+version: 1
+purpose: |
+  Called once per batch of flagged episodes (up to 7 per call). For each
+  flagged episode, confirm/reject the statistical reason, rate severity, and
+  surface any novel anomalies that the stats missed.
+
+system: |
+  You are a robotics teleoperation analyst. You are reviewing statistically
+  flagged episodes against normal reference episodes to decide: (a) is the
+  flag a real anomaly or stat noise, (b) what specifically in the video
+  corresponds to it, (c) what else is unusual in the flagged episode that
+  the statistics do not capture.
+
+  Be specific with timestamps. Do not invent. If you are unsure, say "cannot
+  tell from video" — that is strictly preferred over guessing.
+
+user_template: |
+  TASK: {task_name}
+
+  Episodes are recorded at {fps} Hz. For each video you will also receive:
+    • phase timeline in seconds (Approach/Grasp/Lift/Transit/Place/Release/Return
+      per cycle)
+    • gripper event log: every pre-merge open/close transition in seconds.
+      The logical cycle count after merging brief intermediate gaps is given
+      as "cycles=N". When the raw event count exceeds 2×N, there is at least
+      one intermediate gripper toggle INSIDE a cycle — this typically means
+      a failed first grasp, slip, or re-grip recovery. Use this to ground
+      your interpretation of any "slow lift" or "long place" observations.
+    • per-phase position & rotation magnitude summary (mean / peak).
+
+  NORMAL REFERENCE episodes (videos 1-{n_normals}, unflagged, from different clusters):
+  {normal_videos_block}
+
+  FLAGGED episodes to review (videos {first_flagged_video}-{last_flagged_video}):
+  {flagged_videos_block}
+
+  For EACH flagged episode, answer:
+
+  Q1 (confirm):   Does the video confirm the statistical flag? Describe what
+                  specifically in the video corresponds, AND cross-reference
+                  the gripper event log / phase timings when relevant. If a
+                  "slow phase" coincides with an intermediate gripper toggle,
+                  explicitly call it a re-grip / failed-grasp recovery rather
+                  than just "slow motion".
+  Q2 (severity):  Rate the observed behaviour:
+                    "stylistic"   — natural variance, not a mistake
+                    "suspicious"  — unusual but plausibly deliberate
+                    "mistake"     — a likely teleop error (drop, slip, collision,
+                                    retry, failed first grasp)
+  Q3 (novel):     Other anomalies visible in THIS flagged episode that the
+                  statistical flag does NOT mention. Focus on: dropped object,
+                  collision, grip slip, re-grip, wrist pose error, unusual
+                  scene, recovery move. Cite a phase and timestamp. Zero-or-more
+                  observations.
+
+  Respond as strict JSON: an array where each element has these fields:
+    "episode_id":    string — must match one of the flagged episode ids
+    "confirmation":  string — 1-2 sentence answer to Q1 with timestamp(s)
+    "severity":      "stylistic" | "suspicious" | "mistake"
+    "novel_observations": array of objects {{phase, cycle, timestamp, observation}}
+
+response_schema:
+  type: object
+  properties:
+    episodes:
+      type: array
+      items:
+        type: object
+        properties:
+          episode_id: {type: string}
+          confirmation: {type: string}
+          severity: {type: string, enum: [stylistic, suspicious, mistake]}
+          novel_observations:
+            type: array
+            items:
+              type: object
+              properties:
+                phase: {type: string}
+                cycle: {type: integer}
+                timestamp: {type: string}
+                observation: {type: string}
+              required: [phase, timestamp, observation]
+        required: [episode_id, confirmation, severity, novel_observations]
+  required: [episodes]

@@ -1,15 +1,19 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { useFrameCounts, useSignalComparison, useDatasetCapabilities } from "@/hooks/useDatasetAnalysis";
 import { useDatasets, useTasks, useDatasetOverview } from "@/hooks/useApi";
 import FrameCountChart from "./FrameCountChart";
-import SignalComparisonChart from "./SignalComparisonChart";
+import { PhaseAwarePanel } from "./PhaseAwarePanel";
 
 interface DatasetAnalysisProps {
   datasetId: string | null;
   onClose: () => void;
-  onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number, targetFrame?: number) => void;
+  onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number) => void;
+  // Kept on the props interface for source compatibility with the modal host.
+  // The legacy "Compare Episodes" button that consumed this was removed when
+  // the envelope view retired.
+  onViewComparisonInRerun?: (rrdUrl: string) => void;
 }
 
 type AnalysisTab = "frame-counts" | "signal-comparison";
@@ -21,7 +25,6 @@ export default function DatasetAnalysis({
 }: DatasetAnalysisProps) {
   const [activeTab, setActiveTab] = useState<AnalysisTab>("frame-counts");
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
-  const [maxEpisodes, setMaxEpisodes] = useState(5);
   const [chosenDatasetId, setChosenDatasetId] = useState<string | null>(initialDatasetId);
 
   // Sync if parent passes a new datasetId
@@ -43,7 +46,6 @@ export default function DatasetAnalysis({
   const { tasks, totalTasks, loading: tasksLoading } = useTasks(datasetId);
   const {
     capabilities,
-    loading: capabilitiesLoading,
     fetchCapabilities,
     reset: resetCapabilities,
   } = useDatasetCapabilities();
@@ -54,12 +56,10 @@ export default function DatasetAnalysis({
     fetchFrameCounts,
     reset: resetFrameCounts,
   } = useFrameCounts();
-  const {
-    state: signalState,
-    startAnalysis,
-    cancelAnalysis,
-    reset: resetSignals,
-  } = useSignalComparison();
+  // Legacy SSE-based signal-comparison hook is still wired so any in-flight
+  // analysis is aborted on dataset/task change. Only the cancel/reset
+  // handlers are consumed; the streamed signal data is no longer rendered.
+  const { cancelAnalysis, reset: resetSignals } = useSignalComparison();
 
   // Clear all stale data and fetch capabilities when dataset changes
   useEffect(() => {
@@ -95,12 +95,6 @@ export default function DatasetAnalysis({
       fetchFrameCounts(datasetId, selectedTask);
     }
   }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts, resetSignals]);
-
-  const handleStartSignalAnalysis = useCallback(() => {
-    if (datasetId && selectedTask) {
-      startAnalysis(datasetId, selectedTask, maxEpisodes);
-    }
-  }, [datasetId, selectedTask, maxEpisodes, startAnalysis]);
 
   const signalsDisabled = capabilities !== null && !capabilities.supports_signal_comparison;
 
@@ -325,117 +319,21 @@ export default function DatasetAnalysis({
 
         {activeTab === "signal-comparison" && (
           <div>
-            {/* Controls */}
-            <div className="flex items-center gap-4 mb-4">
-              <span className="text-sm text-gray-600 dark:text-gray-400">
-                Compare first:
-              </span>
-              <div className="flex gap-1">
-                {[5, 10].map((n) => (
-                  <button
-                    key={n}
-                    onClick={() => setMaxEpisodes(n)}
-                    className={`px-3 py-1 text-sm rounded ${
-                      maxEpisodes === n
-                        ? "bg-blue-500 text-white"
-                        : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
-                    }`}
-                  >
-                    {n}
-                  </button>
-                ))}
-              </div>
-              <span className="text-sm text-gray-600 dark:text-gray-400">episodes</span>
-
-              {signalState.phase === "idle" || signalState.phase === "complete" || signalState.phase === "error" || signalState.phase === "no_signals" ? (
-                <button
-                  onClick={handleStartSignalAnalysis}
-                  className="px-4 py-1.5 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 transition-colors"
-                  data-testid="start-analysis-btn"
-                >
-                  {signalState.phase === "complete" ? "Re-analyze" : "Start Analysis"}
-                </button>
-              ) : (
-                <button
-                  onClick={cancelAnalysis}
-                  className="px-4 py-1.5 bg-gray-500 text-white text-sm rounded hover:bg-gray-600 transition-colors"
-                >
-                  Cancel
-                </button>
-              )}
-            </div>
-
-            {/* Progress bar */}
-            {signalState.phase === "processing" && (
-              <div className="mb-4">
-                <div className="flex justify-between text-xs text-gray-500 mb-1">
-                  <span>
-                    Processing episode {signalState.progress.current + 1}/{signalState.progress.total}
-                  </span>
-                  <span className="font-mono truncate ml-2 max-w-[200px]">
-                    {getEpisodeLabel(signalState.progress.currentEpisode)}
-                  </span>
-                </div>
-                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                  <div
-                    className="bg-blue-500 h-2 rounded-full transition-all"
-                    style={{
-                      width: `${signalState.progress.total > 0 ? ((signalState.progress.current) / signalState.progress.total) * 100 : 0}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* No signals message */}
-            {signalState.phase === "no_signals" && signalState.noSignalsReason && (
-              <div className="px-4 py-6 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-center">
-                <div className="text-sm text-blue-700 dark:text-blue-300 font-medium mb-1">
-                  Action Insights Not Available
-                </div>
-                <div className="text-sm text-blue-600 dark:text-blue-400">
-                  {signalState.noSignalsReason}
-                </div>
-              </div>
-            )}
-
-            {/* Error */}
-            {signalState.error && (
-              <div className="text-sm text-red-500 mb-4">
-                Error: {signalState.error}
-              </div>
-            )}
-
-            {/* Charts */}
-            {(signalState.episodes.size > 0 || signalState.knownEpisodes.length > 0) && (
-              <SignalComparisonChart
-                episodes={signalState.episodes}
+            {selectedTask && datasetId ? (
+              <PhaseAwarePanel
                 datasetId={datasetId}
-                firstFrames={signalState.firstFrames}
-                knownEpisodes={signalState.knownEpisodes}
+                taskName={selectedTask}
                 onNavigateToEpisode={onNavigateToEpisode}
               />
-            )}
-
-            {/* Idle state */}
-            {signalState.phase === "idle" && signalState.episodes.size === 0 && signalState.knownEpisodes.length === 0 && (
-              <div className="text-sm text-gray-500 text-center py-12">
-                Click &quot;Start Analysis&quot; to download and compare episode signals.
-                <br />
-                <span className="text-xs text-gray-400 mt-1 block">
-                  This will download MCAP files but skip video decoding for faster analysis.
-                </span>
+            ) : (
+              <div className="py-6 text-sm text-gray-500 text-center">
+                Select a task to run phase-aware analysis.
               </div>
             )}
+
           </div>
         )}
       </div>
     </div>
   );
-}
-
-function getEpisodeLabel(episodeId: string): string {
-  if (!episodeId) return "";
-  const parts = episodeId.split("/");
-  return parts[parts.length - 1]?.replace(/\.[^.]+$/, "") || episodeId;
 }

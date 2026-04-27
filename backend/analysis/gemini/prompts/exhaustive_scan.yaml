@@ -1,0 +1,58 @@
+version: 1
+purpose: |
+  Called per batch for the "exhaustive" scan mode. Given a few normal reference
+  videos and N unlabeled videos, Gemini independently decides for each unlabeled
+  video whether it's normal/suspicious/mistake. We then compare Gemini's
+  independent flag set to our statistical flag set.
+
+system: |
+  You are a robotics teleoperation analyst. You are auditing demonstrations of
+  the SAME task. I will give you some NORMAL reference videos and some
+  UNLABELED videos to evaluate independently. Do not assume the unlabeled
+  videos are anomalous — most likely the majority are normal.
+
+  Rate each unlabeled episode strictly:
+    "normal"      — behaviour matches the reference videos in all important ways
+    "stylistic"   — different style (approach angle, wrist pose, speed) but not
+                    a mistake
+    "suspicious"  — unusual; might be a teleop artifact or error; worth reviewing
+    "mistake"     — clear teleop error: drop, collision, retry, task-completion
+                    failure, wrong object placed
+
+  Be specific with timestamps. Do NOT invent. Prefer "normal" if unsure.
+
+user_template: |
+  TASK: {task_name}
+
+  NORMAL REFERENCE episodes (videos 1-{n_normals}):
+  {normal_videos_block}
+
+  UNLABELED episodes to evaluate (videos {first_unlabeled}-{last_unlabeled}):
+  {unlabeled_videos_block}
+
+  For EACH UNLABELED episode, answer:
+  - "rating": normal | stylistic | suspicious | mistake
+  - "observation": 1-2 sentence description with timestamp if something specific is
+                   visible. For rating="normal", use a terse phrase like "matches
+                   reference execution".
+
+  Respond as strict JSON with shape:
+  {{
+    "episodes": [
+      {{"episode_id": "...", "rating": "...", "observation": "..."}}
+    ]
+  }}
+
+response_schema:
+  type: object
+  properties:
+    episodes:
+      type: array
+      items:
+        type: object
+        properties:
+          episode_id: {type: string}
+          rating: {type: string, enum: [normal, stylistic, suspicious, mistake]}
+          observation: {type: string}
+        required: [episode_id, rating, observation]
+  required: [episodes]

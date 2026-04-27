@@ -49,7 +49,10 @@ def _classify_action_dimensions(labels: list | None, dims: int) -> dict:
     Classify action dimensions into semantic groups.
     Port of frontend/src/utils/actionClassification.ts.
     """
-    if not labels:
+    # Some datasets (e.g. lerobot/libero) list a single aggregate label like
+    # ['actions'] for a 7-dim vector. Treat that as "no labels" rather than
+    # trying to index past the end.
+    if not labels or len(labels) < dims:
         if dims == 7:
             return {
                 "group1": {"label": "Position", "names": ["x", "y", "z"], "indices": [0, 1, 2]},
@@ -145,6 +148,19 @@ def _camera_entity(img_key: str) -> str:
     return f"camera/{_camera_short_name(img_key)}"
 
 
+# Lazy cache: {repo_id: {episode_idx: file_path_within_repo}}. Populated as
+# episodes are discovered; persists within one backend process. Avoids repeated
+# outward-spiral search when the meta parquet's data/file_index is unreliable
+# (e.g., Libero — meta says ep_235→file_015, actual is file_091).
+_EP_TO_FILE_CACHE: dict[str, dict[int, str]] = {}
+
+
+def _remember_episodes_in_file(repo_id: str, file_rel: str, episodes_in_file: list[int]) -> None:
+    cache = _EP_TO_FILE_CACHE.setdefault(repo_id, {})
+    for eid in episodes_in_file:
+        cache[int(eid)] = file_rel
+
+
 def _load_lerobot_episode_direct(
     repo_id: str,
     episode_idx: int,
@@ -186,13 +202,19 @@ def _load_lerobot_episode_direct(
     if columns is not None:
         read_cols = list(set(["episode_index", "frame_index"] + columns))
 
-    def _read_episode_from_file(file_path: str) -> list[dict] | None:
-        """Read a specific episode from a parquet file, using column filter."""
+    def _read_episode_from_file(file_path: str, file_rel: str) -> list[dict] | None:
+        """Read a specific episode from a parquet file, using column filter.
+        Side-effect: record all episodes found in this file into the cache
+        so future lookups can skip the search."""
         try:
             df = pd.read_parquet(file_path, columns=read_cols)
         except Exception:
-            # Some columns may not exist in this file — fall back to all columns
             df = pd.read_parquet(file_path)
+        try:
+            unique_eps = df["episode_index"].unique().tolist()
+            _remember_episodes_in_file(repo_id, file_rel, unique_eps)
+        except Exception:
+            pass
         if episode_idx not in df["episode_index"].values:
             return None
         ep_df = df[df["episode_index"] == episode_idx].sort_values("frame_index")
@@ -200,18 +222,31 @@ def _load_lerobot_episode_direct(
             ep_df = ep_df.head(max_frames)
         return ep_df.to_dict("records")
 
+    # Lazy cache hit: we've previously read a file that contained this episode.
+    # Trust it — HF hub files are immutable within a branch.
+    cached_file = _EP_TO_FILE_CACHE.get(repo_id, {}).get(episode_idx)
+    if cached_file and cached_file in all_files:
+        try:
+            path = hf_hub_download(repo_id, cached_file, repo_type="dataset", token=HF_TOKEN)
+            result = _read_episode_from_file(path, cached_file)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.warning(f"Cached file {cached_file} for ep {episode_idx} failed: {e}")
+
     # Binary search: load first file to learn episodes_per_file, then jump
     num_files = len(all_files)
 
     try:
         first_path = hf_hub_download(repo_id, all_files[0], repo_type="dataset", token=HF_TOKEN)
         first_df = pd.read_parquet(first_path, columns=["episode_index"])
+        _remember_episodes_in_file(repo_id, all_files[0], first_df["episode_index"].unique().tolist())
         eps_per_file = len(first_df["episode_index"].unique())
         first_ep = first_df["episode_index"].min()
 
         # Check if target is in first file
         if episode_idx in first_df["episode_index"].values:
-            result = _read_episode_from_file(first_path)
+            result = _read_episode_from_file(first_path, all_files[0])
             if result is not None:
                 return result
 
@@ -219,24 +254,31 @@ def _load_lerobot_episode_direct(
     except Exception:
         estimated_file = min(episode_idx // 7, num_files - 1)
 
-    # Search outward from estimate
+    # Outward spiral. No cap — if the estimate is wildly off (as happens when
+    # eps-per-file is non-uniform, e.g. Libero), we still need to find the
+    # episode. Each downloaded file caches every episode it contains, so this
+    # pays off across repeated calls.
     for delta in range(0, num_files):
         for idx in [estimated_file + delta, estimated_file - delta]:
             if idx < 0 or idx >= num_files:
                 continue
+            # Skip if our lazy cache says this file doesn't contain the target
+            # (we recorded its episodes on a previous pass)
+            known_eps = _EP_TO_FILE_CACHE.get(repo_id, {})
+            file_rel = all_files[idx]
+            if file_rel in known_eps.values() and episode_idx not in {k for k, v in known_eps.items() if v == file_rel}:
+                continue
             try:
-                path = hf_hub_download(repo_id, all_files[idx], repo_type="dataset", token=HF_TOKEN)
-                result = _read_episode_from_file(path)
+                path = hf_hub_download(repo_id, file_rel, repo_type="dataset", token=HF_TOKEN)
+                result = _read_episode_from_file(path, file_rel)
                 if result is not None:
-                    logger.info(f"Found episode {episode_idx} in {all_files[idx]} ({len(result)} frames, {delta} files from estimate)")
+                    logger.info(f"Found episode {episode_idx} in {file_rel} ({len(result)} frames, {delta} files from estimate)")
                     return result
             except Exception as e:
-                logger.warning(f"Error reading {all_files[idx]}: {e}")
+                logger.warning(f"Error reading {file_rel}: {e}")
                 continue
 
-        if delta > 10:
-            break
-
+    logger.warning(f"Episode {episode_idx} not found in any of {num_files} files of {repo_id}")
     return []
 
 
@@ -424,6 +466,22 @@ def _generate_rrd_lerobot_streaming(
                 )
                 with open(variant_info_path) as f:
                     variant_info = json.load(f)
+                # Only accept a variant that is a true MIRROR of the main repo
+                # (same episode count AND same total frame count). Some *_image
+                # repos (e.g. lerobot/libero_spatial_image) are subsets — accepting
+                # them here silently serves the wrong episode with a fraction of
+                # the expected frames.
+                same_episodes = (
+                    variant_info.get("total_episodes") == info.get("total_episodes")
+                    and variant_info.get("total_frames") == info.get("total_frames")
+                )
+                if not same_episodes:
+                    logger.info(
+                        f"Skipping variant {variant} (not a mirror of {repo_id}: "
+                        f"{variant_info.get('total_episodes')}ep/{variant_info.get('total_frames')}f "
+                        f"vs {info.get('total_episodes')}ep/{info.get('total_frames')}f)"
+                    )
+                    continue
                 # Check this variant has actual image data
                 for vf_name, vf_info in variant_info.get("features", {}).items():
                     if "images" in vf_name and vf_info.get("dtype") == "image":

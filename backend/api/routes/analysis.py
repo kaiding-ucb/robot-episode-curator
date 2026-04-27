@@ -1653,3 +1653,304 @@ def _downsample_imu(data: Dict[str, Any], max_points: int = 2000) -> Dict[str, A
         else:
             result[key] = []
     return result
+
+
+# ============================================================================
+# Phase-aware anomaly detection endpoint
+# ============================================================================
+
+# Simple in-memory cache keyed on (dataset_id, task_name). Values are the full
+# analysis dict. Rebuilds on dataset reload via the DELETE /analysis/phase-aware/cache.
+_phase_aware_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+@router.get("/{dataset_id}/analysis/phase-aware")
+async def get_phase_aware(
+    request: Request,
+    dataset_id: str,
+    task_name: str = Query(..., description="Task name (from /tasks)"),
+    cohort_size: int = Query(30, ge=4, le=200, description="Max episodes to analyze (first-N of task)"),
+    refresh: bool = Query(False, description="Bypass cache and recompute"),
+    include_gemini: bool = Query(False, description="Run Gemini semantic enrichment on top"),
+    flagged_cap: int = Query(20, description="Max flagged episodes to send to Gemini"),
+):
+    """Phase-aware anomaly detection for a (dataset, task).
+
+    Pipeline: gripper-event phase segmentation → per-phase envelope + duration
+    MAD + shape Mahalanobis → hierarchical clustering with gap-statistic K.
+    See `backend/analysis/phase_aware.py` and `exploration/phase_aware/FINDINGS.md`.
+
+    Only supports LeRobot datasets with gripper signals today; falls back to
+    `method: "unsupported"` otherwise.
+    """
+    from analysis import analyze_task
+    from analysis.loader import load_episodes_action_state
+    from downloaders.manager import get_all_datasets
+    from api.routes.datasets import is_lerobot_dataset
+
+    cache_key = (dataset_id, task_name, cohort_size)
+    if not refresh and cache_key in _phase_aware_cache:
+        cached = _phase_aware_cache[cache_key]
+        # If Gemini is requested but the cached result lacks enrichment, fall
+        # through to the Gemini branch below (the disk-backed Gemini cache will
+        # usually short-circuit it anyway).
+        cached_has_gemini = isinstance(cached.get("gemini"), dict) and cached["gemini"].get("enriched") is True
+        if not include_gemini or cached_has_gemini:
+            return cached
+
+    all_datasets = get_all_datasets()
+    dataset_info = all_datasets.get(dataset_id)
+    if not dataset_info:
+        return {"error": f"Dataset '{dataset_id}' not found", "method": "unsupported"}
+
+    try:
+        is_lerobot = await is_lerobot_dataset(dataset_info)
+    except Exception:
+        is_lerobot = False
+    if not is_lerobot:
+        return {"error": "Phase-aware analysis requires a LeRobot dataset with action/state signals",
+                "method": "unsupported"}
+
+    repo_id = dataset_info.get("repo_id", "")
+    if not repo_id:
+        return {"error": f"No repo_id for {dataset_id}", "method": "unsupported"}
+
+    # If we have a non-Gemini cached result and user wants Gemini, start from
+    # that instead of re-running the whole phase-aware compute.
+    base_result: Optional[Dict[str, Any]] = None
+    if not refresh and include_gemini and cache_key in _phase_aware_cache:
+        cached = _phase_aware_cache[cache_key]
+        cached_has_gemini = isinstance(cached.get("gemini"), dict) and cached["gemini"].get("enriched") is True
+        if not cached_has_gemini:
+            base_result = cached
+
+    # Resolve the task's global episode IDs via the existing episodes endpoint.
+    # Cap the cohort for scalability (UMI's single task has 1447 episodes —
+    # running phase-aware on all of them takes minutes and pushes Gemini cost
+    # way up; first-N is the tractable default).
+    from api.routes.datasets import list_task_episodes
+    try:
+        episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
+    except Exception as e:
+        return {"error": f"Could not resolve task episodes: {e}", "method": "unsupported"}
+
+    global_ids: list[int] = []
+    for ep in episode_info_list:
+        eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
+        if eid and isinstance(eid, str) and eid.startswith("episode_"):
+            try:
+                global_ids.append(int(eid.split("_")[-1]))
+            except ValueError:
+                pass
+    global_ids = global_ids[:cohort_size]
+    if not global_ids:
+        return {"error": f"No episodes found for task '{task_name}'", "method": "unsupported"}
+
+    # Load action + state arrays for all episodes
+    try:
+        episodes_raw = await load_episodes_action_state(repo_id, global_ids)
+    except Exception as e:
+        logger.error(f"Failed to load episodes for phase-aware: {e}", exc_info=True)
+        return {"error": f"Episode loading failed: {type(e).__name__}: {e}", "method": "unsupported"}
+
+    if not episodes_raw:
+        return {"error": "No episodes could be loaded", "method": "unsupported"}
+
+    # Pull FPS from info.json (falls back to 10 Hz)
+    fps = 10.0
+    try:
+        from huggingface_hub import hf_hub_download as _hf_dl
+        import json as _json
+        info_path = await asyncio.to_thread(_hf_dl, repo_id, "meta/info.json", repo_type="dataset")
+        with open(info_path) as f:
+            fps = float(_json.load(f).get("fps", 10.0))
+    except Exception:
+        pass
+
+    if base_result is not None:
+        result = base_result
+    else:
+        try:
+            def _run():
+                return analyze_task(episodes_raw, task_name, fps=fps).to_dict()
+            result = await asyncio.to_thread(_run)
+        except Exception as e:
+            logger.error(f"Phase-aware analysis failed: {e}", exc_info=True)
+            return {"error": f"Analysis failed: {type(e).__name__}: {e}", "method": "unsupported"}
+
+        result["method"] = "gripper"
+        _phase_aware_cache[cache_key] = result
+
+    if include_gemini:
+        from analysis.gemini import enrich_with_gemini
+        from huggingface_hub import hf_hub_download
+        try:
+            info_path = await asyncio.to_thread(
+                hf_hub_download, repo_id, "meta/info.json", repo_type="dataset"
+            )
+            import json as _json
+            with open(info_path) as f:
+                info = _json.load(f)
+            video_path_template = info.get("video_path")
+            if not video_path_template:
+                result["gemini"] = {"enriched": False, "error": "Dataset has no video_path in info.json"}
+                return result
+        except Exception as e:
+            result["gemini"] = {"enriched": False, "error": f"Could not load info.json: {e}"}
+            return result
+
+        try:
+            result = await enrich_with_gemini(
+                result,
+                dataset_id=dataset_id,
+                task_name=task_name,
+                repo_id=repo_id,
+                video_path_template=video_path_template,
+                flagged_cap=flagged_cap,
+            )
+            # Update the in-memory cache too so refresh=false returns enriched version
+            _phase_aware_cache[cache_key] = result
+        except Exception as e:
+            logger.error(f"Gemini enrichment failed: {e}", exc_info=True)
+            result["gemini"] = {"enriched": False, "error": f"{type(e).__name__}: {e}"}
+
+    return result
+
+
+@router.delete("/analysis/phase-aware/cache")
+async def clear_phase_aware_cache(gemini: bool = Query(False, description="Also clear Gemini disk cache")):
+    n = len(_phase_aware_cache)
+    _phase_aware_cache.clear()
+    g = 0
+    if gemini:
+        from analysis.gemini.enrich import clear_cache
+        g = clear_cache()
+    return {"cleared_memory": n, "cleared_gemini": g}
+
+
+@router.get("/{dataset_id}/analysis/phase-aware/stream")
+async def stream_phase_aware(
+    request: Request,
+    dataset_id: str,
+    task_name: str = Query(..., description="Task name (from /tasks)"),
+    cohort_size: int = Query(30, ge=4, le=200),
+    flagged_cap: int = Query(20),
+):
+    """SSE stream of phase-aware analysis + Gemini enrichment.
+
+    Events emitted in order:
+      - `phase_aware`     ← once, after the statistical compute completes (~5–15 s)
+      - `clip_progress`   ← per clip extracted/uploaded (count-based progress)
+      - `cluster`         ← per cluster-char Gemini call completion
+      - `flag_batch`      ← per flag-enrich batch completion (1+ episodes per event)
+      - `done`            ← terminal; carries timings + token usage
+      - `error`           ← non-fatal sub-failures (cluster N raised, partial result still emitted)
+    """
+    # Resolve dataset/repo identically to the non-streaming endpoint
+    from analysis import analyze_task
+    from analysis.loader import load_episodes_action_state
+    from analysis.gemini import enrich_with_gemini
+    from downloaders.manager import get_all_datasets
+    from api.routes.datasets import is_lerobot_dataset, list_task_episodes
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def emit(event_type: str, data: Any) -> None:
+        await queue.put({"type": event_type, "data": data})
+
+    async def _runner():
+        try:
+            all_datasets = get_all_datasets()
+            dataset_info = all_datasets.get(dataset_id)
+            if not dataset_info:
+                await emit("error", {"error": f"Dataset '{dataset_id}' not found"})
+                return
+            try:
+                if not await is_lerobot_dataset(dataset_info):
+                    await emit("error", {"error": "Phase-aware requires a LeRobot dataset"})
+                    return
+            except Exception as e:
+                await emit("error", {"error": f"is_lerobot_dataset failed: {e}"})
+                return
+            repo_id = dataset_info.get("repo_id", "")
+
+            episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
+            global_ids = []
+            for ep in episode_info_list:
+                eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
+                if eid and isinstance(eid, str) and eid.startswith("episode_"):
+                    try:
+                        global_ids.append(int(eid.split("_")[-1]))
+                    except ValueError:
+                        pass
+            global_ids = global_ids[:cohort_size]
+            if not global_ids:
+                await emit("error", {"error": "No episodes for task"})
+                return
+
+            episodes_raw = await load_episodes_action_state(repo_id, global_ids)
+            if not episodes_raw:
+                await emit("error", {"error": "No episodes could be loaded"})
+                return
+
+            fps = 10.0
+            video_path_template: Optional[str] = None
+            try:
+                from huggingface_hub import hf_hub_download as _hf_dl
+                info_path = await asyncio.to_thread(_hf_dl, repo_id, "meta/info.json", repo_type="dataset")
+                with open(info_path) as f:
+                    info = json.load(f)
+                fps = float(info.get("fps", 10.0))
+                video_path_template = info.get("video_path")
+            except Exception as e:
+                await emit("error", {"error": f"Could not load info.json: {e}"})
+                return
+
+            def _run():
+                return analyze_task(episodes_raw, task_name, fps=fps).to_dict()
+            stat_result = await asyncio.to_thread(_run)
+            stat_result["method"] = "gripper"
+            cache_key = (dataset_id, task_name, cohort_size)
+            _phase_aware_cache[cache_key] = stat_result
+            await emit("phase_aware", stat_result)
+
+            if not video_path_template:
+                await emit("done", {"reason": "no video_path; phase-aware only"})
+                return
+
+            try:
+                enriched = await enrich_with_gemini(
+                    stat_result,
+                    dataset_id=dataset_id,
+                    task_name=task_name,
+                    repo_id=repo_id,
+                    video_path_template=video_path_template,
+                    flagged_cap=flagged_cap,
+                    on_progress=emit,
+                )
+                _phase_aware_cache[cache_key] = enriched
+                g = enriched.get("gemini", {})
+                await emit("done", {
+                    "timings": g.get("timings", {}),
+                    "token_usage": g.get("token_usage", {}),
+                    "errors": g.get("errors", []),
+                    "cached": g.get("cached", False),
+                })
+            except Exception as e:
+                logger.error(f"stream gemini enrichment failed: {e}", exc_info=True)
+                await emit("error", {"error": f"{type(e).__name__}: {e}"})
+                await emit("done", {"errors": [str(e)]})
+        finally:
+            await queue.put(None)
+
+    asyncio.create_task(_runner())
+
+    async def _gen():
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            payload = json.dumps(evt["data"], default=str)
+            yield f"event: {evt['type']}\ndata: {payload}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
