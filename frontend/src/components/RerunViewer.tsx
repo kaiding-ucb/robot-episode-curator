@@ -81,11 +81,17 @@ function RerunCanvas({ rrdUrl }: { rrdUrl: string }) {
       if (!globalViewer) {
         // First time — create the viewer
         globalViewer = new rerun.WebViewer();
+        // `show_notification_toasts: false` is documented in Rerun's internal
+        // AppOptions but not in the public WebViewerOptions surface — passing it
+        // anyway because Rerun forwards unknown keys through to the WASM. This
+        // suppresses the "Reached memory limit, dropping oldest data" popup;
+        // the user has the sidebar Clear-cache button for manual control.
         await globalViewer.start(null, container, {
           width: "100%",
           height: "100%",
           hide_welcome_screen: true,
-        });
+          show_notification_toasts: false,
+        } as Parameters<typeof globalViewer.start>[2]);
         globalCanvas = container.querySelector("canvas");
         applyPanelOverrides(globalViewer);
       } else {
@@ -122,11 +128,17 @@ function RerunCanvas({ rrdUrl }: { rrdUrl: string }) {
         currentRrdUrl = null;
         // Recreate on next tick
         globalViewer = new rerun.WebViewer();
+        // `show_notification_toasts: false` is documented in Rerun's internal
+        // AppOptions but not in the public WebViewerOptions surface — passing it
+        // anyway because Rerun forwards unknown keys through to the WASM. This
+        // suppresses the "Reached memory limit, dropping oldest data" popup;
+        // the user has the sidebar Clear-cache button for manual control.
         await globalViewer.start(null, container, {
           width: "100%",
           height: "100%",
           hide_welcome_screen: true,
-        });
+          show_notification_toasts: false,
+        } as Parameters<typeof globalViewer.start>[2]);
         globalCanvas = container.querySelector("canvas");
         applyPanelOverrides(globalViewer);
         globalViewer.open(rrdUrl);
