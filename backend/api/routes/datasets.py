@@ -12,6 +12,7 @@ Endpoints:
 - POST /api/datasets - Add a new dataset from HuggingFace URL
 - DELETE /api/datasets/{id} - Remove a dynamically added dataset
 """
+import asyncio
 import io
 import logging
 import os
@@ -354,7 +355,11 @@ async def fetch_lerobot_episodes_meta(repo_id: str, path_prefix: str = "") -> Op
                     dl_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
                     dl_resp = await client.get(dl_url, headers=headers, timeout=60.0)
                     if dl_resp.status_code == 200:
-                        df = pd.read_parquet(io.BytesIO(dl_resp.content))
+                        # parquet read is sync/CPU-bound — push to a thread so
+                        # the event loop stays responsive for other requests.
+                        df = await asyncio.to_thread(
+                            pd.read_parquet, io.BytesIO(dl_resp.content)
+                        )
                         dfs.append(df)
                 except Exception as e:
                     logger.warning(f"Failed to download {file_path}: {e}")
@@ -362,10 +367,15 @@ async def fetch_lerobot_episodes_meta(repo_id: str, path_prefix: str = "") -> Op
     if not dfs:
         return None
 
-    combined = pd.concat(dfs, ignore_index=True)
-    combined = combined.sort_values("episode_index").reset_index(drop=True)
+    def _combine(frames: List[pd.DataFrame]) -> pd.DataFrame:
+        c = pd.concat(frames, ignore_index=True)
+        return c.sort_values("episode_index").reset_index(drop=True)
+
+    combined = await asyncio.to_thread(_combine, dfs)
     _LEROBOT_EPISODES_CACHE[cache_key] = (combined, datetime.utcnow())
-    _write_disk_cache(disk_path, combined.to_dict(orient="records"))
+    await asyncio.to_thread(
+        _write_disk_cache, disk_path, combined.to_dict(orient="records")
+    )
     logger.info(f"Cached LeRobot episodes metadata for {cache_key}: {len(combined)} episodes")
     return combined
 
@@ -400,7 +410,9 @@ async def fetch_lerobot_tasks_meta(repo_id: str, path_prefix: str = "") -> Optio
         try:
             resp = await client.get(url, headers=_get_hf_headers(), timeout=30.0)
             if resp.status_code == 200:
-                df = pd.read_parquet(io.BytesIO(resp.content))
+                df = await asyncio.to_thread(
+                    pd.read_parquet, io.BytesIO(resp.content)
+                )
                 # Normalize: ensure both task_index and task_description are columns.
                 # Only apply when task_description is NOT already a column to avoid
                 # creating duplicates via reset_index().
@@ -1148,12 +1160,19 @@ async def list_tasks(
                                 task_col = col
                                 break
 
-                    # Get episode-task mapping for counts (fast path via episodes meta)
-                    ep_task_map = await get_episode_task_map(repo_id)
+                    # For datasets with > 100 tasks (e.g. Droid 1.0.1's 49k tasks),
+                    # skip the expensive ep_task_map build. Counting episodes per
+                    # task requires scanning every data parquet — minutes of work.
+                    info = await fetch_lerobot_info(repo_id)
+                    total_tasks_hint = (info or {}).get("total_tasks") or len(tasks_df)
+                    skip_counts = total_tasks_hint > 100
+
                     task_episode_counts: Dict[int, int] = {}
-                    if ep_task_map:
-                        for _, task_idx in ep_task_map.items():
-                            task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
+                    if not skip_counts:
+                        ep_task_map = await get_episode_task_map(repo_id)
+                        if ep_task_map:
+                            for _, task_idx in ep_task_map.items():
+                                task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
 
                     tasks = []
                     for _, row in tasks_df.iterrows():
@@ -1161,7 +1180,7 @@ async def list_tasks(
                         task_name = str(row[task_col]).strip() if task_col in row.index else ""
                         if not task_name:
                             task_name = f"Untitled (task {task_idx})"
-                        ep_count = task_episode_counts.get(task_idx)
+                        ep_count = None if skip_counts else task_episode_counts.get(task_idx)
                         tasks.append(TaskInfo(
                             name=task_name,
                             episode_count=ep_count,
@@ -1809,7 +1828,7 @@ class MetaSummaryResponse(BaseModel):
 
 
 @router.get("/{dataset_id}/meta-summary", response_model=MetaSummaryResponse)
-async def get_meta_summary(dataset_id: str):
+async def get_meta_summary(dataset_id: str, request: Request):
     """
     Return raw LeRobot meta/info.json plus tasks (from meta/tasks.parquet) for a dataset.
 
@@ -1829,19 +1848,30 @@ async def get_meta_summary(dataset_id: str):
         return MetaSummaryResponse(source="unavailable")
 
     info = await fetch_lerobot_info(repo_id)
+    if await request.is_disconnected():
+        raise HTTPException(status_code=499, detail="client disconnected")
+
     tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+    if await request.is_disconnected():
+        raise HTTPException(status_code=499, detail="client disconnected")
 
     rows: List[MetaTaskRow] = []
     if tasks_df is not None:
-        # Episode-count per task (best-effort, may be None for some formats)
+        # Skip the expensive episode→task map for huge datasets (> 100 tasks).
+        # For Droid 1.0.1 (49k tasks) building this map scans 156 data parquets;
+        # the Summary tab can show "—" instead of waiting minutes.
+        total_tasks_hint = (info or {}).get("total_tasks") or len(tasks_df)
+        skip_counts = total_tasks_hint > 100
+
         ep_counts: Dict[int, int] = {}
-        try:
-            ep_task_map = await get_episode_task_map(repo_id)
-            if ep_task_map:
-                for _, t_idx in ep_task_map.items():
-                    ep_counts[t_idx] = ep_counts.get(t_idx, 0) + 1
-        except Exception as e:
-            logger.warning(f"meta-summary: episode-task map failed for {dataset_id}: {e}")
+        if not skip_counts:
+            try:
+                ep_task_map = await get_episode_task_map(repo_id)
+                if ep_task_map:
+                    for _, t_idx in ep_task_map.items():
+                        ep_counts[t_idx] = ep_counts.get(t_idx, 0) + 1
+            except Exception as e:
+                logger.warning(f"meta-summary: episode-task map failed for {dataset_id}: {e}")
 
         task_col = "task_description" if "task_description" in tasks_df.columns else None
         if task_col is None:
@@ -1859,7 +1889,7 @@ async def get_meta_summary(dataset_id: str):
             rows.append(MetaTaskRow(
                 task_index=t_idx,
                 task_description=desc or f"Untitled (task {t_idx})",
-                episode_count=ep_counts.get(t_idx),
+                episode_count=None if skip_counts else ep_counts.get(t_idx),
             ))
         rows.sort(key=lambda r: r.task_index)
 

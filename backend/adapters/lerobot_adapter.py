@@ -62,12 +62,21 @@ class LeRobotAdapter(StreamingAdapter):
                         task_col = col
                         break
 
-            # Get episode-task mapping for counts (fast path via episodes meta)
-            ep_task_map = await get_episode_task_map(repo_id, path_prefix=prefix)
+            # Skip the expensive episode→task map for huge datasets (> 100 tasks).
+            # Building the map for e.g. Droid 1.0.1 (49k tasks) requires scanning
+            # 156 data parquets — minutes of work that freezes the backend. The
+            # task list itself is tiny, so we return tasks without per-task
+            # episode counts; the UI shows "—" for those rows.
+            info = await self._get_info()
+            total_tasks_hint = (info or {}).get("total_tasks") or len(tasks_df)
+            skip_counts = total_tasks_hint > 100
+
             task_episode_counts: Dict[int, int] = {}
-            if ep_task_map:
-                for _, task_idx in ep_task_map.items():
-                    task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
+            if not skip_counts:
+                ep_task_map = await get_episode_task_map(repo_id, path_prefix=prefix)
+                if ep_task_map:
+                    for _, task_idx in ep_task_map.items():
+                        task_episode_counts[task_idx] = task_episode_counts.get(task_idx, 0) + 1
 
             tasks = []
             for _, row in tasks_df.iterrows():
@@ -75,7 +84,7 @@ class LeRobotAdapter(StreamingAdapter):
                 task_name = str(row[task_col]).strip() if task_col in row.index else ""
                 if not task_name:
                     task_name = f"Untitled (task {task_idx})"
-                ep_count = task_episode_counts.get(task_idx)
+                ep_count = None if skip_counts else task_episode_counts.get(task_idx)
                 tasks.append(TaskRef(
                     name=task_name,
                     episode_count=ep_count,
