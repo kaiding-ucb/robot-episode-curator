@@ -568,23 +568,25 @@ def _generate_rrd_lerobot_streaming(
     classification = _classify_action_dimensions(action_labels, action_dims)
 
     # For video-type image columns that aren't in the parquet (DROID / UMI
-    # style), decode frames directly from the HF chunk MP4 files via PyAV.
-    video_decoded_frames: dict[str, dict[int, "np.ndarray"]] = {}
+    # style), pull a per-episode MP4 slice via ffmpeg stream-copy and embed
+    # it as a single rr.AssetVideo per camera. No full chunk download, no
+    # uncompressed pixel data baked into the .rrd.
+    video_clips: dict[str, bytes] = {}
     first_row_has_image = any(episode_data[0].get(k) is not None for k in image_keys) if episode_data and image_keys else False
     if image_keys and not first_row_has_image:
         try:
-            video_decoded_frames = _extract_lerobot_video_frames(
-                repo_id, episode_idx, info, image_keys, max_frames=max_frames,
+            video_clips = _extract_lerobot_episode_clips(
+                repo_id, episode_idx, info, image_keys,
             )
         except Exception as e:
-            logger.warning(f"Video frame extraction failed for {repo_id}/{episode_idx}: {e}")
+            logger.warning(f"Video clip extraction failed for {repo_id}/{episode_idx}: {e}")
 
     # Create Blueprint and initialize Rerun
     # A camera view only makes sense if we actually have frames for it. Drop
     # keys that produced no frames so the blueprint row stays tight.
     effective_image_keys = [
         k for k in image_keys
-        if (first_row_has_image or (video_decoded_frames and video_decoded_frames.get(k)))
+        if (first_row_has_image or (video_clips and video_clips.get(k)))
     ]
     camera_names = [_camera_short_name(k) for k in effective_image_keys] or ["rgb"]
     has_action_column = sample_action is not None
@@ -608,7 +610,38 @@ def _generate_rrd_lerobot_streaming(
 
     # (Episode metadata is surfaced in the app header — no Rerun panel needed.)
 
-    # Log episode data
+    # Log per-camera video clips ONCE (static) — replaces per-frame rr.Image
+    # logging that used to bloat .rrd files to ~700MB. The viewer streams the
+    # MP4 natively in the browser via Rerun's hardware-accelerated decoder.
+    for img_key, mp4_bytes in (video_clips or {}).items():
+        try:
+            asset = rr.AssetVideo(contents=mp4_bytes, media_type="video/mp4")
+            entity = _camera_entity(img_key)
+            rr.log(entity, asset, static=True)
+
+            # Index the video frames on the same "time" timeline as actions/state
+            # so scrubbing keeps everything in sync. read_frame_timestamps_nanos()
+            # returns per-frame PTS within the sliced clip (which starts at 0
+            # because ffmpeg input-side seek resets the output timebase).
+            try:
+                ts_ns = asset.read_frame_timestamps_nanos()
+                if ts_ns is not None and len(ts_ns) > 0:
+                    rr.send_columns(
+                        entity,
+                        indexes=[rr.TimeColumn("time", duration=1e-9 * ts_ns)],
+                        columns=rr.VideoFrameReference.columns_nanoseconds(ts_ns),
+                    )
+            except Exception as e:
+                # If the timestamp/columns API isn't available in this rerun-sdk
+                # build, the AssetVideo still plays — we just lose frame-accurate
+                # scrubbing. Don't fail the whole episode for that.
+                logger.warning(f"VideoFrameReference columns failed for {img_key}: {e}")
+        except Exception as e:
+            logger.warning(f"AssetVideo log failed for {img_key}: {e}")
+
+    # Per-frame log loop — handles parquet image columns (libero_*_image variant)
+    # and the per-frame action/state scalars. Cameras already covered by
+    # video_clips skip per-frame Image logging.
     for row in episode_data:
         frame_idx = row.get("frame_index", 0)
         timestamp = row.get("timestamp", frame_idx / fps)
@@ -616,16 +649,11 @@ def _generate_rrd_lerobot_streaming(
         rr.set_time("frame", sequence=frame_idx)
         rr.set_time("time", timestamp=float(timestamp))
 
-        # All observation.images.* cameras (dynamic — matches info.json features).
-        # Sources in order of preference:
-        #   1. An "images" column already in the parquet (libero_*_image variant)
-        #   2. A frame decoded from the HF chunk MP4 (droid_100, umi, raw libero)
-        local_idx = frame_idx  # episodes are 0-indexed by frame_index
         for img_key in image_keys:
+            if img_key in video_clips:
+                continue  # video already logged statically as AssetVideo
             img = row.get(img_key)
             arr = _decode_image(img) if img is not None else None
-            if arr is None:
-                arr = (video_decoded_frames.get(img_key) or {}).get(local_idx)
             if arr is None:
                 continue
             rr.log(_camera_entity(img_key), rr.Image(arr))
@@ -684,6 +712,13 @@ def _generate_rrd_lerobot_streaming(
     file_size_kb = cache_path.stat().st_size / 1024
     logger.info(f"Generated enriched RRD: {cache_path} ({file_size_kb:.1f} KB, {total_frames} frames)")
 
+    # Cap the rrd cache directory at 500 MB — oldest .rrd files are evicted.
+    try:
+        from api.routes.cache_admin import enforce_lru_cap
+        enforce_lru_cap(RRD_CACHE_DIR, 500 * 1024 * 1024)
+    except Exception as e:
+        logger.warning(f"LRU cap on RRD_CACHE_DIR failed: {e}")
+
     return {
         "status": "generated",
         "rrd_url": f"{STATIC_BASE_URL}/{cache_path.name}",
@@ -695,59 +730,48 @@ def _generate_rrd_lerobot_streaming(
     }
 
 
-def _extract_lerobot_video_frames(
+def _extract_lerobot_episode_clips(
     repo_id: str,
     episode_idx: int,
     info: dict,
     image_keys: list[str],
-    max_frames: int = 0,
-) -> dict[str, dict[int, "np.ndarray"]]:
-    """For LeRobot v3 datasets whose image columns are video-type (no image
-    variant on HF), decode frames directly from the per-chunk MP4 files.
+) -> dict[str, bytes]:
+    """For LeRobot v3 video-only image columns: produce a per-camera per-episode
+    MP4 clip via ffmpeg stream copy from the remote chunk MP4. No full chunk
+    download — ffmpeg HTTP-range reads only the byte range needed.
 
-    Returns {img_key: {frame_index_within_episode: rgb np.ndarray}}.
-    Frame 0 corresponds to the episode's first frame, not a global offset.
+    Returns {img_key: bytes} — each value is a small (typ. 1–10 MB) MP4 ready to
+    embed in `rr.AssetVideo(contents=...)`.
     """
-    import numpy as np
+    import io as _io
     import pandas as pd
-    import av
-    from huggingface_hub import hf_hub_download
+    from utils.video_slice import slice_remote_mp4_to_bytes, FfmpegError
 
     video_path_template = info.get("video_path")
-    fps = info.get("fps", 10)
     if not video_path_template:
         return {}
 
-    # Locate the episodes metadata parquet(s). We don't know which chunk/file
-    # the episode lives in, so scan meta/episodes/*/*.parquet until we find it.
-    episode_meta_row = None
+    # Episodes meta is async-cached; call it via asyncio.run() since this
+    # function runs in a thread executor (so no live loop in the calling thread).
+    import asyncio
+
+    from api.routes.datasets import fetch_lerobot_episodes_meta
+
     try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=HF_TOKEN)
-        meta_files = [
-            f for f in api.list_repo_files(repo_id, repo_type="dataset", token=HF_TOKEN)
-            if f.startswith("meta/episodes/") and f.endswith(".parquet")
-        ]
-        meta_files.sort()
+        episodes_df = asyncio.run(fetch_lerobot_episodes_meta(repo_id))
     except Exception as e:
-        logger.warning(f"_extract_lerobot_video_frames: could not list meta files for {repo_id}: {e}")
+        logger.warning(f"_extract_lerobot_episode_clips: episode meta fetch failed for {repo_id}: {e}")
+        return {}
+    if episodes_df is None:
         return {}
 
-    for meta_rel in meta_files:
-        try:
-            meta_local = hf_hub_download(repo_id, meta_rel, repo_type="dataset", token=HF_TOKEN)
-            df = pd.read_parquet(meta_local)
-            if episode_idx in df["episode_index"].values:
-                episode_meta_row = df[df["episode_index"] == episode_idx].iloc[0]
-                break
-        except Exception:
-            continue
-    if episode_meta_row is None:
-        logger.warning(f"_extract_lerobot_video_frames: episode {episode_idx} not found in meta for {repo_id}")
+    rows = episodes_df[episodes_df["episode_index"] == episode_idx]
+    if len(rows) == 0:
+        logger.warning(f"_extract_lerobot_episode_clips: episode {episode_idx} not in meta for {repo_id}")
         return {}
+    episode_meta_row = rows.iloc[0]
 
-    frames_by_key: dict[str, dict[int, np.ndarray]] = {}
-
+    clips_by_key: dict[str, bytes] = {}
     for img_key in image_keys:
         chunk_col = f"videos/{img_key}/chunk_index"
         file_col = f"videos/{img_key}/file_index"
@@ -762,52 +786,32 @@ def _extract_lerobot_video_frames(
         t_start = float(episode_meta_row[t0_col])
         t_end = float(episode_meta_row[t1_col])
 
-        rel = video_path_template.format(video_key=img_key, chunk_index=chunk_idx, file_index=file_idx)
-        try:
-            mp4_local = hf_hub_download(repo_id, rel, repo_type="dataset", token=HF_TOKEN)
-        except Exception as e:
-            logger.warning(f"Could not download {rel}: {e}")
-            continue
+        rel = video_path_template.format(
+            video_key=img_key, chunk_index=chunk_idx, file_index=file_idx,
+        )
+        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{rel}"
 
         try:
-            container = av.open(mp4_local)
-            stream = container.streams.video[0]
-            # seek to t_start (in AV_TIME_BASE microseconds when no stream is given,
-            # or stream time_base when given). Use the stream.time_base for precision.
-            if stream.time_base is not None:
-                seek_pts = int(t_start / float(stream.time_base))
-                container.seek(seek_pts, any_frame=False, backward=True, stream=stream)
-
-            target = {}
-            expected_frames = max(1, int(round((t_end - t_start) * fps)))
-            if max_frames > 0:
-                expected_frames = min(expected_frames, max_frames)
-
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    continue
-                pts_s = float(frame.pts * stream.time_base)
-                if pts_s < t_start - 0.05:
-                    continue
-                if pts_s >= t_end - 1e-6:
-                    break
-                # Snap to the nearest episode-local frame index
-                local_idx = int(round((pts_s - t_start) * fps))
-                if local_idx < 0 or local_idx >= expected_frames:
-                    continue
-                if local_idx in target:
-                    continue  # keep first decoded frame at this slot
-                target[local_idx] = frame.to_ndarray(format="rgb24")
-            container.close()
-            frames_by_key[img_key] = target
-            logger.info(
-                f"_extract_lerobot_video_frames: decoded {len(target)}/{expected_frames} frames "
-                f"for {img_key} (ep {episode_idx} from {rel})"
+            mp4_bytes = slice_remote_mp4_to_bytes(
+                url=url,
+                hf_token=HF_TOKEN or None,
+                t_start=t_start,
+                t_end=t_end,
+                pre_roll=0.0,  # rely on ffmpeg keyframe snapping; output PTS resets to 0
             )
+            clips_by_key[img_key] = mp4_bytes
+            logger.info(
+                f"_extract_lerobot_episode_clips: sliced {len(mp4_bytes)/1e6:.2f} MB "
+                f"for {img_key} (ep {episode_idx}, [{t_start:.2f}, {t_end:.2f}]s)"
+            )
+        except FfmpegError as e:
+            logger.warning(f"ffmpeg slice failed for {rel}: {e}")
         except Exception as e:
-            logger.warning(f"PyAV decode failed for {rel}: {e}")
+            logger.warning(f"slice_remote_mp4 raised for {rel}: {e}")
 
-    return frames_by_key
+    # Silence the unused-import warning when pandas/io aren't used downstream
+    _ = (_io, pd)
+    return clips_by_key
 
 
 def _decode_image(img) -> "np.ndarray | None":
@@ -1093,6 +1097,11 @@ async def generate_rrd(
         frame_count = num_frames
         file_size_kb = cache_path.stat().st_size / 1024
         logger.info(f"Generated RRD file: {cache_path} ({file_size_kb:.1f} KB)")
+        try:
+            from api.routes.cache_admin import enforce_lru_cap
+            enforce_lru_cap(RRD_CACHE_DIR, 500 * 1024 * 1024)
+        except Exception as e:
+            logger.warning(f"LRU cap on RRD_CACHE_DIR failed: {e}")
 
         return JSONResponse({
             "status": "generated",
@@ -1441,6 +1450,11 @@ async def generate_comparison_rrd(
         f"Generated comparison RRD: {cache_path} "
         f"({file_size_kb:.1f} KB, {len(actual_indices)} episodes)"
     )
+    try:
+        from api.routes.cache_admin import enforce_lru_cap
+        enforce_lru_cap(RRD_CACHE_DIR, 500 * 1024 * 1024)
+    except Exception as e:
+        logger.warning(f"LRU cap on RRD_CACHE_DIR failed: {e}")
 
     return JSONResponse({
         "status": "generated",

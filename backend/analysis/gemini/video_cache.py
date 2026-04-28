@@ -1,16 +1,17 @@
-"""Per-episode MP4 clip cache. One-time ffmpeg slice from the HF chunk MP4;
-reuse forever for repeated Gemini analyses (decision #9)."""
+"""Per-episode MP4 clip cache. Streams the per-episode byte range from the
+HF chunk MP4 via ffmpeg HTTP-range reads — no full chunk download — and
+caches the small slice on disk for reuse by repeated Gemini analyses."""
 from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from huggingface_hub import hf_hub_download, HfApi
+
+from utils.video_slice import slice_remote_mp4, FfmpegError
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +45,21 @@ def cache_path_for(repo_id: str, episode_idx: int) -> Path:
 
 
 def _find_episode_meta_row(repo_id: str, episode_idx: int) -> Optional[pd.Series]:
-    """Scan meta/episodes/*.parquet for the episode row (holds video chunk/file/timestamps)."""
-    api = HfApi(token=HF_TOKEN)
+    """Find the meta/episodes row for `episode_idx` via the existing async cache."""
+    import asyncio
+    from api.routes.datasets import fetch_lerobot_episodes_meta
+
     try:
-        meta_files = [
-            f for f in api.list_repo_files(repo_id, repo_type="dataset", token=HF_TOKEN)
-            if f.startswith("meta/episodes/") and f.endswith(".parquet")
-        ]
+        df = asyncio.run(fetch_lerobot_episodes_meta(repo_id))
     except Exception as e:
-        logger.warning(f"video_cache: cannot list meta files for {repo_id}: {e}")
+        logger.warning(f"video_cache: episodes meta fetch failed for {repo_id}: {e}")
         return None
-    for rel in sorted(meta_files):
-        try:
-            local = hf_hub_download(repo_id, rel, repo_type="dataset", token=HF_TOKEN)
-            df = pd.read_parquet(local)
-            if episode_idx in df["episode_index"].values:
-                return df[df["episode_index"] == episode_idx].iloc[0]
-        except Exception:
-            continue
-    return None
+    if df is None:
+        return None
+    rows = df[df["episode_index"] == episode_idx]
+    if len(rows) == 0:
+        return None
+    return rows.iloc[0]
 
 
 def _pick_primary_video_key(row: pd.Series) -> Optional[str]:
@@ -137,30 +134,30 @@ async def get_episode_clip(
         return None
 
     rel = video_path_template.format(video_key=video_key, chunk_index=chunk_idx, file_index=file_idx)
-    t0 = time.time()
-    try:
-        mp4_local = hf_hub_download(repo_id, rel, repo_type="dataset", token=HF_TOKEN)
-    except Exception as e:
-        logger.warning(f"video_cache: HF download failed for {rel}: {e}")
-        return None
-    if timing is not None:
-        timing["chunk_dl"] = timing.get("chunk_dl", 0.0) + (time.time() - t0)
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{rel}"
 
     t0 = time.time()
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{t_start:.3f}",
-        "-to", f"{t_end:.3f}",
-        "-i", mp4_local,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an",
-        str(out),
-    ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"video_cache: ffmpeg failed for episode_{episode_idx}: {e.stderr.decode()[:300]}")
+        slice_remote_mp4(
+            url=url,
+            hf_token=HF_TOKEN or None,
+            t_start=t_start,
+            t_end=t_end,
+            out_path=out,
+            pre_roll=0.0,
+        )
+    except FfmpegError as e:
+        logger.warning(f"video_cache: slice failed for episode_{episode_idx} ({rel}): {e}")
         return None
     if timing is not None:
+        # Combined network + ffmpeg time — no separate chunk download phase any more.
         timing["ffmpeg"] = timing.get("ffmpeg", 0.0) + (time.time() - t0)
+
+    # Cap the Gemini clip cache at 500 MB.
+    try:
+        from api.routes.cache_admin import enforce_lru_cap
+        enforce_lru_cap(CACHE_ROOT, 500 * 1024 * 1024)
+    except Exception as e:
+        logger.warning(f"LRU cap on Gemini clip cache failed: {e}")
 
     return out

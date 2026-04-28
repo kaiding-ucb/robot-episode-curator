@@ -61,6 +61,45 @@ def _dir_size(p: Path) -> int:
     return total
 
 
+def enforce_lru_cap(directory: Path, max_bytes: int) -> int:
+    """Delete oldest files (by mtime) under `directory` until total size ≤ max_bytes.
+
+    Returns the number of files removed. Safe to call from anywhere — never
+    raises, never deletes outside `directory`.
+    """
+    if not directory.exists():
+        return 0
+    try:
+        files = []
+        for child in directory.rglob("*"):
+            try:
+                if child.is_file():
+                    files.append((child.stat().st_mtime, child.stat().st_size, child))
+            except OSError:
+                continue
+        files.sort(key=lambda t: t[0])  # oldest first
+        total = sum(sz for _, sz, _ in files)
+        removed = 0
+        for _, sz, path in files:
+            if total <= max_bytes:
+                break
+            try:
+                path.unlink(missing_ok=True)
+                total -= sz
+                removed += 1
+            except OSError as e:
+                logger.warning(f"enforce_lru_cap: unlink failed for {path}: {e}")
+        if removed:
+            logger.info(
+                f"enforce_lru_cap({directory.name}): removed {removed} file(s) "
+                f"to keep ≤ {max_bytes / (1024 * 1024):.0f} MB"
+            )
+        return removed
+    except Exception as e:
+        logger.warning(f"enforce_lru_cap failed for {directory}: {e}")
+        return 0
+
+
 @router.get("/size", response_model=CacheSizeResponse)
 async def cache_size():
     """Return total disk usage of all known caches."""
