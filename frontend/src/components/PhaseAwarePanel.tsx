@@ -385,7 +385,7 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
               cohort: <span className="font-mono text-gray-700 dark:text-gray-300">{data.cohort_size}</span>
               <span className="text-gray-400 dark:text-gray-500"> episodes</span>
               {data.cohort_size >= COHORT_CAP && (
-                <span className="text-gray-400 dark:text-gray-500"> (capped at {COHORT_CAP}; task may have more)</span>
+                <span className="text-gray-400 dark:text-gray-500"> (capped at {COHORT_CAP} for prototype demo; task may have more)</span>
               )}
             </span>
             <span>·</span>
