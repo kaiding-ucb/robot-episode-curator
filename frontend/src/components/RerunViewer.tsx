@@ -328,7 +328,7 @@ export default function RerunViewer({ datasetId, episodeId, onClose, comparisonR
     return (
       <div className="flex items-center justify-center h-full bg-gray-900 text-gray-400">
         <div className="text-center">
-          <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+          <div className="animate-spin w-8 h-8 border-2 border-gray-300 dark:border-gray-600 border-t-transparent rounded-full mx-auto mb-2"></div>
           <p>{generationProgress || "Preparing Rerun viewer..."}</p>
           <p className="text-xs text-gray-500 mt-2">This may take a moment for large episodes</p>
         </div>
@@ -357,7 +357,7 @@ export default function RerunViewer({ datasetId, episodeId, onClose, comparisonR
           <p className="text-sm text-gray-500 mb-4">{error}</p>
           <button
             onClick={generateRrd}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm transition-colors"
+            className="px-4 py-2 bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
           >
             Retry
           </button>

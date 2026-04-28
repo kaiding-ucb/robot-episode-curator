@@ -135,7 +135,7 @@ export default function OnboardingPanel({ onChange }: OnboardingPanelProps) {
             <button
               onClick={saveHf}
               disabled={hfSaving || !hfInput.trim()}
-              className="px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md"
+              className="px-3 py-2 text-sm bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md"
               data-testid="onboarding-hf-save"
             >
               {hfSaving ? "Saving…" : "Save"}
@@ -184,7 +184,7 @@ export default function OnboardingPanel({ onChange }: OnboardingPanelProps) {
             <button
               onClick={saveGem}
               disabled={gemSaving || !gemInput.trim()}
-              className="px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md"
+              className="px-3 py-2 text-sm bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md"
               data-testid="onboarding-gemini-save"
             >
               {gemSaving ? "Saving…" : "Save"}

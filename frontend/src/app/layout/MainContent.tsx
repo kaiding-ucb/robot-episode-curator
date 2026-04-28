@@ -10,7 +10,7 @@ const RerunViewer = dynamic(() => import("@/components/RerunViewer"), {
   ssr: false,
   loading: () => (
     <div className="flex items-center justify-center h-full bg-gray-900 text-gray-400">
-      <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full" />
+      <div className="animate-spin w-8 h-8 border-2 border-gray-300 dark:border-gray-600 border-t-transparent rounded-full" />
     </div>
   ),
 });

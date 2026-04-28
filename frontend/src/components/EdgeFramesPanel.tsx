@@ -27,7 +27,7 @@ function ToggleButton({
       data-testid={testId}
       className={`px-3 py-1 text-xs font-medium transition-colors ${
         active
-          ? "bg-blue-600 text-white"
+          ? "bg-gray-900 dark:bg-gray-700 text-white"
           : "bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
       }`}
     >
@@ -109,7 +109,7 @@ export default function EdgeFramesPanel({
         <div className="flex items-center gap-3" data-testid="edge-frames-progress">
           <div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
             <div
-              className="h-full bg-blue-500 transition-all"
+              className="h-full bg-gray-700 dark:bg-gray-300 transition-all"
               style={{ width: `${progressPct}%` }}
             />
           </div>

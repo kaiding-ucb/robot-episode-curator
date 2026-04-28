@@ -133,7 +133,7 @@ export default function FrameCountChart({ data }: FrameCountChartProps) {
     <div data-testid="frame-count-chart">
       {/* Stats summary */}
       <div className="flex flex-wrap gap-4 mb-3 text-sm">
-        <span className="px-2 py-1 bg-blue-50 dark:bg-blue-900/30 rounded text-blue-700 dark:text-blue-300">
+        <span className="px-2 py-1 bg-gray-100 dark:bg-gray-800 rounded text-gray-700 dark:text-gray-300">
           {data.total_episodes} episodes
         </span>
         <span className="px-2 py-1 bg-gray-50 dark:bg-gray-800 rounded text-gray-600 dark:text-gray-300">

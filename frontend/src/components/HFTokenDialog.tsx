@@ -154,7 +154,7 @@ export default function HFTokenDialog({ isOpen, onClose, onSaved }: HFTokenDialo
             <button
               onClick={handleSave}
               disabled={saving || !token.trim()}
-              className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="px-3 py-1.5 text-sm bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
               data-testid="hf-token-save"
             >
               {saving ? "Saving…" : "Save"}

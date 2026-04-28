@@ -232,7 +232,7 @@ export default function DatasetAnalysis({
                 summaryDisabled
                   ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
                   : activeTab === "summary"
-                    ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                    ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-gray-900 dark:border-white"
                     : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
               }`}
               data-testid="summary-tab"
@@ -248,7 +248,7 @@ export default function DatasetAnalysis({
           onClick={() => setActiveTab("frame-counts")}
           className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
             activeTab === "frame-counts"
-              ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+              ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-gray-900 dark:border-white"
               : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
           }`}
           data-testid="frame-counts-tab"
@@ -261,7 +261,7 @@ export default function DatasetAnalysis({
             edgeFramesDisabled
               ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
               : activeTab === "edge-frames"
-                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-gray-900 dark:border-white"
                 : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
           }`}
           data-testid="edge-frames-tab"
@@ -278,7 +278,7 @@ export default function DatasetAnalysis({
             signalsDisabled
               ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
               : activeTab === "signal-comparison"
-                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-gray-900 dark:border-white"
                 : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
           }`}
           data-testid="signal-comparison-tab"
@@ -293,7 +293,7 @@ export default function DatasetAnalysis({
 
       {/* Signal comparison info banner when disabled */}
       {signalsDisabled && capabilities?.signal_comparison_note && activeTab === "frame-counts" && (
-        <div className="mb-4 px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded text-sm text-blue-700 dark:text-blue-300">
+        <div className="mb-4 px-3 py-2 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded text-sm text-gray-700 dark:text-gray-300">
           <span className="font-medium">Action Insights unavailable:</span>{" "}
           {capabilities.signal_comparison_note}
         </div>

@@ -262,7 +262,7 @@ export default function SummaryPanel({
           </div>
           <button
             onClick={() => setShowRaw((v) => !v)}
-            className="text-xs text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+            className="text-xs text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white underline-offset-2 hover:underline"
             data-testid="toggle-raw-info"
           >
             {showRaw ? "Hide raw" : "View raw"}

@@ -349,7 +349,7 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
   if (loading) {
     return (
       <div className="py-12 text-center text-gray-500">
-        <div className="inline-block w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+        <div className="inline-block w-8 h-8 border-2 border-gray-700 dark:border-gray-300 border-t-transparent rounded-full animate-spin mb-3"></div>
         <div className="text-sm">Running phase-aware analysis…</div>
         <div className="text-xs text-gray-400 mt-1">Downloading parquets &amp; computing envelopes (~10–30s)</div>
       </div>
@@ -585,7 +585,7 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
                   {onNavigateToEpisode && (
                     <button
                       onClick={() => onNavigateToEpisode(datasetId, e.episode_id, e.frames, 0)}
-                      className="text-xs px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors flex-shrink-0"
+                      className="text-xs px-2 py-1 bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded transition-colors flex-shrink-0"
                       data-testid={`open-episode-${e.episode_id}`}
                     >
                       Open in viewer →

@@ -373,7 +373,7 @@ export default function EpisodeViewer({
             <div className="text-center">
               <button
                 onClick={handleStartCaching}
-                className="w-20 h-20 rounded-full bg-blue-500 hover:bg-blue-600 text-white flex items-center justify-center transition-colors mx-auto mb-3"
+                className="w-20 h-20 rounded-full bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white flex items-center justify-center transition-colors mx-auto mb-3"
                 data-testid="play-overlay-btn"
               >
                 <svg className="w-10 h-10 ml-1" fill="currentColor" viewBox="0 0 24 24">
@@ -396,9 +396,9 @@ export default function EpisodeViewer({
             data-testid="caching-progress"
           >
             <div className="text-center text-white">
-              <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <div className="animate-spin w-8 h-8 border-2 border-gray-300 dark:border-gray-600 border-t-transparent rounded-full mx-auto mb-2"></div>
               <p className="text-lg font-medium">Caching Episode...</p>
-              <p className="text-2xl font-bold text-blue-500 mt-1">{cachingStatus.progress || 0}%</p>
+              <p className="text-2xl font-bold text-gray-900 dark:text-white mt-1">{cachingStatus.progress || 0}%</p>
               <p className="text-xs text-gray-400 mt-2">
                 {cachingStatus.totalFrames
                   ? `${Math.round((cachingStatus.progress || 0) * cachingStatus.totalFrames / 100)} / ${cachingStatus.totalFrames} frames`
@@ -415,7 +415,7 @@ export default function EpisodeViewer({
             data-testid="loading-frames"
           >
             <div className="text-center text-white">
-              <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <div className="animate-spin w-8 h-8 border-2 border-gray-300 dark:border-gray-600 border-t-transparent rounded-full mx-auto mb-2"></div>
               <p>Loading frames...</p>
             </div>
           </div>
@@ -459,7 +459,7 @@ export default function EpisodeViewer({
           <div className="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded flex items-center gap-2">
             <div className="w-24 h-1 bg-gray-600 rounded overflow-hidden">
               <div
-                className="h-full bg-blue-500 transition-all duration-200"
+                className="h-full bg-gray-700 dark:bg-gray-300 transition-all duration-200"
                 style={{ width: `${progress * 100}%` }}
               />
             </div>
@@ -470,7 +470,7 @@ export default function EpisodeViewer({
         {/* Caching status indicator */}
         {(cachingStatus.status === "caching" || cachingStatus.status === "started") && (
           <div
-            className="absolute top-2 left-1/2 -translate-x-1/2 bg-blue-500/90 text-white text-xs px-3 py-1 rounded-full flex items-center gap-2"
+            className="absolute top-2 left-1/2 -translate-x-1/2 bg-gray-900/90 dark:bg-gray-700/90 text-white text-xs px-3 py-1 rounded-full flex items-center gap-2"
             data-testid="caching-indicator"
           >
             <div className="animate-spin w-3 h-3 border border-white border-t-transparent rounded-full" />

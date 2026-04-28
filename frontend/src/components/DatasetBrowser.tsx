@@ -92,7 +92,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
           <span>Datasets</span>
           <button
             onClick={() => setShowAddDialog(true)}
-            className="p-1 text-blue-500 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded"
+            className="p-1 text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
             title="Add LeRobot Dataset"
             data-testid="add-dataset-button"
           >
@@ -122,7 +122,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                 onClick={() => handleSelectDataset(dataset.id)}
                 className={`w-full px-4 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors ${
                   selectedDataset === dataset.id
-                    ? "bg-blue-50 dark:bg-blue-900/30 border-l-2 border-blue-500"
+                    ? "bg-gray-100 dark:bg-gray-800 border-l-2 border-gray-900 dark:border-white"
                     : ""
                 }`}
                 data-testid={`dataset-item-${dataset.id}`}
@@ -272,7 +272,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
             <button
               onClick={loadMoreTasks}
               data-testid="load-more-tasks"
-              className="w-full px-4 py-2 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-50 dark:hover:bg-gray-800 border-t border-gray-200 dark:border-gray-700 transition-colors"
+              className="w-full px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 border-t border-gray-200 dark:border-gray-700 transition-colors"
             >
               Load more tasks ({totalTasks - tasks.length} remaining)
             </button>
@@ -287,7 +287,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
           <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-white dark:bg-gray-900 z-10">
             <button
               onClick={handleBackToTasks}
-              className="flex items-center text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 mb-1"
+              className="flex items-center text-sm text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white mb-1"
               data-testid="back-to-tasks"
             >
               <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -319,7 +319,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
           ) : (
             <>
               {selectedDatasetInfo?.type === "video" && (
-                <div className="mx-4 mb-2 px-3 py-2 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded text-sm text-purple-700 dark:text-purple-300" data-testid="streaming-notice">
+                <div className="mx-4 mb-2 px-3 py-2 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded text-sm text-gray-700 dark:text-gray-300" data-testid="streaming-notice">
                   Streaming dataset - showing sample episodes
                 </div>
               )}
@@ -355,7 +355,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                   <button
                     onClick={loadMore}
                     disabled={loadingEpisodes}
-                    className="w-full px-4 py-2 text-sm font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-lg transition-colors disabled:opacity-50"
+                    className="w-full px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
                     data-testid="load-more-episodes"
                   >
                     {loadingEpisodes ? "Loading..." : "Load more episodes"}

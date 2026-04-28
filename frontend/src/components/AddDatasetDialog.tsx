@@ -156,7 +156,7 @@ export default function AddDatasetDialog({
               <button
                 onClick={handleProbe}
                 disabled={phase === "probing" || !input.trim()}
-                className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-4 py-2 text-sm bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
                 data-testid="probe-btn"
               >
                 {phase === "probing" ? "Probing…" : "Probe"}
@@ -186,7 +186,7 @@ export default function AddDatasetDialog({
                   {probe.repo_id}
                 </span>
                 {probe.codebase_version && (
-                  <Pill className="bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 font-mono">
+                  <Pill className="bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300 font-mono">
                     {probe.codebase_version}
                   </Pill>
                 )}
@@ -293,7 +293,7 @@ export default function AddDatasetDialog({
               <button
                 onClick={handleConfirmAdd}
                 disabled={phase === "adding" || alreadyAdded}
-                className="px-4 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-4 py-1.5 text-sm bg-gray-900 hover:bg-black dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
                 data-testid="confirm-add-btn"
               >
                 {phase === "adding" ? "Adding…" : alreadyAdded ? "Already added" : "Add to viewer"}
