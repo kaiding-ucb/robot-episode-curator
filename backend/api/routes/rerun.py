@@ -613,23 +613,31 @@ def _generate_rrd_lerobot_streaming(
     # Log per-camera video clips ONCE (static) — replaces per-frame rr.Image
     # logging that used to bloat .rrd files to ~700MB. The viewer streams the
     # MP4 natively in the browser via Rerun's hardware-accelerated decoder.
+    #
+    # The action/state per-frame loop below uses `rr.set_time("time", timestamp=…)`,
+    # so the "time" timeline is locked to the `timestamp` type. We must index the
+    # video frames on the same timeline using `timestamp=`, never `duration=`,
+    # otherwise Rerun rejects the column type mismatch and the camera renders blank.
+    import numpy as _np
+
     for img_key, mp4_bytes in (video_clips or {}).items():
         try:
             asset = rr.AssetVideo(contents=mp4_bytes, media_type="video/mp4")
             entity = _camera_entity(img_key)
             rr.log(entity, asset, static=True)
 
-            # Index the video frames on the same "time" timeline as actions/state
-            # so scrubbing keeps everything in sync. read_frame_timestamps_nanos()
-            # returns per-frame PTS within the sliced clip (which starts at 0
-            # because ffmpeg input-side seek resets the output timebase).
             try:
                 ts_ns = asset.read_frame_timestamps_nanos()
                 if ts_ns is not None and len(ts_ns) > 0:
+                    # Convert nanoseconds → float seconds-since-Unix-epoch so the
+                    # TimeColumn matches the `timestamp=` semantics used elsewhere
+                    # on the "time" timeline. The clip's PTS starts at 0, which
+                    # maps to 1970-01-01 — same convention as the action/state log.
+                    timestamp_s = _np.asarray(ts_ns, dtype=_np.float64) / 1e9
                     rr.send_columns(
                         entity,
-                        indexes=[rr.TimeColumn("time", duration=1e-9 * ts_ns)],
-                        columns=rr.VideoFrameReference.columns_nanoseconds(ts_ns),
+                        indexes=[rr.TimeColumn("time", timestamp=timestamp_s)],
+                        columns=rr.VideoFrameReference.columns_nanos(ts_ns),
                     )
             except Exception as e:
                 # If the timestamp/columns API isn't available in this rerun-sdk

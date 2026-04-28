@@ -90,6 +90,13 @@ function installErrorSuppressor() {
   }) as typeof console.error;
 }
 
+// Install at module load so the suppressor is in place BEFORE the first WASM
+// async callback fires (the previous "useEffect" install missed the very first
+// episode's stale-handle error in dev mode).
+if (typeof window !== "undefined") {
+  installErrorSuppressor();
+}
+
 // Hide everything except the viewport (cameras + state + action views) and
 // the bottom time controls. Applied both via the backend blueprint and here
 // as a belt-and-suspenders in case the .rrd is loaded from an older cache.
