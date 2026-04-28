@@ -11,14 +11,30 @@ import pytest
 from pathlib import Path
 
 
-# HuggingFace token from CLAUDE.md
-HF_TOKEN = "REDACTED-HF-TOKEN"
+# HuggingFace token: read from environment or ~/.huggingface/token at test start.
+def _resolve_hf_token() -> str:
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if tok:
+        return tok
+    for p in (Path.home() / ".huggingface" / "token", Path.home() / ".cache" / "huggingface" / "token"):
+        if p.exists():
+            try:
+                t = p.read_text().strip()
+                if t:
+                    return t
+            except OSError:
+                continue
+    return ""
+
+
+HF_TOKEN = _resolve_hf_token()
 
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_hf_token():
     """Set up HuggingFace token for API access."""
-    os.environ["HF_TOKEN"] = HF_TOKEN
+    if HF_TOKEN:
+        os.environ["HF_TOKEN"] = HF_TOKEN
     yield
 
 

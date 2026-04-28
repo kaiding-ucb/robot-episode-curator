@@ -106,64 +106,10 @@ def get_all_datasets() -> Dict[str, Dict[str, Any]]:
     return combined
 
 
-# Dataset registry with download configurations
-DATASET_REGISTRY = {
-    "egocentric_10k": {
-        "name": "Egocentric-10K",
-        "type": "video",
-        "description": "10,000 hours of factory egocentric video",
-        "size_estimate_gb": 16400,  # 16.4 TB
-        "downloader_class": HuggingFaceDownloader,
-        "repo_id": "builddotai/Egocentric-10K",
-        "requires_auth": True,
-        "streaming_recommended": True,
-        "format": "webdataset",
-        "has_actions": False,
-        "has_imu": False,
-        "max_episode_size_mb": None,
-    },
-    "realomni": {
-        "name": "10Kh RealOmni-Open",
-        "type": "teleop",
-        "description": "Dual-arm teleoperation data with multiple sensors",
-        "size_estimate_gb": 95000,  # 95 TB total
-        "downloader_class": HuggingFaceDownloader,
-        "repo_id": "genrobot2025/10Kh-RealOmin-OpenData",
-        "requires_auth": True,
-        "streaming_recommended": True,
-        "modalities": ["rgb", "depth", "imu", "actions"],
-        "format": "mcap",
-        "has_actions": True,
-        "has_imu": True,
-        "max_episode_size_mb": 200,
-    },
-    "ego4d": {
-        "name": "Ego4D",
-        "type": "video",
-        "description": "Egocentric video dataset from Meta",
-        "size_estimate_gb": 7000,  # ~7 TB
-        "requires_auth": True,
-        "requires_license": True,
-        "format": "video",
-        "has_actions": False,
-        "has_imu": False,
-        "max_episode_size_mb": None,
-    },
-    "microagi00": {
-        "name": "MicroAGI00",
-        "type": "teleop",
-        "description": "Egocentric RGB+D manipulation data with hand landmarks",
-        "size_estimate_gb": 500,
-        "downloader_class": HuggingFaceDownloader,
-        "repo_id": "MicroAGI-Labs/MicroAGI00",
-        "requires_auth": False,
-        "streaming_recommended": True,
-        "format": "mcap",
-        "has_actions": True,
-        "has_imu": True,
-        "max_episode_size_mb": 57000,
-    },
-}
+# Static dataset registry intentionally empty after the LeRobot pivot —
+# all datasets are user-added (dynamic) and fully deletable. The symbol
+# remains for backward compatibility with code that imports it.
+DATASET_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
 class DownloadManager:

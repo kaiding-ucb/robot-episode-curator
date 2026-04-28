@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Data Viewer - Robotics Dataset Explorer",
-  description: "Quality assessment viewer for robotics datasets",
+  title: "Robot Episode Curator",
+  description: "Curator and quality viewer for LeRobot datasets",
 };
 
 export default function RootLayout({

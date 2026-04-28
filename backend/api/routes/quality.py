@@ -27,7 +27,7 @@ from quality import (
 )
 from loaders import HDF5Loader, LeRobotLoader, RLDSLoader
 from loaders.streaming_extractor import StreamingFrameExtractor
-from downloaders.manager import DATASET_REGISTRY
+from downloaders.manager import get_all_datasets
 from cache import (
     get_cached_quality_result,
     cache_quality_result,
@@ -156,10 +156,11 @@ def get_data_root(request: Request) -> Path:
 
 def get_loader(dataset_id: str, data_root: Path):
     """Get appropriate loader for dataset."""
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     data_dir = data_root / dataset_id
 
     # Check format first
@@ -178,10 +179,11 @@ def get_loader(dataset_id: str, data_root: Path):
 
 def is_streaming_dataset(dataset_id: str) -> tuple:
     """Check if dataset is streaming and return repo_id if so."""
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         return False, None
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
     if config.get("streaming_recommended") and config.get("repo_id"):
         return True, config["repo_id"]
 

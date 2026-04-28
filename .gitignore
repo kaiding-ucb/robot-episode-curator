@@ -34,3 +34,7 @@ test-results/
 /*.jpg
 /*.jpeg
 
+# Project-specific (Claude Code session memory; private exploration notebooks)
+CLAUDE.md
+exploration/
+

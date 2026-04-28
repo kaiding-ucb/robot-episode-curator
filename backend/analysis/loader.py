@@ -18,7 +18,25 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "REDACTED-HF-TOKEN")
+def _read_hf_token_file() -> str | None:
+    from pathlib import Path
+    for p in (Path.home() / ".huggingface" / "token", Path.home() / ".cache" / "huggingface" / "token"):
+        if p.exists():
+            try:
+                t = p.read_text().strip()
+                if t:
+                    return t
+            except OSError:
+                continue
+    return None
+
+
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or _read_hf_token_file()
+    or ""
+)
 
 
 async def _list_data_files(repo_id: str, branch: str = "main") -> list[str]:

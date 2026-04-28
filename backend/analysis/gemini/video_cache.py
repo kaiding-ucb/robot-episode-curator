@@ -14,7 +14,24 @@ from huggingface_hub import hf_hub_download, HfApi
 
 logger = logging.getLogger(__name__)
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "REDACTED-HF-TOKEN")
+def _read_hf_token_file() -> Optional[str]:
+    for p in (Path.home() / ".huggingface" / "token", Path.home() / ".cache" / "huggingface" / "token"):
+        if p.exists():
+            try:
+                t = p.read_text().strip()
+                if t:
+                    return t
+            except OSError:
+                continue
+    return None
+
+
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or _read_hf_token_file()
+    or ""
+)
 CACHE_ROOT = Path(os.environ.get("DATA_VIEWER_CACHE", Path.home() / ".cache" / "data_viewer")) / "phase_aware_gemini" / "clips"
 
 

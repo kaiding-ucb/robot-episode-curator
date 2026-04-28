@@ -33,6 +33,7 @@ from downloaders.manager import (
     add_dynamic_dataset,
     remove_dynamic_dataset,
     get_all_datasets,
+    get_dynamic_datasets,
 )
 from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
 from loaders.base import Modality
@@ -752,29 +753,85 @@ def get_loader(dataset_id: str, data_root: Path):
     return None
 
 
+_NON_LEROBOT_FORMATS = {"webdataset", "mcap", "video", "rlds", "hdf5"}
+
+
+async def _is_repo_lerobot(repo_id: str) -> bool:
+    """Probe meta/info.json on HF; return True if codebase_version is present."""
+    try:
+        info = await fetch_lerobot_info(repo_id)
+    except Exception:
+        return False
+    return bool(info and info.get("codebase_version"))
+
+
 @router.get("", response_model=List[DatasetInfo])
 async def list_datasets(request: Request):
     """
-    List all available datasets with their status.
+    List datasets registered in the dynamic registry, restricted to LeRobot.
+
+    Entries with `format=="lerobot"` are kept directly. Entries with no
+    recorded format are probed against `meta/info.json`; if they look like
+    LeRobot they are upgraded in-place (format set to "lerobot") and kept.
+    Entries with a non-LeRobot format are filtered out.
     """
+    import asyncio
+
     data_root = get_data_root(request)
     manager = DownloadManager(data_root)
+    all_dyn = get_dynamic_datasets()
 
-    datasets = []
-    for ds in manager.list_datasets():
-        datasets.append(
-            DatasetInfo(
-                id=ds["id"],
-                name=ds["name"],
-                type=ds["type"],
-                format=ds.get("format"),
-                description=ds.get("description"),
-                status=ds.get("status", "unknown"),
-                size_mb=ds.get("size_mb"),
-            )
+    raw = manager.list_datasets()
+    keep: List[dict] = []
+    ambiguous: List[dict] = []
+
+    for ds in raw:
+        fmt = ds.get("format")
+        if fmt == "lerobot":
+            keep.append(ds)
+        elif fmt in _NON_LEROBOT_FORMATS:
+            continue  # Filter legacy non-LeRobot entries
+        elif fmt is None or fmt == "":
+            ambiguous.append(ds)
+        else:
+            # Unknown format strings — drop conservatively.
+            continue
+
+    # Probe ambiguous entries in parallel.
+    if ambiguous:
+        repo_ids = [ds.get("id") for ds in ambiguous]
+        configs = [all_dyn.get(ds_id) for ds_id in repo_ids]
+        repos = [(c or {}).get("repo_id") for c in configs]
+
+        async def probe(repo_id: Optional[str]) -> bool:
+            if not repo_id:
+                return False
+            return await _is_repo_lerobot(repo_id)
+
+        results = await asyncio.gather(*(probe(r) for r in repos), return_exceptions=False)
+
+        for ds, repo_id, is_lerobot, cfg in zip(ambiguous, repos, results, configs):
+            if is_lerobot and cfg is not None:
+                # Upgrade in place: persist format=lerobot for next load.
+                merged = dict(cfg)
+                merged["format"] = "lerobot"
+                add_dynamic_dataset(ds["id"], merged)
+                ds["format"] = "lerobot"
+                keep.append(ds)
+            # else: filter out — not a LeRobot dataset
+
+    return [
+        DatasetInfo(
+            id=ds["id"],
+            name=ds["name"],
+            type=ds["type"],
+            format=ds.get("format"),
+            description=ds.get("description"),
+            status=ds.get("status", "unknown"),
+            size_mb=ds.get("size_mb"),
         )
-
-    return datasets
+        for ds in keep
+    ]
 
 
 @router.get("/{dataset_id}", response_model=DatasetInfo)
@@ -2105,6 +2162,128 @@ async def _probe_mcap_modalities(
     return [Modality.RGB.value], None
 
 
+# === LeRobot Catalog Endpoint ===
+
+
+class LerobotCatalogEntry(BaseModel):
+    repo_id: str
+    name: str
+    likes: int = 0
+    downloads: int = 0
+    last_modified: Optional[str] = None
+    gated: bool = False
+    codebase_version: Optional[str] = None
+    robot_type: Optional[str] = None
+    total_episodes: Optional[int] = None
+    total_frames: Optional[int] = None
+    total_tasks: Optional[int] = None
+
+
+class LerobotCatalogResponse(BaseModel):
+    items: List[LerobotCatalogEntry]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
+_LEROBOT_CATALOG_CACHE: Dict[str, Tuple[LerobotCatalogResponse, datetime]] = {}
+_LEROBOT_CATALOG_TTL = timedelta(hours=1)
+
+
+def _parse_catalog_card(description: str) -> Dict[str, Any]:
+    """Parse a few cheap fields from the description blob (LeRobot card text)."""
+    out: Dict[str, Any] = {}
+    if not description:
+        return out
+    # codebase_version "v3.0", "v2.1", etc.
+    m = re.search(r'"codebase_version"\s*:\s*"(v?[\d.]+)"', description)
+    if m:
+        out["codebase_version"] = m.group(1)
+    m = re.search(r'"robot_type"\s*:\s*"([^"]+)"', description)
+    if m:
+        out["robot_type"] = m.group(1)
+    for key in ("total_episodes", "total_frames", "total_tasks"):
+        m = re.search(rf'"{key}"\s*:\s*(\d+)', description)
+        if m:
+            out[key] = int(m.group(1))
+    return out
+
+
+@router.get("/lerobot-catalog", response_model=LerobotCatalogResponse)
+async def lerobot_catalog(
+    search: str = Query("", description="Substring filter against repo_id"),
+    sort: str = Query("downloads", pattern="^(downloads|likes|lastModified)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List LeRobot datasets from the HuggingFace `lerobot` org with light parsing."""
+    cache_key = f"{search}|{sort}|{limit}|{offset}"
+    if cache_key in _LEROBOT_CATALOG_CACHE:
+        cached, fetched_at = _LEROBOT_CATALOG_CACHE[cache_key]
+        if datetime.utcnow() - fetched_at < _LEROBOT_CATALOG_TTL:
+            return cached
+
+    params = {
+        "author": "lerobot",
+        "limit": str(limit),
+        "full": "true",
+        "sort": sort,
+        "direction": "-1",
+    }
+    if search:
+        params["search"] = search
+
+    headers = _get_hf_headers()
+    url = "https://huggingface.co/api/datasets"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(url, params=params, headers=headers, timeout=20.0)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:
+        logger.warning(f"lerobot_catalog: HF query failed: {e}")
+        raise HTTPException(status_code=502, detail=f"HuggingFace query failed: {e}")
+
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=502, detail="Unexpected HF response shape")
+
+    # Apply offset/limit client-side (HF API doesn't support offset directly with this filter set)
+    sliced = payload[offset : offset + limit]
+    items: List[LerobotCatalogEntry] = []
+    for entry in sliced:
+        if not isinstance(entry, dict):
+            continue
+        repo_id = entry.get("id") or ""
+        if not repo_id.startswith("lerobot/"):
+            continue
+        name = repo_id.split("/", 1)[1] if "/" in repo_id else repo_id
+        parsed = _parse_catalog_card(entry.get("description") or "")
+        items.append(LerobotCatalogEntry(
+            repo_id=repo_id,
+            name=name,
+            likes=int(entry.get("likes") or 0),
+            downloads=int(entry.get("downloads") or 0),
+            last_modified=entry.get("lastModified"),
+            gated=bool(entry.get("gated")),
+            codebase_version=parsed.get("codebase_version"),
+            robot_type=parsed.get("robot_type"),
+            total_episodes=parsed.get("total_episodes"),
+            total_frames=parsed.get("total_frames"),
+            total_tasks=parsed.get("total_tasks"),
+        ))
+
+    response = LerobotCatalogResponse(
+        items=items,
+        total=len(payload),
+        offset=offset,
+        limit=limit,
+        has_more=(offset + limit) < len(payload),
+    )
+    _LEROBOT_CATALOG_CACHE[cache_key] = (response, datetime.utcnow())
+    return response
+
+
 @router.post("/probe", response_model=ProbeResponse)
 async def probe_dataset(request_body: ProbeRequest):
     """
@@ -2142,11 +2321,16 @@ async def add_dataset(request_body: AddDatasetRequest):
 
     The dataset will appear in the list and can be browsed/streamed.
     """
-    repo_id = parse_huggingface_url(request_body.url)
+    raw = (request_body.url or "").strip()
+    repo_id = parse_huggingface_url(raw)
+    if not repo_id:
+        # Bare names like "svla_so101_pickplace" → assume the lerobot org.
+        if raw and "/" not in raw and " " not in raw and re.match(r"^[A-Za-z0-9._-]+$", raw):
+            repo_id = f"lerobot/{raw}"
     if not repo_id:
         raise HTTPException(
             status_code=400,
-            detail="Invalid HuggingFace URL",
+            detail="Invalid HuggingFace URL or repo ID",
         )
 
     # Check if already exists
@@ -2171,12 +2355,21 @@ async def add_dataset(request_body: AddDatasetRequest):
             error=probe_result.error,
         )
 
+    # Enforce LeRobot-only after the pivot.
+    if probe_result.format_detected != "lerobot":
+        detected = probe_result.format_detected or "unknown"
+        return AddDatasetResponse(
+            dataset_id=dataset_id,
+            name=repo_id.split("/")[-1],
+            success=False,
+            error=(
+                f"Only LeRobot datasets are supported. Detected format: {detected}. "
+                "Browse https://huggingface.co/lerobot for compatible datasets."
+            ),
+        )
+
     # Determine dataset type
-    dataset_type = "video"
-    if probe_result.format_detected in ["mcap", "lerobot", "rlds", "hdf5"]:
-        dataset_type = "teleop"
-    if Modality.ACTIONS.value in probe_result.modalities:
-        dataset_type = "teleop"
+    dataset_type = "teleop"
 
     # Create config
     name = request_body.name or probe_result.name
@@ -2205,19 +2398,7 @@ async def add_dataset(request_body: AddDatasetRequest):
 
 @router.delete("/{dataset_id}")
 async def delete_dataset(dataset_id: str):
-    """
-    Remove a dynamically added dataset.
-
-    Note: Only datasets added via the /api/datasets POST endpoint can be removed.
-    Built-in datasets cannot be removed.
-    """
-    if dataset_id in DATASET_REGISTRY:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot remove built-in dataset: {dataset_id}",
-        )
-
-    # Get config before removal to invalidate adapter cache
+    """Remove a dataset from the registry. All datasets are deletable."""
     all_datasets = get_all_datasets()
     config = all_datasets.get(dataset_id, {})
     repo_id = config.get("repo_id")

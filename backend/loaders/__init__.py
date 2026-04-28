@@ -18,12 +18,13 @@ def get_repo_id_for_dataset(dataset_id: str) -> str | None:
         HuggingFace repo ID or None if not found
     """
     # Import here to avoid circular dependency
-    from downloaders.manager import DATASET_REGISTRY
+    from downloaders.manager import get_all_datasets
 
-    if dataset_id not in DATASET_REGISTRY:
+    all_datasets = get_all_datasets()
+    if dataset_id not in all_datasets:
         return None
 
-    config = DATASET_REGISTRY[dataset_id]
+    config = all_datasets[dataset_id]
 
     # Return explicit repo_id if set
     if "repo_id" in config:

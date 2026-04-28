@@ -797,6 +797,51 @@ export function useActionsData(
 }
 
 /**
+ * List LeRobot datasets from the HuggingFace `lerobot` org.
+ */
+export interface LerobotCatalogEntry {
+  repo_id: string;
+  name: string;
+  likes: number;
+  downloads: number;
+  last_modified: string | null;
+  gated: boolean;
+  codebase_version: string | null;
+  robot_type: string | null;
+  total_episodes: number | null;
+  total_frames: number | null;
+  total_tasks: number | null;
+}
+
+export interface LerobotCatalogResponse {
+  items: LerobotCatalogEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+}
+
+export async function fetchLerobotCatalog(
+  search: string = "",
+  sort: "downloads" | "likes" | "lastModified" = "downloads",
+  limit: number = 50,
+  offset: number = 0,
+): Promise<LerobotCatalogResponse> {
+  const params = new URLSearchParams({
+    sort,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (search) params.set("search", search);
+  const res = await fetch(`${API_BASE}/datasets/lerobot-catalog?${params}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
  * Probe a HuggingFace dataset URL
  */
 export async function probeDataset(url: string) {
@@ -825,6 +870,59 @@ export async function addDataset(url: string, name?: string, datasetId?: string)
     const data = await res.json();
     throw new Error(data.detail || `HTTP ${res.status}`);
   }
+  return res.json();
+}
+
+/**
+ * HuggingFace token settings.
+ */
+export interface HfTokenStatus {
+  has_token: boolean;
+  source: "env" | "file" | "none";
+  masked: string | null;
+  username: string | null;
+}
+
+export async function getHfTokenStatus(): Promise<HfTokenStatus> {
+  const res = await fetch(`${API_BASE}/settings/hf-token`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function setHfToken(token: string): Promise<HfTokenStatus> {
+  const res = await fetch(`${API_BASE}/settings/hf-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteHfToken(): Promise<HfTokenStatus> {
+  const res = await fetch(`${API_BASE}/settings/hf-token`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Cache admin (sidebar Clear cache button).
+ */
+export interface CacheBucket { name: string; bytes: number }
+export interface CacheSize { total_bytes: number; total_mb: number; buckets: CacheBucket[] }
+
+export async function fetchCacheSize(): Promise<CacheSize> {
+  const res = await fetch(`${API_BASE}/cache/size`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function clearCache(): Promise<{ cleared_bytes: number; cleared_mb: number }> {
+  const res = await fetch(`${API_BASE}/cache`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 

@@ -83,6 +83,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
         isOpen={showAddDialog}
         onClose={() => setShowAddDialog(false)}
         onDatasetAdded={handleDatasetAdded}
+        existingRepoIds={new Set(datasets.map((d) => d.id).filter(Boolean))}
       />
 
       {/* Dataset List - hidden when a dataset is selected to give tasks/episodes full space */}
@@ -92,7 +93,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
           <button
             onClick={() => setShowAddDialog(true)}
             className="p-1 text-blue-500 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded"
-            title="Add HuggingFace Dataset"
+            title="Add LeRobot Dataset"
             data-testid="add-dataset-button"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

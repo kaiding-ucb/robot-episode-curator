@@ -36,11 +36,25 @@ class TestStreamingPlayback:
 
     @pytest.fixture
     def hf_token(self):
-        """Get HuggingFace token from environment or CLAUDE.md."""
-        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        """Get HuggingFace token from env or ~/.huggingface/token; skip if missing."""
+        token = (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or os.environ.get("HUGGINGFACE_TOKEN")
+        )
         if not token:
-            # Use token from CLAUDE.md for testing
-            token = "REDACTED-HF-TOKEN"
+            from pathlib import Path
+            for p in (Path.home() / ".huggingface" / "token", Path.home() / ".cache" / "huggingface" / "token"):
+                if p.exists():
+                    try:
+                        t = p.read_text().strip()
+                        if t:
+                            token = t
+                            break
+                    except OSError:
+                        continue
+        if not token:
+            pytest.skip("HF_TOKEN not configured")
         return token
 
     @pytest.mark.asyncio

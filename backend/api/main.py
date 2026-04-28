@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from api.routes import datasets, episodes, downloads, quality, compare, analysis, rerun, edge_frames
+from api.routes import datasets, episodes, downloads, quality, compare, analysis, rerun, edge_frames, cache_admin, settings as settings_routes
 from loaders.streaming_extractor import cleanup_all_decoded_frames
 
 # Configure logging
@@ -59,6 +59,8 @@ app.include_router(quality.router, prefix="/api/quality", tags=["quality"])
 app.include_router(compare.router, prefix="/api/compare", tags=["compare"])
 app.include_router(analysis.router, prefix="/api/datasets", tags=["analysis"])
 app.include_router(edge_frames.router, prefix="/api/datasets", tags=["edge_frames"])
+app.include_router(cache_admin.router, prefix="/api/cache", tags=["cache"])
+app.include_router(settings_routes.router, prefix="/api/settings", tags=["settings"])
 app.include_router(rerun.router, prefix="/api", tags=["rerun"])
 
 
