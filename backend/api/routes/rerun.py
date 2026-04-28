@@ -53,8 +53,12 @@ HF_TOKEN = (
 
 
 def _get_rrd_cache_path(dataset_id: str, episode_id: str) -> Path:
-    """Get the cache path for an RRD file."""
+    """Get the cache path for an RRD file. Ensures the cache dir exists at
+    call time — the user can wipe ~/.cache/data_viewer at any moment via the
+    sidebar Clear cache button, so the import-time mkdir alone isn't enough.
+    """
     import hashlib
+    RRD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = f"{dataset_id}|{episode_id}"
     hash_key = hashlib.sha256(key.encode()).hexdigest()[:16]
     safe_name = episode_id.replace("/", "_").replace("\\", "_")[:50]

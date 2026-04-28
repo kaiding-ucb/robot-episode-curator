@@ -13,8 +13,33 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
-# Decision #5: server env var; fallback to the dev key in project scripts.
-_API_KEY = os.environ.get("GEMINI_API_KEY", "REDACTED-GEMINI-KEY")
+
+
+def _read_gemini_token_file() -> Optional[str]:
+    """Read user-saved Gemini key from disk if env var isn't set.
+
+    Mirrors the HF-token resolution pattern: env var first, then a small
+    file under ~/.config/data_viewer/. Token is written by the
+    /api/settings/gemini-token endpoint.
+    """
+    p = Path.home() / ".config" / "data_viewer" / "gemini_key"
+    if p.exists():
+        try:
+            t = p.read_text().strip()
+            if t:
+                return t
+        except OSError:
+            pass
+    return None
+
+
+def _resolve_api_key() -> str:
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or _read_gemini_token_file()
+        or ""
+    )
 
 
 class GeminiUnavailable(RuntimeError):
@@ -22,12 +47,18 @@ class GeminiUnavailable(RuntimeError):
 
 
 class GeminiClient:
-    def __init__(self, api_key: str = _API_KEY, model: str = DEFAULT_MODEL):
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
         try:
             from google import genai  # noqa: F401
         except ImportError as e:
             raise GeminiUnavailable(f"google-genai not installed: {e}")
-        self.api_key = api_key
+        resolved = api_key or _resolve_api_key()
+        if not resolved:
+            raise GeminiUnavailable(
+                "Gemini API key not configured. Set GEMINI_API_KEY or save a key "
+                "via the homepage settings."
+            )
+        self.api_key = resolved
         self.model = model
         self._client = None
         self._uploaded_cache: dict[Path, Any] = {}

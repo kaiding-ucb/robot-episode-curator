@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 TOKEN_FILE = Path.home() / ".huggingface" / "token"
+GEMINI_TOKEN_FILE = Path.home() / ".config" / "data_viewer" / "gemini_key"
 
 
 class HfTokenStatus(BaseModel):
@@ -121,6 +122,120 @@ async def set_hf_token(body: HfTokenUpdate):
         masked=_mask(token),
         username=username,
     )
+
+
+# === Gemini API Key ===
+
+
+class GeminiKeyStatus(BaseModel):
+    has_key: bool
+    source: str  # "env" | "file" | "none"
+    masked: Optional[str] = None
+
+
+class GeminiKeyUpdate(BaseModel):
+    key: str = Field(..., min_length=4, max_length=200)
+
+
+def _read_gemini_key_from_file() -> Optional[str]:
+    if GEMINI_TOKEN_FILE.exists():
+        try:
+            t = GEMINI_TOKEN_FILE.read_text().strip()
+            if t:
+                return t
+        except OSError:
+            pass
+    return None
+
+
+def _current_gemini_key() -> tuple[Optional[str], str]:
+    t = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if t:
+        return t, "env"
+    t = _read_gemini_key_from_file()
+    if t:
+        return t, "file"
+    return None, "none"
+
+
+async def _validate_gemini_key(key: str) -> tuple[bool, Optional[str]]:
+    """Best-effort key check.
+
+    Hits the public ListModels endpoint. We treat 401/403 as a hard reject
+    (the key is genuinely bad), but any other response — 200, 4xx, network
+    error — is "inconclusive": save the key and let the actual Gemini call
+    surface a richer error if it fails. This avoids false-rejections from
+    transient network issues or restricted-API keys that still work for
+    Gemini-only access.
+
+    Returns (ok, reason_if_rejected).
+    """
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params={"key": key})
+            if resp.status_code in (401, 403):
+                msg = ""
+                try:
+                    err = resp.json().get("error", {})
+                    msg = err.get("message") or ""
+                except Exception:
+                    pass
+                return False, msg or f"HTTP {resp.status_code}"
+            return True, None
+    except Exception as e:
+        logger.warning(f"gemini key check failed: {e}")
+        return True, None  # Inconclusive — accept and let real calls surface errors
+
+
+@router.get("/gemini-token", response_model=GeminiKeyStatus)
+async def get_gemini_status():
+    key, source = _current_gemini_key()
+    if not key:
+        return GeminiKeyStatus(has_key=False, source="none")
+    return GeminiKeyStatus(has_key=True, source=source, masked=_mask(key))
+
+
+@router.post("/gemini-token", response_model=GeminiKeyStatus)
+async def set_gemini_key(body: GeminiKeyUpdate):
+    key = body.key.strip()
+    if len(key) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini key looks too short. Get one from https://aistudio.google.com/apikey.",
+        )
+    ok, reason = await _validate_gemini_key(key)
+    if not ok:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Key rejected by Google API: {reason}",
+        )
+    try:
+        GEMINI_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GEMINI_TOKEN_FILE.write_text(key + "\n")
+        try:
+            os.chmod(GEMINI_TOKEN_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write key file: {e}")
+    return GeminiKeyStatus(has_key=True, source="file", masked=_mask(key))
+
+
+@router.delete("/gemini-token", response_model=GeminiKeyStatus)
+async def delete_gemini_key():
+    if GEMINI_TOKEN_FILE.exists():
+        try:
+            GEMINI_TOKEN_FILE.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to remove key file: {e}")
+    key, source = _current_gemini_key()
+    if key:
+        return GeminiKeyStatus(has_key=True, source=source, masked=_mask(key))
+    return GeminiKeyStatus(has_key=False, source="none")
+
+
+# === HF token DELETE (kept below Gemini for grouping) ===
 
 
 @router.delete("/hf-token", response_model=HfTokenStatus)

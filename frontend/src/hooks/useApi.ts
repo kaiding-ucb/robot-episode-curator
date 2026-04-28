@@ -908,6 +908,37 @@ export async function deleteHfToken(): Promise<HfTokenStatus> {
   return res.json();
 }
 
+export interface GeminiKeyStatus {
+  has_key: boolean;
+  source: "env" | "file" | "none";
+  masked: string | null;
+}
+
+export async function getGeminiKeyStatus(): Promise<GeminiKeyStatus> {
+  const res = await fetch(`${API_BASE}/settings/gemini-token`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function setGeminiKey(key: string): Promise<GeminiKeyStatus> {
+  const res = await fetch(`${API_BASE}/settings/gemini-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteGeminiKey(): Promise<GeminiKeyStatus> {
+  const res = await fetch(`${API_BASE}/settings/gemini-token`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
 /**
  * Cache admin (sidebar Clear cache button).
  */

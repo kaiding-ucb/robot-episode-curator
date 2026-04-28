@@ -1,26 +1,30 @@
 "use client";
 
-import EpisodeViewer from "@/components/EpisodeViewer";
-import type { Modality } from "@/types/api";
+import dynamic from "next/dynamic";
+import OnboardingPanel from "@/components/OnboardingPanel";
+
+// Rerun viewer is loaded lazily — its WASM module only initialises in the
+// browser, and the bundle is large enough that we don't want it in the
+// initial JS payload.
+const RerunViewer = dynamic(() => import("@/components/RerunViewer"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex items-center justify-center h-full bg-gray-900 text-gray-400">
+      <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full" />
+    </div>
+  ),
+});
 
 interface MainContentProps {
   selectedDataset: string | null;
   selectedEpisode: string | null;
   selectedEpisodeDisplayName?: string | null;
-  totalFrames: number;
-  targetFrame: number | null;
-  onFrameChange: () => void;
-  availableModalities?: Modality[];
 }
 
 export default function MainContent({
   selectedDataset,
   selectedEpisode,
   selectedEpisodeDisplayName,
-  totalFrames,
-  targetFrame,
-  onFrameChange,
-  availableModalities = ["rgb"],
 }: MainContentProps) {
   return (
     <main className="flex-1 flex flex-col min-w-0">
@@ -42,16 +46,16 @@ export default function MainContent({
         </div>
       </header>
 
-      {/* Episode Viewer */}
+      {/* Main panel: Rerun when an episode is selected, onboarding card otherwise. */}
       <div className="flex-1 bg-gray-50 dark:bg-gray-900 overflow-hidden">
-        <EpisodeViewer
-          datasetId={selectedDataset}
-          episodeId={selectedEpisode}
-          totalFrames={totalFrames}
-          targetFrame={targetFrame}
-          onFrameChange={onFrameChange}
-          availableModalities={availableModalities}
-        />
+        {selectedEpisode ? (
+          <RerunViewer
+            datasetId={selectedDataset}
+            episodeId={selectedEpisode}
+          />
+        ) : (
+          <OnboardingPanel />
+        )}
       </div>
     </main>
   );

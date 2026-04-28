@@ -324,9 +324,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                 </div>
               )}
               <ul className="divide-y divide-gray-100 dark:divide-gray-800" data-testid="episode-list">
-                {episodes.map((episode, index) => {
-                  const displayIndex = episode.task_local_index ?? index;
-                  return (
+                {episodes.map((episode) => (
                   <li key={episode.id}>
                     <button
                       onClick={() => onSelectEpisode?.(
@@ -334,13 +332,13 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                         episode.id,
                         episode.num_frames || 0,
                         selectedDatasetInfo?.modalities as Modality[] | undefined,
-                        `episode_${displayIndex}`
+                        episode.id
                       )}
                       className="w-full px-4 py-2 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
                       data-testid={`episode-item-${episode.id}`}
                     >
                       <p className="text-sm font-medium text-gray-900 dark:text-white">
-                        episode_{displayIndex}
+                        {episode.id}
                       </p>
                       <p className="text-xs text-gray-500">
                         {episode.num_frames != null ? `${episode.num_frames} frames` : 'frames'}
@@ -348,8 +346,7 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                       </p>
                     </button>
                   </li>
-                  );
-                })}
+                ))}
               </ul>
 
               {/* Load More Button */}

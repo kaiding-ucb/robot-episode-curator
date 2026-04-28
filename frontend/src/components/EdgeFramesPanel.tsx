@@ -48,10 +48,10 @@ export default function EdgeFramesPanel({
     return Array.from(map.values()).sort((a, b) => a.episode_index - b.episode_index);
   }, [state.framesByPos, state.position]);
 
-  if (!datasetId || !taskName) {
+  if (!datasetId) {
     return (
       <div className="py-6 text-sm text-gray-500 text-center" data-testid="edge-frames-no-task">
-        Select a task to load starting & ending frames.
+        Select a dataset to load starting &amp; ending frames.
       </div>
     );
   }
@@ -71,8 +71,8 @@ export default function EdgeFramesPanel({
       {/* Header */}
       <div className="flex flex-wrap items-center gap-3">
         <div className="text-xs text-gray-600 dark:text-gray-400">
-          <span className="font-medium">Task:</span>{" "}
-          <span className="text-gray-900 dark:text-white">{taskName}</span>
+          <span className="font-medium">{taskName ? "Task:" : "Scope:"}</span>{" "}
+          <span className="text-gray-900 dark:text-white">{taskName || "All tasks"}</span>
           {totalForTask > 0 && (
             <span className="ml-2 text-gray-500 dark:text-gray-400">
               · showing <span className="font-semibold">{Math.min(total, totalForTask)}</span> of{" "}

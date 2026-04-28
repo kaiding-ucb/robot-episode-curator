@@ -85,7 +85,8 @@ interface PhaseAwareData {
 
 interface PhaseAwarePanelProps {
   datasetId: string;
-  taskName: string;
+  /** Specific task, or `null` for dataset-wide (first 50 episodes by episode_index). */
+  taskName: string | null;
   onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number, targetFrame?: number) => void;
 }
 
@@ -107,9 +108,11 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
   const [gemLoading, setGemLoading] = useState(false);
   const [gemError, setGemError] = useState<string | null>(null);
 
+  const taskQuery = taskName ? `&task_name=${encodeURIComponent(taskName)}` : "&task_name=_all_";
+
   const fetchData = (includeGemini: boolean, signal?: AbortSignal) =>
     fetch(
-      `${API_BASE}/datasets/${encodeURIComponent(datasetId)}/analysis/phase-aware?task_name=${encodeURIComponent(taskName)}&cohort_size=${COHORT_CAP}${includeGemini ? "&include_gemini=true" : ""}`,
+      `${API_BASE}/datasets/${encodeURIComponent(datasetId)}/analysis/phase-aware?cohort_size=${COHORT_CAP}${taskQuery}${includeGemini ? "&include_gemini=true" : ""}`,
       { signal }
     ).then(async (r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -117,7 +120,7 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
     });
 
   useEffect(() => {
-    if (!datasetId || !taskName) return;
+    if (!datasetId) return;
     const controller = new AbortController();
     setLoading(true);
     setError(null);
@@ -167,7 +170,7 @@ export function PhaseAwarePanel({ datasetId, taskName, onNavigateToEpisode }: Ph
     if (evtSrcRef.current) {
       evtSrcRef.current.close();
     }
-    const url = `${API_BASE}/datasets/${encodeURIComponent(datasetId)}/analysis/phase-aware/stream?task_name=${encodeURIComponent(taskName)}&cohort_size=${COHORT_CAP}`;
+    const url = `${API_BASE}/datasets/${encodeURIComponent(datasetId)}/analysis/phase-aware/stream?cohort_size=${COHORT_CAP}${taskQuery}`;
     const es = new EventSource(url);
     evtSrcRef.current = es;
 

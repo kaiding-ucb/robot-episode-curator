@@ -213,42 +213,52 @@ async def edge_frames_stream(
     if info is None:
         raise HTTPException(status_code=502, detail="Could not fetch LeRobot info.json")
 
-    tasks_df = await fetch_lerobot_tasks_meta(repo_id)
     episodes_df = await fetch_lerobot_episodes_meta(repo_id)
-    if episodes_df is None or tasks_df is None:
-        raise HTTPException(status_code=502, detail="Could not fetch LeRobot meta")
+    if episodes_df is None:
+        raise HTTPException(status_code=502, detail="Could not fetch LeRobot episodes meta")
 
-    # Resolve task_index from task_name
-    task_col = "task_description" if "task_description" in tasks_df.columns else None
-    if task_col is None:
-        for col in tasks_df.columns:
-            if col != "task_index":
-                task_col = col
-                break
+    all_tasks_mode = task_name in ("_all_", "")
 
-    task_index: Optional[int] = None
-    if task_col is not None:
-        match = tasks_df[tasks_df[task_col] == task_name]
-        if len(match) > 0:
-            task_index = int(match.iloc[0]["task_index"])
-    if task_index is None:
-        m = re.match(r"^Untitled \(task (\d+)\)$", task_name)
-        if m:
-            candidate = int(m.group(1))
-            if candidate in tasks_df["task_index"].values:
-                task_index = candidate
-    if task_index is None:
-        raise HTTPException(status_code=404, detail=f"Task not found: {task_name}")
+    if all_tasks_mode:
+        all_indices = sorted(int(x) for x in episodes_df["episode_index"].tolist())
+        total_for_task = len(all_indices)
+        selected_indices = all_indices[:limit]
+    else:
+        tasks_df = await fetch_lerobot_tasks_meta(repo_id)
+        if tasks_df is None:
+            raise HTTPException(status_code=502, detail="Could not fetch LeRobot tasks meta")
 
-    ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
-    if ep_task_map is None:
-        raise HTTPException(status_code=502, detail="Could not derive episode-task map")
+        # Resolve task_index from task_name
+        task_col = "task_description" if "task_description" in tasks_df.columns else None
+        if task_col is None:
+            for col in tasks_df.columns:
+                if col != "task_index":
+                    task_col = col
+                    break
 
-    task_ep_indices = sorted(
-        [ep_idx for ep_idx, t_idx in ep_task_map.items() if t_idx == task_index]
-    )
-    total_for_task = len(task_ep_indices)
-    selected_indices = task_ep_indices[:limit]
+        task_index: Optional[int] = None
+        if task_col is not None:
+            match = tasks_df[tasks_df[task_col] == task_name]
+            if len(match) > 0:
+                task_index = int(match.iloc[0]["task_index"])
+        if task_index is None:
+            m = re.match(r"^Untitled \(task (\d+)\)$", task_name)
+            if m:
+                candidate = int(m.group(1))
+                if candidate in tasks_df["task_index"].values:
+                    task_index = candidate
+        if task_index is None:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_name}")
+
+        ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
+        if ep_task_map is None:
+            raise HTTPException(status_code=502, detail="Could not derive episode-task map")
+
+        task_ep_indices = sorted(
+            [ep_idx for ep_idx, t_idx in ep_task_map.items() if t_idx == task_index]
+        )
+        total_for_task = len(task_ep_indices)
+        selected_indices = task_ep_indices[:limit]
 
     video_path_template = info.get("video_path")
     video_key = _pick_video_key(info)

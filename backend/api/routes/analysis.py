@@ -868,10 +868,13 @@ async def get_dataset_capabilities(dataset_id: str):
 
 
 async def _lerobot_frame_counts_for_task(
-    repo_id: str, task_name: str,
+    repo_id: str, task_name: Optional[str],
 ) -> Optional[FrameCountDistribution]:
     """
     Get exact frame counts for a LeRobot dataset task using metadata parquet.
+
+    When `task_name` is None or empty, includes every episode in the dataset
+    (dataset-wide / "All tasks" mode).
 
     Returns None if metadata is unavailable (caller should fall back to file-size estimation).
     """
@@ -883,54 +886,63 @@ async def _lerobot_frame_counts_for_task(
     )
     import re
 
+    all_tasks = not task_name or task_name == "_all_"
+
     # Fetch metadata in parallel (no datasets-server calls needed)
     episodes_df, tasks_df, info = await asyncio.gather(
         fetch_lerobot_episodes_meta(repo_id),
         fetch_lerobot_tasks_meta(repo_id),
         fetch_lerobot_info(repo_id),
     )
-    if episodes_df is None or tasks_df is None:
+    if episodes_df is None:
         return None
 
-    # Get episode→task map using full resolution chain (meta parquet → data parquet → API)
-    ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
+    if all_tasks:
+        task_episodes = episodes_df.sort_values("episode_index")
+        display_task_name = "All tasks"
+    else:
+        if tasks_df is None:
+            return None
+        # Get episode→task map using full resolution chain (meta parquet → data parquet → API)
+        ep_task_map = await get_episode_task_map(repo_id, episodes_df=episodes_df)
 
-    # Resolve task_name to task_index
-    task_col = "task_description"
-    if task_col not in tasks_df.columns:
-        for col in tasks_df.columns:
-            if col != "task_index":
-                task_col = col
-                break
+        # Resolve task_name to task_index
+        task_col = "task_description"
+        if task_col not in tasks_df.columns:
+            for col in tasks_df.columns:
+                if col != "task_index":
+                    task_col = col
+                    break
 
-    task_index = None
-    if task_col in tasks_df.columns:
-        match = tasks_df[tasks_df[task_col] == task_name]
-        if len(match) > 0:
-            task_index = int(match.iloc[0]["task_index"])
+        task_index = None
+        if task_col in tasks_df.columns:
+            match = tasks_df[tasks_df[task_col] == task_name]
+            if len(match) > 0:
+                task_index = int(match.iloc[0]["task_index"])
 
-    # Handle "Untitled (task N)" fallback names
-    if task_index is None:
-        untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
-        if untitled_match:
-            candidate_idx = int(untitled_match.group(1))
-            if candidate_idx in tasks_df["task_index"].values:
-                task_index = candidate_idx
+        # Handle "Untitled (task N)" fallback names
+        if task_index is None:
+            untitled_match = re.match(r"^Untitled \(task (\d+)\)$", task_name)
+            if untitled_match:
+                candidate_idx = int(untitled_match.group(1))
+                if candidate_idx in tasks_df["task_index"].values:
+                    task_index = candidate_idx
 
-    if task_index is None:
-        return None
+        if task_index is None:
+            return None
 
-    # Get episodes for this task (ep_task_map already fetched above)
-    if ep_task_map is None:
-        return None
+        # Get episodes for this task (ep_task_map already fetched above)
+        if ep_task_map is None:
+            return None
 
-    task_ep_indices = sorted([
-        ep_idx for ep_idx, t_idx in ep_task_map.items()
-        if t_idx == task_index
-    ])
+        task_ep_indices = sorted([
+            ep_idx for ep_idx, t_idx in ep_task_map.items()
+            if t_idx == task_index
+        ])
 
-    task_episodes = episodes_df[episodes_df["episode_index"].isin(task_ep_indices)]
-    task_episodes = task_episodes.sort_values("episode_index")
+        task_episodes = episodes_df[episodes_df["episode_index"].isin(task_ep_indices)]
+        task_episodes = task_episodes.sort_values("episode_index")
+        display_task_name = task_name
 
     fps = info.get("fps", 30) if info else 30
 
@@ -947,12 +959,17 @@ async def _lerobot_frame_counts_for_task(
 
     stats = _compute_statistics(episode_counts)
 
+    note = (
+        "Exact frame counts from LeRobot episode metadata (no estimation needed)."
+        if not all_tasks
+        else f"Exact frame counts across all {len(episode_counts)} episodes in the dataset."
+    )
     return FrameCountDistribution(
-        task_name=task_name,
+        task_name=display_task_name,
         episodes=episode_counts,
         total_episodes=len(episode_counts),
         source="metadata",
-        source_note="Exact frame counts from LeRobot episode metadata (no estimation needed).",
+        source_note=note,
         **stats,
     )
 
@@ -1078,10 +1095,11 @@ async def _lerobot_frame_counts_from_api(
 @router.get("/{dataset_id}/analysis/frame-counts")
 async def get_frame_count_distribution(
     dataset_id: str,
-    task_name: str = Query(..., description="Task folder name"),
+    task_name: Optional[str] = Query(None, description="Task folder name (omit or '_all_' for dataset-wide mode)"),
 ):
     """
-    Get frame count distribution for all episodes in a task.
+    Get frame count distribution for episodes in a task — or every episode in
+    the dataset when `task_name` is omitted or "_all_" (LeRobot only).
 
     For LeRobot datasets, uses exact frame counts from metadata parquet.
     For other formats, uses HF tree API file sizes with format-specific heuristics.
@@ -1190,8 +1208,8 @@ async def get_frame_count_distribution(
 async def get_signals_comparison(
     request: Request,
     dataset_id: str,
-    task_name: str = Query(..., description="Task folder name"),
-    max_episodes: int = Query(5, ge=1, le=20, description="Max episodes to analyze"),
+    task_name: Optional[str] = Query(None, description="Task folder name (omit or '_all_' for dataset-wide mode)"),
+    max_episodes: int = Query(5, ge=1, le=50, description="Max episodes to analyze"),
     resolution: int = Query(200, ge=50, le=2000, description="Max data points per episode signal"),
 ):
     """
@@ -1269,10 +1287,17 @@ async def get_signals_comparison(
 
                 task_ep_indices = None
                 task_index = 0  # Default to task 0
+                all_tasks_mode = (task_name is None) or task_name == "" or task_name == "_all_"
 
-                logger.info(f"Signal analysis task resolution: task_name='{task_name}', tasks_df={'present' if tasks_df is not None else 'None'} ({len(tasks_df) if tasks_df is not None else 0} rows), ep_task_map={'present' if ep_task_map is not None else 'None'} ({len(ep_task_map) if ep_task_map is not None else 0} entries)")
+                logger.info(f"Signal analysis task resolution: task_name='{task_name}', all_tasks={all_tasks_mode}, tasks_df={'present' if tasks_df is not None else 'None'} ({len(tasks_df) if tasks_df is not None else 0} rows), ep_task_map={'present' if ep_task_map is not None else 'None'} ({len(ep_task_map) if ep_task_map is not None else 0} entries)")
 
-                if tasks_df is not None and ep_task_map is not None:
+                if all_tasks_mode:
+                    # Dataset-wide: first N episodes by global episode_index, no task filter.
+                    if episodes_meta_df is not None and "episode_index" in episodes_meta_df.columns:
+                        all_indices = sorted(int(x) for x in episodes_meta_df["episode_index"].tolist())
+                        task_ep_indices = set(all_indices)
+                    task_index = None  # disable filter_task_index path
+                elif tasks_df is not None and ep_task_map is not None:
                     task_col = "task_description"
                     if task_col not in tasks_df.columns:
                         for col in tasks_df.columns:
@@ -1681,8 +1706,8 @@ _phase_aware_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 async def get_phase_aware(
     request: Request,
     dataset_id: str,
-    task_name: str = Query(..., description="Task name (from /tasks)"),
-    cohort_size: int = Query(30, ge=4, le=200, description="Max episodes to analyze (first-N of task)"),
+    task_name: Optional[str] = Query(None, description="Task name (omit or '_all_' for first-N episodes across all tasks)"),
+    cohort_size: int = Query(30, ge=4, le=200, description="Max episodes to analyze (first-N of task or dataset)"),
     refresh: bool = Query(False, description="Bypass cache and recompute"),
     include_gemini: bool = Query(False, description="Run Gemini semantic enrichment on top"),
     flagged_cap: int = Query(20, description="Max flagged episodes to send to Gemini"),
@@ -1701,7 +1726,9 @@ async def get_phase_aware(
     from downloaders.manager import get_all_datasets
     from api.routes.datasets import is_lerobot_dataset
 
-    cache_key = (dataset_id, task_name, cohort_size)
+    all_tasks_mode = (task_name is None) or task_name == "" or task_name == "_all_"
+    effective_task = "_all_" if all_tasks_mode else task_name
+    cache_key = (dataset_id, effective_task, cohort_size)
     if not refresh and cache_key in _phase_aware_cache:
         cached = _phase_aware_cache[cache_key]
         # If Gemini is requested but the cached result lacks enrichment, fall
@@ -1737,25 +1764,30 @@ async def get_phase_aware(
         if not cached_has_gemini:
             base_result = cached
 
-    # Resolve the task's global episode IDs via the existing episodes endpoint.
-    # Cap the cohort for scalability (UMI's single task has 1447 episodes —
-    # running phase-aware on all of them takes minutes and pushes Gemini cost
-    # way up; first-N is the tractable default).
-    from api.routes.datasets import list_task_episodes
-    try:
-        episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
-    except Exception as e:
-        return {"error": f"Could not resolve task episodes: {e}", "method": "unsupported"}
+    # Resolve the task's global episode IDs via the existing episodes endpoint
+    # — or the first N episodes by episode_index when task_name is omitted.
+    if all_tasks_mode:
+        from api.routes.datasets import fetch_lerobot_episodes_meta
+        episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+        if episodes_df is None or "episode_index" not in episodes_df.columns:
+            return {"error": "Could not load episodes metadata", "method": "unsupported"}
+        global_ids = sorted(int(x) for x in episodes_df["episode_index"].tolist())[:cohort_size]
+    else:
+        from api.routes.datasets import list_task_episodes
+        try:
+            episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
+        except Exception as e:
+            return {"error": f"Could not resolve task episodes: {e}", "method": "unsupported"}
 
-    global_ids: list[int] = []
-    for ep in episode_info_list:
-        eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
-        if eid and isinstance(eid, str) and eid.startswith("episode_"):
-            try:
-                global_ids.append(int(eid.split("_")[-1]))
-            except ValueError:
-                pass
-    global_ids = global_ids[:cohort_size]
+        global_ids = []
+        for ep in episode_info_list:
+            eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
+            if eid and isinstance(eid, str) and eid.startswith("episode_"):
+                try:
+                    global_ids.append(int(eid.split("_")[-1]))
+                except ValueError:
+                    pass
+        global_ids = global_ids[:cohort_size]
     if not global_ids:
         return {"error": f"No episodes found for task '{task_name}'", "method": "unsupported"}
 
@@ -1780,12 +1812,14 @@ async def get_phase_aware(
     except Exception:
         pass
 
+    display_task = "All tasks" if all_tasks_mode else task_name
+
     if base_result is not None:
         result = base_result
     else:
         try:
             def _run():
-                return analyze_task(episodes_raw, task_name, fps=fps).to_dict()
+                return analyze_task(episodes_raw, display_task, fps=fps).to_dict()
             result = await asyncio.to_thread(_run)
         except Exception as e:
             logger.error(f"Phase-aware analysis failed: {e}", exc_info=True)
@@ -1816,7 +1850,7 @@ async def get_phase_aware(
             result = await enrich_with_gemini(
                 result,
                 dataset_id=dataset_id,
-                task_name=task_name,
+                task_name=display_task,
                 repo_id=repo_id,
                 video_path_template=video_path_template,
                 flagged_cap=flagged_cap,
@@ -1845,7 +1879,7 @@ async def clear_phase_aware_cache(gemini: bool = Query(False, description="Also 
 async def stream_phase_aware(
     request: Request,
     dataset_id: str,
-    task_name: str = Query(..., description="Task name (from /tasks)"),
+    task_name: Optional[str] = Query(None, description="Task name (omit or '_all_' for first-N episodes across all tasks)"),
     cohort_size: int = Query(30, ge=4, le=200),
     flagged_cap: int = Query(20),
 ):
@@ -1871,6 +1905,10 @@ async def stream_phase_aware(
     async def emit(event_type: str, data: Any) -> None:
         await queue.put({"type": event_type, "data": data})
 
+    all_tasks_mode = (task_name is None) or task_name == "" or task_name == "_all_"
+    effective_task = "_all_" if all_tasks_mode else task_name
+    display_task = "All tasks" if all_tasks_mode else task_name
+
     async def _runner():
         try:
             all_datasets = get_all_datasets()
@@ -1887,16 +1925,24 @@ async def stream_phase_aware(
                 return
             repo_id = dataset_info.get("repo_id", "")
 
-            episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
-            global_ids = []
-            for ep in episode_info_list:
-                eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
-                if eid and isinstance(eid, str) and eid.startswith("episode_"):
-                    try:
-                        global_ids.append(int(eid.split("_")[-1]))
-                    except ValueError:
-                        pass
-            global_ids = global_ids[:cohort_size]
+            if all_tasks_mode:
+                from api.routes.datasets import fetch_lerobot_episodes_meta
+                episodes_df = await fetch_lerobot_episodes_meta(repo_id)
+                if episodes_df is None or "episode_index" not in episodes_df.columns:
+                    await emit("error", {"error": "Could not load episodes metadata"})
+                    return
+                global_ids = sorted(int(x) for x in episodes_df["episode_index"].tolist())[:cohort_size]
+            else:
+                episode_info_list = await list_task_episodes(dataset_id, task_name, request, limit=cohort_size, offset=0)
+                global_ids = []
+                for ep in episode_info_list:
+                    eid = getattr(ep, "id", None) or (ep.get("id") if isinstance(ep, dict) else None)
+                    if eid and isinstance(eid, str) and eid.startswith("episode_"):
+                        try:
+                            global_ids.append(int(eid.split("_")[-1]))
+                        except ValueError:
+                            pass
+                global_ids = global_ids[:cohort_size]
             if not global_ids:
                 await emit("error", {"error": "No episodes for task"})
                 return
@@ -1920,10 +1966,10 @@ async def stream_phase_aware(
                 return
 
             def _run():
-                return analyze_task(episodes_raw, task_name, fps=fps).to_dict()
+                return analyze_task(episodes_raw, display_task, fps=fps).to_dict()
             stat_result = await asyncio.to_thread(_run)
             stat_result["method"] = "gripper"
-            cache_key = (dataset_id, task_name, cohort_size)
+            cache_key = (dataset_id, effective_task, cohort_size)
             _phase_aware_cache[cache_key] = stat_result
             await emit("phase_aware", stat_result)
 
@@ -1935,7 +1981,7 @@ async def stream_phase_aware(
                 enriched = await enrich_with_gemini(
                     stat_result,
                     dataset_id=dataset_id,
-                    task_name=task_name,
+                    task_name=display_task,
                     repo_id=repo_id,
                     video_path_template=video_path_template,
                     flagged_cap=flagged_cap,

@@ -62,13 +62,14 @@ export function useFrameCounts() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchFrameCounts = useCallback(
-    async (datasetId: string, taskName: string) => {
+    async (datasetId: string, taskName: string | null) => {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(
-          `${API_BASE}/datasets/${datasetId}/analysis/frame-counts?task_name=${encodeURIComponent(taskName)}`
-        );
+        const url = taskName
+          ? `${API_BASE}/datasets/${datasetId}/analysis/frame-counts?task_name=${encodeURIComponent(taskName)}`
+          : `${API_BASE}/datasets/${datasetId}/analysis/frame-counts`;
+        const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const result = await res.json();
         if (result.error) {
@@ -376,7 +377,7 @@ export function useEdgeFrames(datasetId: string | null, taskName: string | null)
 
   const fetchPosition = useCallback(
     (pos: EdgeFramePosition) => {
-      if (!datasetId || !taskName) return;
+      if (!datasetId) return;
       sourcesRef.current[pos]?.close();
       sourcesRef.current[pos] = null;
 
@@ -388,8 +389,9 @@ export function useEdgeFrames(datasetId: string | null, taskName: string | null)
         errorByPos: { ...prev.errorByPos, [pos]: null },
       }));
 
+      const taskSegment = taskName ? encodeURIComponent(taskName) : "_all_";
       const url =
-        `${API_BASE}/datasets/${datasetId}/tasks/${encodeURIComponent(taskName)}` +
+        `${API_BASE}/datasets/${datasetId}/tasks/${taskSegment}` +
         `/edge-frames/stream?position=${pos}&limit=${EDGE_FRAMES_LIMIT}`;
       const es = new EventSource(url);
       sourcesRef.current[pos] = es;
@@ -484,18 +486,18 @@ export function useEdgeFrames(datasetId: string | null, taskName: string | null)
     (pos: EdgeFramePosition) => {
       setState((prev) => ({ ...prev, position: pos }));
       // Lazy-fetch if we haven't started this position yet
-      if (state.phaseByPos[pos] === "idle" && datasetId && taskName) {
+      if (state.phaseByPos[pos] === "idle" && datasetId) {
         fetchPosition(pos);
       }
     },
-    [datasetId, taskName, fetchPosition, state.phaseByPos],
+    [datasetId, fetchPosition, state.phaseByPos],
   );
 
   // Reset + auto-fetch starting frames whenever dataset/task changes.
   useEffect(() => {
     closeAll();
     setState(emptyEdgeState());
-    if (datasetId && taskName) {
+    if (datasetId) {
       fetchPosition("start");
     }
     return () => {

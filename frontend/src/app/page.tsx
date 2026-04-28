@@ -1,12 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import LeftSidebar from "./layout/LeftSidebar";
 import MainContent from "./layout/MainContent";
 import Modals from "./layout/Modals";
-import HFTokenDialog from "@/components/HFTokenDialog";
-import { getHfTokenStatus } from "@/hooks/useApi";
-import type { HfTokenStatus } from "@/hooks/useApi";
 import type { Modality } from "@/types/api";
 
 // Extract task name from LIBERO episode ID and convert to title case
@@ -41,24 +38,6 @@ export default function Home() {
   const [showDatasetAnalysis, setShowDatasetAnalysis] = useState(false);
   const [navigatedFromAnalysis, setNavigatedFromAnalysis] = useState(false);
 
-  // HF token state — banner + dialog
-  const [hfStatus, setHfStatus] = useState<HfTokenStatus | null>(null);
-  const [showHfTokenDialog, setShowHfTokenDialog] = useState(false);
-
-  useEffect(() => {
-    void (async () => {
-      try {
-        const status = await getHfTokenStatus();
-        setHfStatus(status);
-        // Auto-prompt on first load if no token is configured.
-        if (!status.has_token) setShowHfTokenDialog(true);
-      } catch {
-        setHfStatus({ has_token: false, source: "none", masked: null, username: null });
-        setShowHfTokenDialog(true);
-      }
-    })();
-  }, []);
-
   const handleSelectEpisode = (datasetId: string, episodeId: string, numFrames: number, modalities?: Modality[], displayName?: string) => {
     setSelectedDataset(datasetId);
     setSelectedEpisode(episodeId);
@@ -68,28 +47,8 @@ export default function Home() {
     setTargetFrame(null);
   };
 
-  const tokenMissing = hfStatus !== null && !hfStatus.has_token;
-
   return (
-    <div className="flex flex-col h-screen bg-gray-100 dark:bg-gray-950" data-testid="app-layout">
-      {tokenMissing && (
-        <div
-          className="flex items-center justify-between gap-3 px-4 py-2 bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 text-sm"
-          data-testid="hf-token-banner"
-        >
-          <div>
-            A HuggingFace access token is required to load LeRobot datasets.
-          </div>
-          <button
-            onClick={() => setShowHfTokenDialog(true)}
-            className="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded"
-            data-testid="hf-token-banner-set"
-          >
-            Set token
-          </button>
-        </div>
-      )}
-      <div className="flex flex-1 min-h-0">
+    <div className="flex h-screen bg-gray-100 dark:bg-gray-950" data-testid="app-layout">
       <LeftSidebar
         onSelectEpisode={handleSelectEpisode}
         onSelectDataset={(id) => {
@@ -104,10 +63,6 @@ export default function Home() {
         selectedDataset={selectedDataset}
         selectedEpisode={selectedEpisode}
         selectedEpisodeDisplayName={selectedEpisodeDisplayName}
-        totalFrames={selectedEpisodeFrameCount}
-        targetFrame={targetFrame}
-        onFrameChange={() => setTargetFrame(null)}
-        availableModalities={selectedModalities}
       />
       {/* Floating "Back to Analysis" pill — shown after navigating from analysis modal */}
       {navigatedFromAnalysis && !showDatasetAnalysis && (
@@ -142,12 +97,6 @@ export default function Home() {
           setShowDatasetAnalysis(false);
           setNavigatedFromAnalysis(true);
         }}
-      />
-      </div>
-      <HFTokenDialog
-        isOpen={showHfTokenDialog}
-        onClose={() => setShowHfTokenDialog(false)}
-        onSaved={(s) => setHfStatus(s)}
       />
     </div>
   );

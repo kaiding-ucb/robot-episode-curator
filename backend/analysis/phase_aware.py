@@ -29,7 +29,9 @@ from sklearn.cluster import AgglomerativeClustering
 # Algorithm constants (mirrored from prototype.py — see Phase 0 FINDINGS.md)
 # ========================================================================
 
-ACTION_DIM_GRIPPER = 6
+# The LeRobot convention places the gripper signal at the LAST action dimension.
+# This is true for Libero/Franka (7-D: xyz + rpy + gripper, idx 6) and SO-ARM101
+# (6-D: 5 joints + gripper, idx 5), so we derive it per-array rather than hardcode.
 STATE_DIM_Z = 2
 
 N_BIN_PER_PHASE = 50
@@ -185,7 +187,10 @@ def _detect_gripper_closed_ranges(action: np.ndarray) -> tuple[list[tuple[int, i
     (which the merge step collapses into a single logical cycle) as context
     for downstream semantic analysis.
     """
-    g = action[:, ACTION_DIM_GRIPPER].astype(float)
+    if action.ndim != 2 or action.shape[1] < 1:
+        return [], 0, []
+    gripper_dim = action.shape[1] - 1
+    g = action[:, gripper_dim].astype(float)
     if g.max() == g.min():
         return [], 0, []
     ksize = min(15, len(g) if len(g) % 2 == 1 else len(g) - 1)

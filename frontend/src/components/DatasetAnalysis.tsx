@@ -27,6 +27,7 @@ export default function DatasetAnalysis({
 }: DatasetAnalysisProps) {
   const [activeTab, setActiveTab] = useState<AnalysisTab>("summary");
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
+  const [allTasks, setAllTasks] = useState<boolean>(true); // default ON: tabs render dataset-wide
   const [chosenDatasetId, setChosenDatasetId] = useState<string | null>(initialDatasetId);
 
   // Sync if parent passes a new datasetId
@@ -104,13 +105,22 @@ export default function DatasetAnalysis({
     }
   }, [tasks, selectedTask, tasksLoading]);
 
-  // Reset signal state and fetch frame counts when task changes
+  // Effective task: when "All tasks" is on, treat as null and tabs go dataset-wide.
+  const effectiveTask = allTasks ? null : selectedTask;
+
+  // Reset signal state and fetch frame counts when task or scope changes
   useEffect(() => {
-    if (datasetId && selectedTask && !tasksLoading && tasks.some(t => t.name === selectedTask)) {
+    if (!datasetId) return;
+    if (allTasks) {
+      resetSignals();
+      fetchFrameCounts(datasetId, null);
+      return;
+    }
+    if (selectedTask && !tasksLoading && tasks.some(t => t.name === selectedTask)) {
       resetSignals();
       fetchFrameCounts(datasetId, selectedTask);
     }
-  }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts, resetSignals]);
+  }, [datasetId, allTasks, selectedTask, tasks, tasksLoading, fetchFrameCounts, resetSignals]);
 
   const signalsDisabled = capabilities !== null && !capabilities.supports_signal_comparison;
   const edgeFramesDisabled =
@@ -172,12 +182,13 @@ export default function DatasetAnalysis({
         </div>
 
         {datasetId && (
-        <div>
+        <div className="flex items-center gap-2">
         <label className="text-sm text-gray-600 dark:text-gray-400 mr-2">Task:</label>
         <select
           value={selectedTask || ""}
           onChange={(e) => setSelectedTask(e.target.value || null)}
-          className="px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+          disabled={allTasks}
+          className={`px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white ${allTasks ? "opacity-50 cursor-not-allowed" : ""}`}
           data-testid="task-selector"
         >
           {tasksLoading && (
@@ -193,6 +204,19 @@ export default function DatasetAnalysis({
             </option>
           ))}
         </select>
+        <label
+          className="ml-1 inline-flex items-center gap-1.5 cursor-pointer select-none text-sm text-gray-700 dark:text-gray-300"
+          data-testid="all-tasks-toggle-label"
+        >
+          <input
+            type="checkbox"
+            checked={allTasks}
+            onChange={(e) => setAllTasks(e.target.checked)}
+            className="h-3.5 w-3.5 accent-blue-600 cursor-pointer"
+            data-testid="all-tasks-toggle"
+          />
+          All tasks
+        </label>
           </div>
         )}
       </div>
@@ -312,17 +336,17 @@ export default function DatasetAnalysis({
         {activeTab === "edge-frames" && (
           <EdgeFramesPanel
             datasetId={datasetId}
-            taskName={selectedTask}
+            taskName={effectiveTask}
             onNavigateToEpisode={onNavigateToEpisode}
           />
         )}
 
         {activeTab === "signal-comparison" && (
           <div>
-            {selectedTask && datasetId ? (
+            {datasetId && (allTasks || selectedTask) ? (
               <PhaseAwarePanel
                 datasetId={datasetId}
-                taskName={selectedTask}
+                taskName={effectiveTask}
                 onNavigateToEpisode={onNavigateToEpisode}
               />
             ) : (
