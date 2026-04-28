@@ -1942,6 +1942,20 @@ class ProbeResponse(BaseModel):
     modality_config: Optional[Dict[str, Any]] = None
     sample_files: List[str] = []
     error: Optional[str] = None
+    # LeRobot-specific details (populated from meta/info.json when format=lerobot)
+    codebase_version: Optional[str] = None
+    robot_type: Optional[str] = None
+    fps: Optional[float] = None
+    total_episodes: Optional[int] = None
+    total_frames: Optional[int] = None
+    total_tasks: Optional[int] = None
+    total_videos: Optional[int] = None
+    cameras: List[str] = []  # camera/image feature keys (e.g. observation.images.base_0_rgb)
+    # HF metadata (small badges)
+    license: Optional[str] = None
+    gated: bool = False
+    likes: Optional[int] = None
+    downloads: Optional[int] = None
 
 
 class AddDatasetRequest(BaseModel):
@@ -2102,6 +2116,20 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
             modalities = _detect_lerobot_modalities(info)
             if info.get("total_tasks", 0) > 0:
                 has_tasks = True
+            # Surface key LeRobot fields for the confirmation screen.
+            lerobot_extras = {
+                "codebase_version": info.get("codebase_version"),
+                "robot_type": info.get("robot_type"),
+                "fps": float(info["fps"]) if info.get("fps") else None,
+                "total_episodes": info.get("total_episodes"),
+                "total_frames": info.get("total_frames"),
+                "total_tasks": info.get("total_tasks"),
+                "total_videos": info.get("total_videos"),
+            }
+            cam_keys: List[str] = []
+            for k, v in (info.get("features") or {}).items():
+                if isinstance(v, dict) and v.get("dtype") in ("video", "image"):
+                    cam_keys.append(k)
     elif ".hdf5" in extensions or ".h5" in extensions:
         format_detected = "hdf5"
     elif ".tfrecord" in extensions:
@@ -2118,6 +2146,21 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
             has_tasks = info.get("total_tasks", 0) > 0
             modalities = _detect_lerobot_modalities(info)
             logger.info(f"Detected LeRobot {info['codebase_version']} format for {repo_id} via meta/info.json")
+            # Populate the same extras as the .parquet branch above so the
+            # confirmation card renders the full detail set.
+            lerobot_extras = {
+                "codebase_version": info.get("codebase_version"),
+                "robot_type": info.get("robot_type"),
+                "fps": float(info["fps"]) if info.get("fps") else None,
+                "total_episodes": info.get("total_episodes"),
+                "total_frames": info.get("total_frames"),
+                "total_tasks": info.get("total_tasks"),
+                "total_videos": info.get("total_videos"),
+            }
+            cam_keys: List[str] = []
+            for k, v in (info.get("features") or {}).items():
+                if isinstance(v, dict) and v.get("dtype") in ("video", "image"):
+                    cam_keys.append(k)
 
     # Check for multi-subdataset pattern (no root meta, but subdirs have meta/info.json)
     # e.g. GR00T where each subdataset has its own LeRobot structure
@@ -2141,6 +2184,33 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
             except Exception as e:
                 logger.warning(f"Multi-subdataset probe failed for {repo_id}: {e}")
 
+    extras: Dict[str, Any] = {}
+    cam_keys_out: List[str] = []
+    if format_detected == "lerobot":
+        try:
+            extras = locals().get("lerobot_extras") or {}
+            cam_keys_out = locals().get("cam_keys") or []
+        except Exception:
+            pass
+
+    # Fetch HF repo info for license / gated / popularity. Cheap (~one API call).
+    license_str: Optional[str] = None
+    gated_flag = False
+    likes_n: Optional[int] = None
+    downloads_n: Optional[int] = None
+    try:
+        repo_info = await fetch_repo_info(repo_id)
+        if repo_info:
+            gv = repo_info.get("gated", False)
+            gated_flag = gv not in (False, None, "")
+            likes_n = repo_info.get("likes")
+            downloads_n = repo_info.get("downloads")
+            cd = repo_info.get("cardData") or {}
+            if isinstance(cd, dict) and cd.get("license"):
+                license_str = cd.get("license")
+    except Exception:
+        pass
+
     return ProbeResponse(
         repo_id=repo_id,
         name=name,
@@ -2149,6 +2219,18 @@ async def probe_huggingface_dataset(repo_id: str) -> ProbeResponse:
         modalities=modalities,
         modality_config=modality_config,
         sample_files=sample_files[:5],
+        codebase_version=extras.get("codebase_version"),
+        robot_type=extras.get("robot_type"),
+        fps=extras.get("fps"),
+        total_episodes=extras.get("total_episodes"),
+        total_frames=extras.get("total_frames"),
+        total_tasks=extras.get("total_tasks"),
+        total_videos=extras.get("total_videos"),
+        cameras=cam_keys_out,
+        license=license_str,
+        gated=gated_flag,
+        likes=likes_n,
+        downloads=downloads_n,
     )
 
 

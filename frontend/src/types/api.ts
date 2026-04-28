@@ -97,6 +97,19 @@ export interface ProbeResponse {
   modality_config?: Record<string, ModalityConfig>;
   sample_files: string[];
   error?: string;
+  // LeRobot-specific (populated when format_detected === "lerobot")
+  codebase_version?: string | null;
+  robot_type?: string | null;
+  fps?: number | null;
+  total_episodes?: number | null;
+  total_frames?: number | null;
+  total_tasks?: number | null;
+  total_videos?: number | null;
+  cameras?: string[];
+  license?: string | null;
+  gated?: boolean;
+  likes?: number | null;
+  downloads?: number | null;
 }
 
 export interface AddDatasetResponse {
