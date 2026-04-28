@@ -1,13 +1,16 @@
 /**
  * Hook for dataset analysis — frame counts, signal comparison, and capabilities.
  */
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type {
   FrameCountDistribution,
   EpisodeSignalData,
   EpisodeStub,
   SignalAnalysisState,
   DatasetCapabilities,
+  EdgeFrameItem,
+  EdgeFramePosition,
+  EdgeFramesState,
 } from "@/types/analysis";
 import type { MetaSummaryResponse } from "@/types/api";
 
@@ -337,3 +340,170 @@ export function useSignalComparison() {
 
   return { state, startAnalysis, cancelAnalysis, reset };
 }
+
+/**
+ * Stream starting/ending frame thumbnails for episodes in a task.
+ * Caches both start & end results in-memory; toggling between them after both
+ * positions have loaded is instant (no second fetch).
+ */
+const EDGE_FRAMES_LIMIT = 50;
+
+function emptyEdgeState(): EdgeFramesState {
+  return {
+    position: "start",
+    framesByPos: { start: new Map(), end: new Map() },
+    totalByPos: { start: 0, end: 0 },
+    totalForTaskByPos: { start: 0, end: 0 },
+    loadedByPos: { start: 0, end: 0 },
+    phaseByPos: { start: "idle", end: "idle" },
+    errorByPos: { start: null, end: null },
+  };
+}
+
+export function useEdgeFrames(datasetId: string | null, taskName: string | null) {
+  const [state, setState] = useState<EdgeFramesState>(() => emptyEdgeState());
+  const sourcesRef = useRef<Record<EdgeFramePosition, EventSource | null>>({
+    start: null,
+    end: null,
+  });
+
+  const closeAll = useCallback(() => {
+    (Object.keys(sourcesRef.current) as EdgeFramePosition[]).forEach((p) => {
+      sourcesRef.current[p]?.close();
+      sourcesRef.current[p] = null;
+    });
+  }, []);
+
+  const fetchPosition = useCallback(
+    (pos: EdgeFramePosition) => {
+      if (!datasetId || !taskName) return;
+      sourcesRef.current[pos]?.close();
+      sourcesRef.current[pos] = null;
+
+      setState((prev) => ({
+        ...prev,
+        framesByPos: { ...prev.framesByPos, [pos]: new Map() },
+        loadedByPos: { ...prev.loadedByPos, [pos]: 0 },
+        phaseByPos: { ...prev.phaseByPos, [pos]: "loading" },
+        errorByPos: { ...prev.errorByPos, [pos]: null },
+      }));
+
+      const url =
+        `${API_BASE}/datasets/${datasetId}/tasks/${encodeURIComponent(taskName)}` +
+        `/edge-frames/stream?position=${pos}&limit=${EDGE_FRAMES_LIMIT}`;
+      const es = new EventSource(url);
+      sourcesRef.current[pos] = es;
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "total") {
+            setState((prev) => ({
+              ...prev,
+              totalByPos: { ...prev.totalByPos, [pos]: data.total },
+              totalForTaskByPos: { ...prev.totalForTaskByPos, [pos]: data.total_for_task },
+            }));
+          } else if (data.type === "episode_meta") {
+            setState((prev) => {
+              const next = new Map(prev.framesByPos[pos]);
+              const existing = next.get(data.episode_index);
+              const item: EdgeFrameItem = {
+                episode_id: data.episode_id,
+                episode_index: data.episode_index,
+                total_frames: data.total_frames,
+                image_b64: existing?.image_b64 ?? null,
+                error: existing?.error ?? null,
+              };
+              next.set(data.episode_index, item);
+              return { ...prev, framesByPos: { ...prev.framesByPos, [pos]: next } };
+            });
+          } else if (data.type === "frame") {
+            setState((prev) => {
+              const next = new Map(prev.framesByPos[pos]);
+              const existing = next.get(data.episode_index);
+              next.set(data.episode_index, {
+                episode_id: data.episode_id,
+                episode_index: data.episode_index,
+                total_frames: existing?.total_frames ?? null,
+                image_b64: data.image_b64,
+                error: null,
+              });
+              return {
+                ...prev,
+                framesByPos: { ...prev.framesByPos, [pos]: next },
+                loadedByPos: { ...prev.loadedByPos, [pos]: prev.loadedByPos[pos] + 1 },
+              };
+            });
+          } else if (data.type === "error") {
+            setState((prev) => {
+              const next = new Map(prev.framesByPos[pos]);
+              const existing = next.get(data.episode_index);
+              next.set(data.episode_index, {
+                episode_id: data.episode_id,
+                episode_index: data.episode_index,
+                total_frames: existing?.total_frames ?? null,
+                image_b64: null,
+                error: data.message || "decode failed",
+              });
+              return {
+                ...prev,
+                framesByPos: { ...prev.framesByPos, [pos]: next },
+                loadedByPos: { ...prev.loadedByPos, [pos]: prev.loadedByPos[pos] + 1 },
+              };
+            });
+          } else if (data.type === "done") {
+            setState((prev) => ({
+              ...prev,
+              phaseByPos: { ...prev.phaseByPos, [pos]: "complete" },
+            }));
+            es.close();
+            sourcesRef.current[pos] = null;
+          }
+        } catch {
+          // ignore malformed events
+        }
+      };
+
+      es.onerror = () => {
+        setState((prev) => {
+          if (prev.phaseByPos[pos] === "complete") return prev;
+          return {
+            ...prev,
+            phaseByPos: { ...prev.phaseByPos, [pos]: "error" },
+            errorByPos: { ...prev.errorByPos, [pos]: "Connection lost" },
+          };
+        });
+        es.close();
+        sourcesRef.current[pos] = null;
+      };
+    },
+    [datasetId, taskName],
+  );
+
+  const setPosition = useCallback(
+    (pos: EdgeFramePosition) => {
+      setState((prev) => ({ ...prev, position: pos }));
+      // Lazy-fetch if we haven't started this position yet
+      if (state.phaseByPos[pos] === "idle" && datasetId && taskName) {
+        fetchPosition(pos);
+      }
+    },
+    [datasetId, taskName, fetchPosition, state.phaseByPos],
+  );
+
+  // Reset + auto-fetch starting frames whenever dataset/task changes.
+  useEffect(() => {
+    closeAll();
+    setState(emptyEdgeState());
+    if (datasetId && taskName) {
+      fetchPosition("start");
+    }
+    return () => {
+      closeAll();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasetId, taskName]);
+
+  return { state, setPosition };
+}
+

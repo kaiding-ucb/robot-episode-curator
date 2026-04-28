@@ -166,6 +166,8 @@ class DatasetCapabilities(BaseModel):
     supports_frame_counts: bool
     supports_signal_comparison: bool
     signal_comparison_note: str
+    supports_edge_frames: bool = False
+    edge_frames_note: str = ""
 
 
 # --- HF Token Helper ---
@@ -271,6 +273,15 @@ def _get_capabilities(dataset_info: Dict[str, Any]) -> DatasetCapabilities:
         supports_signals = False
         note = "Signal comparison is not supported for this format"
 
+    # Edge frames: starting & ending thumbnails per episode in a task.
+    # LeRobot-only for now (PyAV remote-seek path); other formats not yet wired.
+    if fmt == "lerobot":
+        supports_edge_frames = True
+        edge_frames_note = ""
+    else:
+        supports_edge_frames = False
+        edge_frames_note = "Starting & ending frames are only available for LeRobot datasets."
+
     return DatasetCapabilities(
         format=fmt,
         has_actions=has_actions,
@@ -278,6 +289,8 @@ def _get_capabilities(dataset_info: Dict[str, Any]) -> DatasetCapabilities:
         supports_frame_counts=supports_frame_counts,
         supports_signal_comparison=supports_signals,
         signal_comparison_note=note,
+        supports_edge_frames=supports_edge_frames,
+        edge_frames_note=edge_frames_note,
     )
 
 

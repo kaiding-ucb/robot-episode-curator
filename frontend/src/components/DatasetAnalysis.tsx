@@ -6,6 +6,7 @@ import { useDatasets, useTasks } from "@/hooks/useApi";
 import FrameCountChart from "./FrameCountChart";
 import { PhaseAwarePanel } from "./PhaseAwarePanel";
 import SummaryPanel from "./SummaryPanel";
+import EdgeFramesPanel from "./EdgeFramesPanel";
 
 interface DatasetAnalysisProps {
   datasetId: string | null;
@@ -17,7 +18,7 @@ interface DatasetAnalysisProps {
   onViewComparisonInRerun?: (rrdUrl: string) => void;
 }
 
-type AnalysisTab = "summary" | "frame-counts" | "signal-comparison";
+type AnalysisTab = "summary" | "frame-counts" | "edge-frames" | "signal-comparison";
 
 export default function DatasetAnalysis({
   datasetId: initialDatasetId,
@@ -112,6 +113,15 @@ export default function DatasetAnalysis({
   }, [datasetId, selectedTask, tasks, tasksLoading, fetchFrameCounts, resetSignals]);
 
   const signalsDisabled = capabilities !== null && !capabilities.supports_signal_comparison;
+  const edgeFramesDisabled =
+    capabilities !== null && capabilities.supports_edge_frames === false;
+
+  // If edge frames not supported and currently active, fall back.
+  useEffect(() => {
+    if (edgeFramesDisabled && activeTab === "edge-frames") {
+      setActiveTab("frame-counts");
+    }
+  }, [edgeFramesDisabled, activeTab]);
 
   return (
     <div className="p-6" data-testid="dataset-analysis-modal">
@@ -222,6 +232,23 @@ export default function DatasetAnalysis({
           Frame Counts
         </button>
         <button
+          onClick={() => !edgeFramesDisabled && setActiveTab("edge-frames")}
+          className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
+            edgeFramesDisabled
+              ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
+              : activeTab === "edge-frames"
+                ? "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white border-b-2 border-blue-500"
+                : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+          }`}
+          data-testid="edge-frames-tab"
+          title={edgeFramesDisabled ? capabilities?.edge_frames_note : undefined}
+        >
+          Starting &amp; Ending Frames
+          {edgeFramesDisabled && (
+            <span className="ml-1.5 text-xs text-gray-400 dark:text-gray-500">(N/A)</span>
+          )}
+        </button>
+        <button
           onClick={() => !signalsDisabled && setActiveTab("signal-comparison")}
           className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
             signalsDisabled
@@ -280,6 +307,14 @@ export default function DatasetAnalysis({
             )}
             {frameCountData && <FrameCountChart data={frameCountData} />}
           </div>
+        )}
+
+        {activeTab === "edge-frames" && (
+          <EdgeFramesPanel
+            datasetId={datasetId}
+            taskName={selectedTask}
+            onNavigateToEpisode={onNavigateToEpisode}
+          />
         )}
 
         {activeTab === "signal-comparison" && (

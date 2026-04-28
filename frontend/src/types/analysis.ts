@@ -75,4 +75,26 @@ export interface DatasetCapabilities {
   supports_frame_counts: boolean;
   supports_signal_comparison: boolean;
   signal_comparison_note: string;
+  supports_edge_frames?: boolean;
+  edge_frames_note?: string;
+}
+
+export interface EdgeFrameItem {
+  episode_id: string;
+  episode_index: number;
+  total_frames: number | null;
+  image_b64: string | null;
+  error?: string | null;
+}
+
+export type EdgeFramePosition = "start" | "end";
+
+export interface EdgeFramesState {
+  position: EdgeFramePosition;
+  framesByPos: Record<EdgeFramePosition, Map<number, EdgeFrameItem>>;
+  totalByPos: Record<EdgeFramePosition, number>;
+  totalForTaskByPos: Record<EdgeFramePosition, number>;
+  loadedByPos: Record<EdgeFramePosition, number>;
+  phaseByPos: Record<EdgeFramePosition, "idle" | "loading" | "complete" | "error">;
+  errorByPos: Record<EdgeFramePosition, string | null>;
 }
