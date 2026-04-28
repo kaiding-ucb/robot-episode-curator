@@ -25,16 +25,21 @@ let errorHandlerInstalled = false;
 function installErrorSuppressor() {
   if (errorHandlerInstalled || typeof window === "undefined") return;
   errorHandlerInstalled = true;
+
   const isRerunBenignError = (msg: unknown): boolean => {
     const s = typeof msg === "string" ? msg : (msg instanceof Error ? msg.message : String(msg ?? ""));
-    // (a) Stale externref from an old recording's async WASM callback
-    // (b) Mid-flight rrd fetch aborted because the user switched episodes
     return (
+      // Stale externref from an old recording's async WASM callback
       /closure\d+_externref_shim/.test(s) ||
+      // wasm-bindgen-shim error format: "Cannot read properties of null (reading 'closureN_externref_shim')"
+      /Cannot read properties of null .*closure/.test(s) ||
+      // Mid-flight rrd fetch aborted because the user switched episodes
       /ERR_CONTENT_LENGTH_MISMATCH/.test(s) ||
       (/(Failed to fetch|network error|NetworkError)/i.test(s) && /\.rrd/.test(s))
     );
   };
+
+  // (1) addEventListener — fires before listeners attached after us.
   window.addEventListener("error", (e) => {
     if (isRerunBenignError(e.error?.message ?? e.message)) {
       e.preventDefault();
@@ -46,6 +51,43 @@ function installErrorSuppressor() {
       e.preventDefault();
     }
   }, true);
+
+  // (2) window.onerror — Next.js dev overlay (and similar tools) hook this
+  // property directly, separate from addEventListener. Override and chain.
+  const prevOnError = window.onerror;
+  window.onerror = (msg, src, line, col, err) => {
+    if (isRerunBenignError(err?.message ?? msg)) return true;
+    return typeof prevOnError === "function"
+      ? prevOnError.call(window, msg, src, line, col, err)
+      : false;
+  };
+  const prevOnRejection = window.onunhandledrejection;
+  window.onunhandledrejection = (e) => {
+    if (isRerunBenignError(e.reason?.message ?? e.reason)) {
+      e.preventDefault();
+      return;
+    }
+    if (typeof prevOnRejection === "function") {
+      prevOnRejection.call(window, e);
+    }
+  };
+
+  // (3) console.error — Next.js devtools also surfaces console.error as toasts.
+  // Filter only the benign Rerun-async noise; everything else passes through.
+  const origConsoleError = console.error.bind(console);
+  console.error = ((...args: unknown[]) => {
+    const text = args
+      .map((a) =>
+        typeof a === "string"
+          ? a
+          : a instanceof Error
+            ? a.message
+            : (a as { message?: string })?.message ?? String(a),
+      )
+      .join(" ");
+    if (isRerunBenignError(text)) return;
+    origConsoleError(...args);
+  }) as typeof console.error;
 }
 
 // Hide everything except the viewport (cameras + state + action views) and
