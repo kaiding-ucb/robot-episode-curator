@@ -329,40 +329,44 @@ async def fetch_lerobot_episodes_meta(repo_id: str, path_prefix: str = "") -> Op
             logger.warning(f"Failed to list LeRobot episodes metadata for {repo_id}: {e}")
             return None
 
-        # For each chunk directory, list and download parquet files
+        # Collect all parquet file paths first (cheap tree lookups).
+        parquet_paths_to_download: List[str] = []
         for item in items:
             if item.get("type") != "directory":
                 continue
             chunk_path = item["path"]
-
-            # List files in this chunk
             try:
                 chunk_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main/{chunk_path}"
                 chunk_resp = await client.get(chunk_url, headers=headers, timeout=15.0)
                 if chunk_resp.status_code != 200:
                     continue
-                chunk_items = chunk_resp.json()
+                for file_item in chunk_resp.json():
+                    if file_item.get("type") == "file" and file_item["path"].endswith(".parquet"):
+                        parquet_paths_to_download.append(file_item["path"])
             except Exception:
                 continue
 
-            for file_item in chunk_items:
-                if file_item.get("type") != "file" or not file_item["path"].endswith(".parquet"):
-                    continue
-                file_path = file_item["path"]
+        # Download + parse all chunk parquets in parallel — for huge datasets
+        # like Droid 1.0.1 these are 7 × ~80MB files; sequential = O(N) over
+        # WAN, parallel ≈ saturates link capacity.
+        sem = asyncio.Semaphore(8)
 
-                # Download parquet file
+        async def _fetch_one(file_path: str) -> Optional[pd.DataFrame]:
+            async with sem:
+                dl_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
                 try:
-                    dl_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
-                    dl_resp = await client.get(dl_url, headers=headers, timeout=60.0)
-                    if dl_resp.status_code == 200:
-                        # parquet read is sync/CPU-bound — push to a thread so
-                        # the event loop stays responsive for other requests.
-                        df = await asyncio.to_thread(
-                            pd.read_parquet, io.BytesIO(dl_resp.content)
-                        )
-                        dfs.append(df)
+                    dl_resp = await client.get(dl_url, headers=headers, timeout=120.0)
+                    if dl_resp.status_code != 200:
+                        return None
+                    return await asyncio.to_thread(
+                        pd.read_parquet, io.BytesIO(dl_resp.content)
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to download {file_path}: {e}")
+                    return None
+
+        results = await asyncio.gather(*(_fetch_one(p) for p in parquet_paths_to_download))
+        dfs = [r for r in results if r is not None]
 
     if not dfs:
         return None
@@ -542,18 +546,34 @@ async def fetch_episode_task_map_from_data_parquet(
         deduped = df.drop_duplicates(subset="episode_index", keep="first")
         return dict(zip(deduped["episode_index"].astype(int), deduped["task_index"].astype(int)))
 
+    # Parallelize the per-parquet column read. Each call does an HTTP range
+    # GET against HF (column-selective via pyarrow), so they don't compete
+    # for CPU much; the win is purely network concurrency. Semaphore=12 keeps
+    # us well under HF's per-IP rate limits while still cutting wall time
+    # from O(N * RTT) to O(N/12 * RTT).
+    sem = asyncio.Semaphore(12)
+
+    async def _read_one(file_path: str) -> Dict[int, int]:
+        async with sem:
+            try:
+                return await loop.run_in_executor(None, _read_task_columns, file_path)
+            except Exception as e:
+                logger.warning(f"task_index read failed for {file_path}: {e}")
+                return {}
+
     try:
-        for file_path in parquet_paths:
-            partial = await loop.run_in_executor(None, _read_task_columns, file_path)
-            mapping.update(partial)
+        partials = await asyncio.gather(*(_read_one(p) for p in parquet_paths))
     except Exception as e:
         logger.warning(f"Failed to read task_index from data parquet for {repo_id}: {e}")
         return None
 
+    for partial in partials:
+        mapping.update(partial)
+
     if not mapping:
         return None
 
-    logger.info(f"Built episode-task map from data parquet for {repo_id}: {len(mapping)} episodes")
+    logger.info(f"Built episode-task map from data parquet for {repo_id}: {len(mapping)} episodes (parallel scan)")
     return mapping
 
 
