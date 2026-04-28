@@ -161,59 +161,91 @@ export function useTasks(datasetId: string | null, pageSize: number = 50) {
 }
 
 /**
- * Fetch episodes for a specific task
+ * Fetch a single page of episodes for a task. Pagination semantics — the
+ * sidebar uses Prev/Next + "Page X of Y" instead of accumulating "Load more".
  */
 export function useTaskEpisodes(
   datasetId: string | null,
   taskName: string | null,
-  limit: number = 5,
-  offset: number = 0
+  pageSize: number = 10,
 ) {
   const [episodes, setEpisodes] = useState<EpisodeMetadata[]>([]);
+  const [page, setPageState] = useState(0); // 0-based
+  const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [hasMore, setHasMore] = useState(false);
 
-  const fetchEpisodes = useCallback(async (newOffset: number = 0) => {
-    if (!datasetId || !taskName) {
-      setEpisodes([]);
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    try {
-      const encodedTaskName = encodeURIComponent(taskName);
-      const res = await fetch(
-        `${API_BASE}/datasets/${datasetId}/tasks/${encodedTaskName}/episodes?limit=${limit}&offset=${newOffset}`
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: EpisodeMetadata[] = await res.json();
-
-      if (newOffset === 0) {
-        setEpisodes(data);
-      } else {
-        setEpisodes(prev => [...prev, ...data]);
+  const fetchPage = useCallback(
+    async (targetPage: number) => {
+      if (!datasetId || !taskName) {
+        setEpisodes([]);
+        setTotalCount(null);
+        return;
       }
+      setLoading(true);
+      setError(null);
+      try {
+        const encodedTaskName = encodeURIComponent(taskName);
+        const offset = targetPage * pageSize;
+        const res = await fetch(
+          `${API_BASE}/datasets/${datasetId}/tasks/${encodedTaskName}/episodes?limit=${pageSize}&offset=${offset}`,
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data: EpisodeMetadata[] = await res.json();
+        const totalHeader = res.headers.get("X-Total-Count");
+        const total = totalHeader != null ? parseInt(totalHeader, 10) : null;
+        setEpisodes(data);
+        setTotalCount(Number.isFinite(total as number) ? (total as number) : null);
+        setPageState(targetPage);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to fetch episodes");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [datasetId, taskName, pageSize],
+  );
 
-      // If we got exactly limit episodes, there might be more
-      setHasMore(data.length === limit);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch episodes");
-    } finally {
-      setLoading(false);
-    }
-  }, [datasetId, taskName, limit]);
-
+  // Reset to page 0 when dataset or task changes.
   useEffect(() => {
-    fetchEpisodes(0);
-  }, [datasetId, taskName, limit]);
+    setPageState(0);
+    void fetchPage(0);
+  }, [datasetId, taskName, pageSize, fetchPage]);
 
-  const loadMore = useCallback(() => {
-    fetchEpisodes(episodes.length);
-  }, [fetchEpisodes, episodes.length]);
+  const pageCount = totalCount != null ? Math.max(1, Math.ceil(totalCount / pageSize)) : null;
+  const hasNext =
+    pageCount != null
+      ? page + 1 < pageCount
+      : episodes.length === pageSize; // unknown total → infer from full page
+  const hasPrev = page > 0;
 
-  return { episodes, loading, error, hasMore, loadMore };
+  const goNext = useCallback(() => {
+    if (hasNext) void fetchPage(page + 1);
+  }, [hasNext, fetchPage, page]);
+  const goPrev = useCallback(() => {
+    if (hasPrev) void fetchPage(page - 1);
+  }, [hasPrev, fetchPage, page]);
+  const goPage = useCallback(
+    (p: number) => {
+      void fetchPage(Math.max(0, p));
+    },
+    [fetchPage],
+  );
+
+  return {
+    episodes,
+    loading,
+    error,
+    page,
+    pageSize,
+    totalCount,
+    pageCount,
+    hasNext,
+    hasPrev,
+    goNext,
+    goPrev,
+    goPage,
+  };
 }
 
 /**

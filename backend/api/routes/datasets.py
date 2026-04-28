@@ -25,7 +25,7 @@ from collections import defaultdict
 
 import httpx
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from downloaders.manager import (
@@ -1258,6 +1258,7 @@ async def list_task_episodes(
     dataset_id: str,
     task_name: str,
     request: Request,
+    response: Response,
     limit: int = 10,
     offset: int = 0,
 ):
@@ -1287,6 +1288,10 @@ async def list_task_episodes(
             episode_refs, total_count = await adapter.list_episodes(
                 task_name, limit=limit, offset=offset
             )
+            # Surface the total count via header so the frontend can paginate
+            # ("Page X of Y") without a second round-trip.
+            response.headers["X-Total-Count"] = str(total_count)
+            response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
             return [
                 EpisodeInfo(
                     id=ep.id,

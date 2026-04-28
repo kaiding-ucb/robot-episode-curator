@@ -19,11 +19,19 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
   const [removeError, setRemoveError] = useState<string | null>(null);
 
   const { tasks, totalTasks, source: taskSource, loading: loadingTasks, error: tasksError, hasMore: hasMoreTasks, loadMore: loadMoreTasks, searchQuery: taskSearchQuery, updateSearch: updateTaskSearch } = useTasks(selectedDataset);
-  const { episodes, loading: loadingEpisodes, error: episodesError, hasMore, loadMore } = useTaskEpisodes(
-    selectedDataset,
-    selectedTask,
-    5 // Reduced limit for faster loading
-  );
+  const {
+    episodes,
+    loading: loadingEpisodes,
+    error: episodesError,
+    page: episodesPage,
+    pageSize: episodesPageSize,
+    totalCount: episodesTotal,
+    pageCount: episodesPageCount,
+    hasNext: episodesHasNext,
+    hasPrev: episodesHasPrev,
+    goNext: episodesGoNext,
+    goPrev: episodesGoPrev,
+  } = useTaskEpisodes(selectedDataset, selectedTask, 10);
 
   const handleSelectDataset = (datasetId: string) => {
     setSelectedDataset(datasetId);
@@ -300,9 +308,16 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
             </h2>
           </div>
 
-          <h3 className="px-4 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wider">
-            Sample Episodes {episodes.length > 0 && `(${episodes.length}${hasMore ? '+' : ''})`}
-          </h3>
+          {(() => {
+            const headerCount = episodesTotal != null
+              ? episodesTotal.toLocaleString()
+              : episodes.length > 0 ? `${episodes.length}+` : "";
+            return (
+              <h3 className="px-4 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                Episodes{headerCount && ` (${headerCount})`}
+              </h3>
+            );
+          })()}
 
           {loadingEpisodes && episodes.length === 0 ? (
             <div className="p-4 text-gray-500" data-testid="loading-episodes">
@@ -318,11 +333,6 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
             </div>
           ) : (
             <>
-              {selectedDatasetInfo?.type === "video" && (
-                <div className="mx-4 mb-2 px-3 py-2 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded text-sm text-gray-700 dark:text-gray-300" data-testid="streaming-notice">
-                  Streaming dataset - showing sample episodes
-                </div>
-              )}
               <ul className="divide-y divide-gray-100 dark:divide-gray-800" data-testid="episode-list">
                 {episodes.map((episode) => (
                   <li key={episode.id}>
@@ -349,16 +359,37 @@ export default function DatasetBrowser({ onSelectEpisode, onSelectDataset }: Dat
                 ))}
               </ul>
 
-              {/* Load More Button */}
-              {hasMore && (
-                <div className="p-4">
+              {/* Pagination controls — Prev / Page X of Y / Next */}
+              {(episodesHasPrev || episodesHasNext) && (
+                <div className="p-3 flex items-center justify-between gap-2 border-t border-gray-100 dark:border-gray-800" data-testid="episodes-pagination">
                   <button
-                    onClick={loadMore}
-                    disabled={loadingEpisodes}
-                    className="w-full px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
-                    data-testid="load-more-episodes"
+                    onClick={episodesGoPrev}
+                    disabled={!episodesHasPrev || loadingEpisodes}
+                    className="px-3 py-1.5 text-xs font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    data-testid="episodes-prev"
+                    aria-label="Previous page"
                   >
-                    {loadingEpisodes ? "Loading..." : "Load more episodes"}
+                    ‹ Prev
+                  </button>
+                  <span className="text-xs text-gray-500 dark:text-gray-400 tabular-nums">
+                    {episodesPageCount != null
+                      ? `Page ${episodesPage + 1} of ${episodesPageCount.toLocaleString()}`
+                      : `Page ${episodesPage + 1}`}
+                    {episodesTotal != null && (
+                      <span className="ml-1 opacity-75">
+                        · {(episodesPage * episodesPageSize + 1).toLocaleString()}–
+                        {Math.min(episodesPage * episodesPageSize + episodes.length, episodesTotal).toLocaleString()}
+                      </span>
+                    )}
+                  </span>
+                  <button
+                    onClick={episodesGoNext}
+                    disabled={!episodesHasNext || loadingEpisodes}
+                    className="px-3 py-1.5 text-xs font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    data-testid="episodes-next"
+                    aria-label="Next page"
+                  >
+                    Next ›
                   </button>
                 </div>
               )}
