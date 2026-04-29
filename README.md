@@ -48,13 +48,3 @@ Out-of-the-box adapters for:
 | LeRobot v3 (parquet + mp4) | `lerobot/libero_*`, `lerobot/aloha_*`, `lerobot/droid_100`, `lerobot/umi_cup_in_the_wild` |
 
 Add any HuggingFace Lerobot dataset via **+ Add Dataset** in the sidebar — the probe step auto-detects format.
-
-## Architecture
-
-```
-backend/    FastAPI · Python 3.10+ · format-specific adapters & loaders
-frontend/   Next.js 16 · React 19 · Tailwind · Rerun web viewer embedded
-tests/      Real-data integration tests (require HF_TOKEN, no mocks)
-```
-
-The dual-adapter pattern (Loaders → Adapters → API Routes → Frontend) makes adding a new format ~200 lines: implement `BaseLoader` and `BaseAdapter`, register in `backend/adapters/registry.py`, done.
