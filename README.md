@@ -7,7 +7,7 @@ Uses [LeRobot](https://github.com/huggingface/lerobot) to load datasets, [Rerun]
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 <p align="center">
-  <img src="docs/media/viewer.gif" alt="Robot Episode Curator demo" width="720" />
+  <img src="docs/media/viewer.gif" alt="Robot Episode Curator demo" />
 </p>
 
 ## Demo
