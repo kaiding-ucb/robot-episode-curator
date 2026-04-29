@@ -6,8 +6,6 @@ Uses [LeRobot](https://github.com/huggingface/lerobot) to load datasets, [Rerun]
 [![🤗 Hugging Face Demo](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue)](https://huggingface.co/spaces/jacob314159/robot-episode-curator)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-A web UI for browsing HuggingFace robotics datasets, watching episodes side-by-side, and surfacing data-quality issues that matter for training. Drop in any LeRobot-format repo and start exploring — the analysis pipeline flags duration outliers, action-envelope drift, and stylistic clusters per task.
-
 ## Demo
 
 Hosted demo on Hugging Face Spaces:
