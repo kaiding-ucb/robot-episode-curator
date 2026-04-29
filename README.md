@@ -8,7 +8,11 @@ Uses [LeRobot](https://github.com/huggingface/lerobot) to load datasets, [Rerun]
 
 A web UI for browsing HuggingFace robotics datasets, watching episodes side-by-side, and surfacing data-quality issues that matter for training. Drop in any LeRobot-format repo and start exploring — the analysis pipeline flags duration outliers, action-envelope drift, and stylistic clusters per task.
 
-Try the live demo on the [HuggingFace Space](https://huggingface.co/spaces/jacob314159/robot-episode-curator) above, or run it locally in five minutes.
+## Demo
+
+Hosted demo on Hugging Face Spaces:
+
+<a href='https://huggingface.co/spaces/jacob314159/robot-episode-curator'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue'></a>
 
 ## Quick Start (5 Minutes)
 
