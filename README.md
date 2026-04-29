@@ -6,6 +6,10 @@ Uses [LeRobot](https://github.com/huggingface/lerobot) to load datasets, [Rerun]
 [![🤗 Hugging Face Demo](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue)](https://huggingface.co/spaces/jacob314159/robot-episode-curator)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
+<p align="center">
+  <img src="docs/media/viewer.gif" alt="Robot Episode Curator demo" width="720" />
+</p>
+
 ## Demo
 
 Hosted demo on Hugging Face Spaces:
