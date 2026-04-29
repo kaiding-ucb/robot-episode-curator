@@ -31,7 +31,6 @@ Get tokens: [HuggingFace](https://huggingface.co/settings/tokens) (read scope is
 
 The pipeline runs per-episode **phase segmentation**, statistical flag detection (duration, cycle, envelope, shape outliers), and **Bayesian variance clustering**. Representative clips from each cluster are sent to **Gemini** for characterization and flag enrichment. Output is a deck of cluster cards and flagged-episode cards rendered next to the data.
 
-**Key innovation:** the phase-segmentation → variance-clustering → video-LLM enrichment chain. Most quality tools either compute statistics *or* run video LLMs; here the statistics decide *which* clips deserve LLM tokens, so you get behavior-aware narratives at a fraction of the cost.
 
 ## Supported Datasets
 
@@ -40,11 +39,8 @@ Out-of-the-box adapters for:
 | Format                     | Examples                                                                                                |
 | -------------------------- | ------------------------------------------------------------------------------------------------------- |
 | LeRobot v3 (parquet + mp4) | `lerobot/libero_*`, `lerobot/aloha_*`, `lerobot/droid_100`, `lerobot/umi_cup_in_the_wild` |
-| MCAP                       | RealOmni, GR00T                                                                                         |
-| WebDataset                 | Egocentric-10K                                                                                          |
-| HDF5                       | LIBERO original release                                                                                 |
 
-Add any HuggingFace dataset via **+ Add Dataset** in the sidebar — the probe step auto-detects format.
+Add any HuggingFace Lerobot dataset via **+ Add Dataset** in the sidebar — the probe step auto-detects format.
 
 ## Architecture
 
@@ -55,18 +51,3 @@ tests/      Real-data integration tests (require HF_TOKEN, no mocks)
 ```
 
 The dual-adapter pattern (Loaders → Adapters → API Routes → Frontend) makes adding a new format ~200 lines: implement `BaseLoader` and `BaseAdapter`, register in `backend/adapters/registry.py`, done.
-
-## Development
-
-```bash
-make test-backend       # pytest, real datasets
-make test-frontend      # playwright e2e
-make lint               # ruff + eslint
-make format             # ruff --fix + black
-```
-
-CI runs lint, smoke imports, and `pytest --collect-only` on every PR. Full integration tests need an `HF_TOKEN` secret and run on demand.
-
-## License
-
-Apache 2.0. See [LICENSE](LICENSE).
