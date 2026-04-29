@@ -18,15 +18,13 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Request, Query
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-from downloaders.manager import DATASET_REGISTRY, get_all_datasets
-from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
-from loaders.streaming_extractor import StreamingFrameExtractor, cleanup_decoded_frames
 from cache import get_encoded_frame_cache
-from adapters import FormatRegistry
+from downloaders.manager import get_all_datasets
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from loaders import HDF5Loader, LeRobotLoader, RLDSLoader
+from loaders.streaming_extractor import StreamingFrameExtractor, cleanup_decoded_frames
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +39,8 @@ _HEAVY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 
 # Dedicated thread pool for parallel frame encoding within batches
 # More workers = faster encoding (WebP encoding releases GIL)
-import multiprocessing
+import multiprocessing  # noqa: E402
+
 _ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=min(8, multiprocessing.cpu_count()),
     thread_name_prefix="encode"
@@ -264,8 +263,8 @@ def encode_image_with_options(
 ) -> str:
     """Encode numpy image array to base64 WebP with resolution and quality options."""
     try:
-        from PIL import Image
         import cv2
+        from PIL import Image
 
         # Ensure correct format
         if image.dtype != np.uint8:
@@ -346,10 +345,14 @@ async def resolve_lerobot_episode(
     if cache_key in _lerobot_resolution_cache:
         return _lerobot_resolution_cache[cache_key]
 
-    from .datasets import fetch_lerobot_info, fetch_lerobot_episodes_meta, detect_lerobot_data_branch
-
     # Parse episode index
     import re
+
+    from .datasets import (
+        detect_lerobot_data_branch,
+        fetch_lerobot_episodes_meta,
+        fetch_lerobot_info,
+    )
     match = re.match(r'^episode_(\d+)$', episode_id)
     if not match:
         return None
@@ -1005,9 +1008,8 @@ async def stream_frames_generator(
 
     # Collect frames for caching
     frames_for_cache = []
-    total_frames_count = 0
-    cache = get_encoded_frame_cache()
-    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+    get_encoded_frame_cache()
+    dataset_id or repo_id.replace("/", "_")
     loop = asyncio.get_event_loop()
 
     async def check_disconnected():
@@ -1075,7 +1077,6 @@ async def stream_frames_generator(
                 stride = stride_used
                 logger.info(f"Auto-stride: {total_frames} frames -> stride={stride}")
 
-            total_frames_count = total_frames
             yield f"data: {json.dumps({'type': 'total', 'total_frames': total_frames, 'stride': stride})}\n\n"
 
             # Apply post-hoc stride filtering only for explicit caller stride
@@ -1125,7 +1126,6 @@ async def stream_frames_generator(
         total_frames = await run_in_thread(extractor.get_frame_count, file_path)
         if total_frames is None:
             return  # Client disconnected
-        total_frames_count = total_frames
 
         # Auto-compute stride for large MCAP episodes
         target = _compute_stride_target(total_frames)
@@ -1263,8 +1263,8 @@ async def stream_lerobot_frames_generator(
     loop = asyncio.get_event_loop()
 
     frames_for_cache = []
-    cache = get_encoded_frame_cache()
-    effective_dataset_id = dataset_id or repo_id.replace("/", "_")
+    get_encoded_frame_cache()
+    dataset_id or repo_id.replace("/", "_")
 
     async def check_disconnected():
         if is_disconnected:
@@ -1644,10 +1644,12 @@ async def _get_lerobot_actions(
     When path_prefix is set, scopes metadata and data paths under the subdataset prefix.
     """
     import re
+
     import httpx
 
-    from .datasets import fetch_lerobot_info, detect_lerobot_data_branch
-    from .analysis import _build_lerobot_data_file_list, _download_parquet, _get_hf_token as get_hf_token
+    from .analysis import _build_lerobot_data_file_list, _download_parquet
+    from .analysis import _get_hf_token as get_hf_token
+    from .datasets import detect_lerobot_data_branch, fetch_lerobot_info
 
     match = re.match(r'^episode_(\d+)$', episode_id)
     if not match:
@@ -1683,7 +1685,7 @@ async def _get_lerobot_actions(
     # Filter to target episode
     ep_col = "episode_index" if "episode_index" in df.columns else "episode_id"
     if ep_col not in df.columns:
-        return ActionsData(error=f"No episode column found in parquet data")
+        return ActionsData(error="No episode column found in parquet data")
     episode_df = df[df[ep_col] == target_ep_idx]
     if episode_df.empty:
         return ActionsData(error=f"Episode {target_ep_idx} not found in parquet data")

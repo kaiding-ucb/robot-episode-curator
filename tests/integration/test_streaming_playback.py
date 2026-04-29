@@ -8,18 +8,18 @@ frame pauses at batch boundaries.
 Tests use real streaming data from HuggingFace (no mocks).
 """
 
-import asyncio
 import os
 import random
+
+# Add backend to path
+import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import httpx
 import pytest
 
-# Add backend to path
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "backend"))
 
 

@@ -7,32 +7,29 @@ Endpoints:
 """
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-
-from fastapi import APIRouter, HTTPException, Request, Query
-from pydantic import BaseModel
+from typing import Dict, List, Optional
 
 import numpy as np
-
-from quality import (
-    compute_quality_score,
-    compute_dataset_quality_stats,
-    QualityScore,
-    # Task-level metrics
-    compute_task_statistics,
-    compute_episode_divergence,
-    compute_task_quality_metrics,
-    compute_simplified_transition_metrics,
-    QualityEvent as QualityEventDataclass,
-)
-from loaders import HDF5Loader, LeRobotLoader, RLDSLoader
-from loaders.streaming_extractor import StreamingFrameExtractor
-from downloaders.manager import get_all_datasets
 from cache import (
-    get_cached_quality_result,
+    cache_quality_events,
     cache_quality_result,
     get_cached_quality_events,
-    cache_quality_events,
+    get_cached_quality_result,
+)
+from downloaders.manager import get_all_datasets
+from fastapi import APIRouter, HTTPException, Query, Request
+from loaders import HDF5Loader, LeRobotLoader, RLDSLoader
+from loaders.streaming_extractor import StreamingFrameExtractor
+from pydantic import BaseModel
+from quality import (
+    QualityScore,
+    compute_dataset_quality_stats,
+    compute_episode_divergence,
+    compute_quality_score,
+    compute_simplified_transition_metrics,
+    compute_task_quality_metrics,
+    # Task-level metrics
+    compute_task_statistics,
 )
 
 logger = logging.getLogger(__name__)
@@ -272,7 +269,7 @@ async def get_quality_events(
             observations = episode.observations
             actions = episode.actions
             total_frames = len(observations) if observations is not None else 0
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
 
     # Compute quality to get events
@@ -440,7 +437,7 @@ async def get_episode_divergence(
     # Load the target episode
     try:
         target_episode = loader.load_episode(episode_id)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
 
     if target_episode.actions is None or len(target_episode.actions) < 5:
@@ -623,7 +620,7 @@ async def get_episode_quality(
             observations = episode.observations
             actions = episode.actions
             timestamps = episode.timestamps if hasattr(episode, 'timestamps') else None
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=404, detail=f"Episode not found: {episode_id}")
 
     # Compute quality

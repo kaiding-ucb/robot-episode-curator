@@ -6,7 +6,7 @@ Provides functions to scan MCAP channels and detect available modalities
 """
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from .base import Modality, ModalityConfig
 

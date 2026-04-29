@@ -165,7 +165,8 @@ def _format_episode_context(
     """Render a compact per-episode context block for the flag-enrich prompt.
     Surfaces gripper events + phase timings in seconds + per-phase magnitudes
     so Gemini can correlate video with signal."""
-    sec = lambda f: f / fps if fps else f
+    def sec(f):
+        return f / fps if fps else f
     lines: list[str] = []
     lines.append(f"    frames={frames} @ {fps:g}Hz · cycles={num_cycles}")
 

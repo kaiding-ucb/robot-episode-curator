@@ -8,7 +8,8 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Optional, AsyncGenerator
+from typing import AsyncGenerator, Callable, Optional
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ class MP4Generator:
 
             return output_path
 
-        except Exception as e:
+        except Exception:
             # Clean up temp file on error
             if temp_output.exists():
                 temp_output.unlink()

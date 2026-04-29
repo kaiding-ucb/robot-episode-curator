@@ -13,8 +13,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Optional, TypeVar, Callable
-from functools import wraps
+from typing import Any, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -318,8 +317,8 @@ def clear_episode_cache(dataset_id: str, episode_id: str):
 
 def get_cache_stats() -> dict:
     """Get cache statistics."""
-    quality_cache = get_quality_cache()
-    frames_cache = get_frames_cache()
+    get_quality_cache()
+    get_frames_cache()
 
     def count_entries(cache_dir: Path) -> int:
         return len(list(cache_dir.glob("*.json"))) + len(list(cache_dir.glob("*.pkl")))
@@ -758,6 +757,7 @@ class EncodedFrameCache:
         Use this from async endpoints to avoid blocking the event loop.
         """
         import asyncio
+
         from api.routes.episodes import _HEAVY_EXECUTOR
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_HEAVY_EXECUTOR, self.list_cached_episodes)
@@ -768,6 +768,7 @@ class EncodedFrameCache:
         Use this from async endpoints to avoid blocking the event loop.
         """
         import asyncio
+
         from api.routes.episodes import _HEAVY_EXECUTOR
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_HEAVY_EXECUTOR, self.get_cache_stats)

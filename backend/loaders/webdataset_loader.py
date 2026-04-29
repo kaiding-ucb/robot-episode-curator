@@ -14,8 +14,6 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-import numpy as np
-
 from .base import Episode, EpisodeMetadata, StreamingLoader
 
 logger = logging.getLogger(__name__)
@@ -58,7 +56,7 @@ class WebDatasetLoader(StreamingLoader):
             return self._dataset
 
         try:
-            from datasets import load_dataset, Features, Value
+            from datasets import load_dataset
 
             # Custom features for datasets with schema mismatches
             custom_features = self._get_custom_features()
@@ -200,7 +198,7 @@ class WebDatasetLoader(StreamingLoader):
                 if isinstance(json_data, (str, bytes)):
                     try:
                         metadata = json.loads(json_data)
-                    except:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
                 elif isinstance(json_data, dict):
                     metadata = json_data

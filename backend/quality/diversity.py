@@ -10,11 +10,11 @@ These metrics assess the diversity and learning value of trajectories:
 IMPORTANT: "Perfect" demonstrations are LOW quality for learning.
 "Messy" demonstrations with recovery behaviors are HIGH quality.
 """
-import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
-from scipy import signal
-from scipy.spatial.distance import pdist, squareform
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy.spatial.distance import pdist
 
 
 @dataclass
@@ -100,10 +100,8 @@ def detect_gripper_events(actions: np.ndarray) -> List[QualityEvent]:
         # Detect sign change (gripper state change)
         if prev_val * curr_val < 0:  # Sign changed
             if curr_val < 0:
-                action = "close"
                 desc = "Gripper closed (grasping)"
             else:
-                action = "open"
                 desc = "Gripper opened (releasing)"
 
             events.append(QualityEvent(

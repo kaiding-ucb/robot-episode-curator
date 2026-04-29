@@ -12,9 +12,10 @@ NOT testing:
 - "Is diversity score high for diverse data?" (math property)
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
-from pathlib import Path
 
 
 # =============================================================================
@@ -196,7 +197,7 @@ class TestQualityMetricsFunctionality:
 
     def test_temporal_metrics_returns_dataclass(self):
         """compute_temporal_metrics returns TemporalMetrics."""
-        from quality.temporal import compute_temporal_metrics, TemporalMetrics
+        from quality.temporal import TemporalMetrics, compute_temporal_metrics
 
         actions = np.random.randn(50, 7)
         metrics = compute_temporal_metrics(actions)
@@ -208,7 +209,7 @@ class TestQualityMetricsFunctionality:
 
     def test_diversity_metrics_returns_dataclass(self):
         """compute_diversity_metrics returns DiversityMetrics."""
-        from quality.diversity import compute_diversity_metrics, DiversityMetrics
+        from quality.diversity import DiversityMetrics, compute_diversity_metrics
 
         actions = np.random.randn(50, 7)
         metrics = compute_diversity_metrics(actions)
@@ -243,7 +244,7 @@ class TestQualityMetricsFunctionality:
 
     def test_quality_aggregator_returns_quality_score(self):
         """compute_quality_score returns QualityScore."""
-        from quality.aggregator import compute_quality_score, QualityScore
+        from quality.aggregator import QualityScore, compute_quality_score
 
         actions = np.random.randn(50, 7)
         observations = np.random.randint(0, 255, (50, 64, 64, 3), dtype=np.uint8)

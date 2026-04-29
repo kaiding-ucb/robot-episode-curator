@@ -1,11 +1,82 @@
 [project]
 name = "data-viewer"
 version = "0.1.0"
-description = "Robotics Dataset Viewer for quality assessment"
+description = "Robotics dataset viewer for browsing, playback, and quality assessment"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "data-viewer contributors" }]
+keywords = ["robotics", "datasets", "lerobot", "libero", "rerun", "huggingface"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Web framework
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "gunicorn>=21.2.0",
+    "pydantic>=2.5.0",
+    "python-multipart>=0.0.6",
+    "aiofiles>=23.2.0",
+    "httpx>=0.26.0",
+
+    # Data loading
+    "h5py>=3.10.0",
+    "numpy>=1.26.0",
+    "pandas>=2.0.0",
+    "datasets>=2.16.0",
+    "huggingface_hub>=0.20.0",
+    "webdataset>=0.2.86",
+    "mcap>=1.1.0",
+    "mcap-protobuf-support>=0.5.0",
+    "av>=11.0.0",
+    "Pillow>=10.0.0",
+    "PyYAML>=6.0",
+
+    # Quality metrics
+    "scikit-learn>=1.4.0",
+    "scipy>=1.12.0",
+    "opencv-python>=4.9.0",
+
+    # Viewer
+    "rerun-sdk>=0.28.2",
+]
+
+[project.optional-dependencies]
+ai = [
+    # Required only for Gemini-powered analysis.
+    "google-genai>=0.3.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kaiding-ucb/data_viewer"
+Issues = "https://github.com/kaiding-ucb/data_viewer/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["api*", "adapters*", "analysis*", "downloaders*", "loaders*", "quality*", "utils*"]
+exclude = ["tests*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "backend/tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 addopts = "-v --tb=short"
@@ -19,3 +90,12 @@ line-length = 100
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [".venv", "data", "frontend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+# Tests intentionally bind values for clarity even when only checked for truthiness.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F841"]
+"backend/tests/**" = ["F841"]

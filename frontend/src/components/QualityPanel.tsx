@@ -235,10 +235,11 @@ export default function QualityPanel({
   const events = qualityEventsData?.events || [];
 
   // Task-level quality metrics
-  const { metrics: taskMetrics, loading: taskLoading } = useTaskQuality(datasetId, taskName);
+  const taskNameOrNull = taskName ?? null;
+  const { metrics: taskMetrics, loading: taskLoading } = useTaskQuality(datasetId, taskNameOrNull);
 
   // Episode divergence for timeline heat map
-  const { divergence, loading: divLoading } = useEpisodeDivergence(datasetId, taskName, episodeId);
+  const { divergence, loading: divLoading } = useEpisodeDivergence(datasetId, taskNameOrNull, episodeId);
 
   // Pass divergence scores to parent for timeline heat
   const divergenceScores = divergence?.frame_divergences;

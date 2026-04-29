@@ -214,7 +214,7 @@ class DownloadManager:
         if dataset_id not in all_datasets:
             return {"status": "unknown", "error": f"Unknown dataset: {dataset_id}"}
 
-        config = all_datasets[dataset_id]
+        all_datasets[dataset_id]
 
         # Check if data directory exists
         data_dir = self.data_root / dataset_id

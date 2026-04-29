@@ -10,14 +10,24 @@ Provides API endpoints for:
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
-from api.routes import datasets, episodes, downloads, quality, compare, analysis, rerun, edge_frames, cache_admin, settings as settings_routes
 from loaders.streaming_extractor import cleanup_all_decoded_frames
+
+from api.routes import (
+    analysis,
+    cache_admin,
+    compare,
+    datasets,
+    downloads,
+    edge_frames,
+    episodes,
+    quality,
+    rerun,
+)
+from api.routes import settings as settings_routes
 
 # Configure logging
 logging.basicConfig(

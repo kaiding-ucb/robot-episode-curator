@@ -8,6 +8,10 @@ __pycache__/
 .next/
 dist/
 build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Data and cache
 data/
@@ -36,5 +40,6 @@ test-results/
 
 # Project-specific (Claude Code session memory; private exploration notebooks)
 CLAUDE.md
+.claude/
 exploration/
 

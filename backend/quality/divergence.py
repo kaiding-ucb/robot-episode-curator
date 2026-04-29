@@ -7,9 +7,11 @@ Low divergence = consistent technique = easier to learn median path.
 
 This is the "Expertise Test" for dataset quality.
 """
-import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Tuple
+
+import numpy as np
+
 from .diversity import QualityEvent
 
 

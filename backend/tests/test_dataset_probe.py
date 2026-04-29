@@ -8,17 +8,17 @@ Tests verify that the probe endpoint correctly detects:
 
 Uses real HuggingFace data - no mocking.
 """
-import pytest
-import httpx
+import sys
 from pathlib import Path
 
-import sys
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.routes.datasets import (
-    probe_huggingface_dataset,
-    parse_huggingface_url,
     generate_dataset_id,
+    parse_huggingface_url,
+    probe_huggingface_dataset,
 )
 from loaders.base import Modality
 

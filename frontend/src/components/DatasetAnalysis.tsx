@@ -33,6 +33,7 @@ export default function DatasetAnalysis({
   // Sync if parent passes a new datasetId
   useEffect(() => {
     if (initialDatasetId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setChosenDatasetId(initialDatasetId);
     }
   }, [initialDatasetId]);
@@ -87,6 +88,7 @@ export default function DatasetAnalysis({
   // If signal comparison not supported, default to frame-counts tab
   useEffect(() => {
     if (capabilities && !capabilities.supports_signal_comparison && activeTab === "signal-comparison") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveTab("frame-counts");
     }
   }, [capabilities, activeTab]);
@@ -94,6 +96,7 @@ export default function DatasetAnalysis({
   // If summary unavailable for this dataset, fall back to frame-counts
   useEffect(() => {
     if (metaSummary && metaSummary.source === "unavailable" && activeTab === "summary") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveTab("frame-counts");
     }
   }, [metaSummary, activeTab]);
@@ -101,6 +104,7 @@ export default function DatasetAnalysis({
   // Auto-select first task when tasks load (only after fetch completes)
   useEffect(() => {
     if (!tasksLoading && tasks.length > 0 && !selectedTask) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedTask(tasks[0].name);
     }
   }, [tasks, selectedTask, tasksLoading]);
@@ -129,6 +133,7 @@ export default function DatasetAnalysis({
   // If edge frames not supported and currently active, fall back.
   useEffect(() => {
     if (edgeFramesDisabled && activeTab === "edge-frames") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveTab("frame-counts");
     }
   }, [edgeFramesDisabled, activeTab]);

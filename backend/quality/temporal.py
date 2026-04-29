@@ -7,9 +7,10 @@ These metrics assess the temporal characteristics of trajectories:
 - Action consistency
 - Trajectory completeness
 """
-import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional
+
+import numpy as np
 
 
 @dataclass

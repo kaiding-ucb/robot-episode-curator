@@ -6,21 +6,20 @@ Tests for analysis.py optimizations:
 Uses real HuggingFace data — no mocking.
 """
 import asyncio
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.routes.analysis import (
-    _read_remote_video_metadata,
-    _video_frame_counts_for_task,
     _estimate_frames,
     _lerobot_frame_counts_for_task,
+    _read_remote_video_metadata,
+    _video_frame_counts_for_task,
 )
-
 
 # ---------------------------------------------------------------------------
 # Part A — Parallelized LeRobot Metadata
@@ -58,11 +57,11 @@ class TestParallelizedLeRobotMetadata:
         that wall-clock time is reasonable (< 15s).
         """
         from api.routes.datasets import (
+            detect_lerobot_data_branch,
+            fetch_lerobot_episodes_meta,
             fetch_lerobot_info,
             fetch_lerobot_tasks_meta,
             get_episode_task_map,
-            fetch_lerobot_episodes_meta,
-            detect_lerobot_data_branch,
         )
 
         start = time.monotonic()

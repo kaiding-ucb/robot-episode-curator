@@ -126,7 +126,7 @@ class GeminiClient:
         text = resp.text or ""
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             logger.warning(f"Gemini returned non-JSON: {text[:500]}")
             raise
         usage = getattr(resp, "usage_metadata", None)

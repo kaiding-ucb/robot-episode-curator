@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .base import StreamingAdapter, TaskRef, EpisodeRef, FrameResolution
+from .base import EpisodeRef, FrameResolution, StreamingAdapter, TaskRef
 
 logger = logging.getLogger(__name__)
 

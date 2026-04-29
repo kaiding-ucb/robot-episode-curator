@@ -10,9 +10,9 @@ Used for:
 - Open X Embodiment datasets
 """
 import logging
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
 from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from PIL import Image

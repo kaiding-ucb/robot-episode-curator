@@ -17,10 +17,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from downloaders.manager import get_all_datasets
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-
-from downloaders.manager import get_all_datasets
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -196,9 +195,9 @@ async def edge_frames_stream(
 
     # Resolve LeRobot meta via existing cached helpers.
     from api.routes.datasets import (
+        fetch_lerobot_episodes_meta,
         fetch_lerobot_info,
         fetch_lerobot_tasks_meta,
-        fetch_lerobot_episodes_meta,
         get_episode_task_map,
         is_lerobot_dataset,
     )
@@ -297,7 +296,7 @@ async def edge_frames_stream(
             file_idx = int(row[file_col])
             t_start = float(row[t0_col])
             t_end = float(row[t1_col])
-            length = int(row["length"]) if "length" in row.index and not row["length"] is None else None
+            length = int(row["length"]) if "length" in row.index and row["length"] is not None else None
         except Exception as e:
             logger.warning(f"edge_frames: bad episode meta row: {e}")
             continue

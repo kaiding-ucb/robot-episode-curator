@@ -104,10 +104,10 @@ class HuggingFaceDownloader(Downloader):
             # In streaming mode, we don't download everything
             # Just verify we can access the dataset
             try:
-                dataset = self.get_dataset()
+                self.get_dataset()
 
                 # Try to access first sample to verify
-                sample = next(self.stream())
+                next(self.stream())
 
                 return DownloadResult(
                     success=True,
@@ -171,7 +171,7 @@ class HuggingFaceDownloader(Downloader):
         if self.streaming:
             # For streaming, check if we can access the dataset
             try:
-                dataset = self.get_dataset()
+                self.get_dataset()
                 return {
                     "status": DownloadStatus.READY.value,
                     "streaming": True,

@@ -12,13 +12,12 @@ Endpoints:
 """
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
-from pydantic import BaseModel
-
-from downloaders.manager import DownloadManager
 from cache import get_encoded_frame_cache
+from downloaders.manager import DownloadManager
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +330,7 @@ async def get_all_cache_stats():
     Uses executor to avoid blocking the event loop on large caches.
     """
     import asyncio
+
     from api.routes.episodes import _HEAVY_EXECUTOR
 
     loop = asyncio.get_event_loop()

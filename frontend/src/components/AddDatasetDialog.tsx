@@ -46,9 +46,15 @@ export default function AddDatasetDialog({
 
   useEffect(() => {
     if (!isOpen) return;
+    // Reset dialog state on every open. Could be expressed as derived state
+    // via a key prop on the dialog, but the lifecycle is clearer here.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPhase("input");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setInput("");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setProbe(null);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
   }, [isOpen]);
 

@@ -509,21 +509,13 @@ function OverlayPanel({
     return { envelope: env, outliers, bandMetrics, hotZones, resampled };
   }, [validTraces, batchRange]);
 
-  if (validTraces.length === 0) {
-    return (
-      <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
-        <div className="text-xs text-gray-500 mb-1">{title}</div>
-        <div className="text-xs text-gray-400 text-center py-4">No data</div>
-      </div>
-    );
-  }
-
   const h = 80;
   const w = 300;
   const yPadding = 2;
   const usableHeight = h - yPadding * 2;
 
-  // Pre-compute envelope rendering data: segment colors, trapezoid paths, mean path, sigma bar
+  // Pre-compute envelope rendering data: segment colors, trapezoid paths, mean path, sigma bar.
+  // Must run before any early return so the hook order stays stable across renders.
   const envelopeRender = useMemo(() => {
     if (!envelope) return null;
     const normUpper = normalizeBatch(envelope.upper, batchRange.min, batchRange.max);
@@ -565,6 +557,15 @@ function OverlayPanel({
 
     return { segments, meanPath, segColors, sigmaBar };
   }, [envelope, batchRange, usableHeight]);
+
+  if (validTraces.length === 0) {
+    return (
+      <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
+        <div className="text-xs text-gray-500 mb-1">{title}</div>
+        <div className="text-xs text-gray-400 text-center py-4">No data</div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-gray-50 dark:bg-gray-800 rounded p-3">
@@ -1213,16 +1214,18 @@ export default function SignalComparisonChart({
 
   const { frameData, loading: framesLoading, errors: frameErrors } = useFirstFrames(episodeList, datasetId, sseFirstFrames);
 
-  // Derive action classification from first episode with labels (all episodes in a task share the same action space)
-  const classification: ActionGrouping | undefined = useMemo(() => {
-    for (const [, ep] of episodeList) {
-      if (ep.actions && !ep.actions.error && ep.actions.actions?.length > 0) {
-        const dims = ep.actions.actions[0].length;
-        return classifyActionDimensions(ep.actions.dimension_labels ?? null, dims);
-      }
-    }
-    return undefined;
-  }, [episodeList]);
+  // Derive action classification from first episode with labels (all episodes
+  // in a task share the same action space). The React 19 compiler auto-memoizes
+  // this; explicit useMemo here would conflict with the compiler analysis.
+  let classification: ActionGrouping | undefined;
+  for (const [, ep] of episodeList) {
+    const actions = ep.actions;
+    if (!actions || actions.error) continue;
+    const rows = actions.actions;
+    if (!rows || rows.length === 0) continue;
+    classification = classifyActionDimensions(actions.dimension_labels ?? null, rows[0].length);
+    break;
+  }
 
   // Single precomputation pass: compute all magnitudes once per episode
   const precomputed = useMemo(() => {

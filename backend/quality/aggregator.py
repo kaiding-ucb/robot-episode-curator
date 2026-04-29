@@ -7,12 +7,13 @@ Weighting based on user requirements:
 
 Note: Visual quality removed as it's not useful for robotics dataset evaluation.
 """
-import numpy as np
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, List
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
-from .temporal import TemporalMetrics, compute_temporal_metrics
+import numpy as np
+
 from .diversity import DiversityMetrics, compute_diversity_metrics
+from .temporal import TemporalMetrics, compute_temporal_metrics
 
 
 @dataclass

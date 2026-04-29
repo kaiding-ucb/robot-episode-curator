@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,ai]"
+
+      - name: Lint (ruff)
+        run: ruff check backend tests
+
+      - name: Smoke import
+        # Confirms the editable install exposes every backend package and that
+        # the FastAPI app loads without runtime errors.
+        run: |
+          python -c "import api, adapters, analysis, downloaders, loaders, quality, utils"
+          python -c "from api.main import app; print('app:', app.title)"
+
+      - name: Pytest collect-only
+        # Real integration tests require HF_TOKEN and download datasets, so we
+        # only verify test modules import cleanly here. Run the full suite
+        # locally with `make test-backend` after exporting your tokens.
+        run: pytest --collect-only -q
+
+  frontend:
+    name: Frontend (Node 20)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check & build
+        run: npx next build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"

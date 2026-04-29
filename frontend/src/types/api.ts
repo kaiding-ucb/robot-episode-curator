@@ -159,9 +159,6 @@ export interface DeleteCacheResponse {
   success: boolean;
 }
 
-// === MODALITY TYPES ===
-export type Modality = "rgb" | "depth" | "imu" | "tactile" | "actions" | "states";
-
 // === DATASET OVERVIEW TYPES ===
 export interface DatasetOverview {
   repo_id: string;

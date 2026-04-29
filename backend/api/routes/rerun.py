@@ -87,28 +87,28 @@ def _classify_action_dimensions(labels: list | None, dims: int) -> dict:
             "grippers": [],
         }
 
-    lower = [l.lower() for l in labels]
-    gripper_indices = [i for i, l in enumerate(lower) if "gripper" in l or "grip" in l]
+    lower = [lbl.lower() for lbl in labels]
+    gripper_indices = [i for i, lbl in enumerate(lower) if "gripper" in lbl or "grip" in lbl]
     non_gripper = [i for i in range(dims) if i not in gripper_indices]
 
     # Cartesian detection
     pos_map = {"x": None, "y": None, "z": None}
     rot_names_found = {"roll": None, "pitch": None, "yaw": None}
 
-    for i, l in enumerate(lower):
+    for i, lbl in enumerate(lower):
         if i in gripper_indices:
             continue
-        if l in ("x",) or "pos_x" in l:
+        if lbl in ("x",) or "pos_x" in lbl:
             pos_map["x"] = i
-        elif l in ("y",) or "pos_y" in l:
+        elif lbl in ("y",) or "pos_y" in lbl:
             pos_map["y"] = i
-        elif l in ("z",) or "pos_z" in l:
+        elif lbl in ("z",) or "pos_z" in lbl:
             pos_map["z"] = i
-        elif l in ("roll",) or "rot_x" in l or l == "rx":
+        elif lbl in ("roll",) or "rot_x" in lbl or lbl == "rx":
             rot_names_found["roll"] = i
-        elif l in ("pitch",) or "rot_y" in l or l == "ry":
+        elif lbl in ("pitch",) or "rot_y" in lbl or lbl == "ry":
             rot_names_found["pitch"] = i
-        elif l in ("yaw",) or "rot_z" in l or l == "rz":
+        elif lbl in ("yaw",) or "rot_z" in lbl or lbl == "rz":
             rot_names_found["yaw"] = i
 
     pos_indices = [v for v in pos_map.values() if v is not None]
@@ -198,7 +198,7 @@ def _load_lerobot_episode_direct(
                  when image columns can be skipped.
     """
     import pandas as pd
-    from huggingface_hub import hf_hub_download, HfApi
+    from huggingface_hub import HfApi, hf_hub_download
 
     api = HfApi(token=HF_TOKEN)
 
@@ -398,9 +398,7 @@ def _generate_rrd_lerobot_streaming(
 
     import numpy as np
     import rerun as rr
-    from datasets import load_dataset
     from huggingface_hub import hf_hub_download
-    from PIL import Image
 
     repo_id = config.get("repo_id", dataset_id)
 
@@ -410,7 +408,6 @@ def _generate_rrd_lerobot_streaming(
     state_labels = None
     has_state = False
     image_keys: list[str] = []
-    task_name = None
 
     try:
         info_path = hf_hub_download(
@@ -559,7 +556,7 @@ def _generate_rrd_lerobot_streaming(
             if first_orig:
                 task_idx = first_orig.get("task_index", 0)
         if task_idx is not None and task_idx < len(tasks_df):
-            task_name = tasks_df.index[task_idx]
+            tasks_df.index[task_idx]
 
     # Classify action dimensions
     action_dims = 7  # default
@@ -752,8 +749,9 @@ def _extract_lerobot_episode_clips(
     embed in `rr.AssetVideo(contents=...)`.
     """
     import io as _io
+
     import pandas as pd
-    from utils.video_slice import slice_remote_mp4_to_bytes, FfmpegError
+    from utils.video_slice import FfmpegError, slice_remote_mp4_to_bytes
 
     video_path_template = info.get("video_path")
     if not video_path_template:
@@ -822,7 +820,7 @@ def _extract_lerobot_episode_clips(
     return clips_by_key
 
 
-def _decode_image(img) -> "np.ndarray | None":
+def _decode_image(img):
     """Decode an image from various formats to numpy array."""
     import numpy as np
     from PIL import Image
@@ -906,9 +904,8 @@ def _generate_rrd_streaming(
 ):
     """Generate RRD from streaming HuggingFace dataset (non-LeRobot fallback)."""
     import rerun as rr
-
-    from loaders.streaming_extractor import StreamingFrameExtractor
     from loaders import get_repo_id_for_dataset
+    from loaders.streaming_extractor import StreamingFrameExtractor
 
     repo_id = get_repo_id_for_dataset(dataset_id)
     if not repo_id:
@@ -980,8 +977,8 @@ async def generate_rrd(
     Returns the URL to access the generated RRD file.
     """
     try:
-        import rerun as rr
-        import numpy as np
+        import numpy as np  # noqa: F401  (availability check; used in helpers)
+        import rerun as rr  # noqa: F401
     except ImportError:
         raise HTTPException(
             status_code=500,
@@ -1301,8 +1298,8 @@ async def generate_comparison_rrd(
 ):
     """Generate a multi-episode comparison .rrd for a task."""
     try:
-        import rerun as rr
         import numpy as np
+        import rerun as rr
     except ImportError:
         raise HTTPException(status_code=500, detail="rerun-sdk not installed")
 
@@ -1331,6 +1328,7 @@ async def generate_comparison_rrd(
 
     # Get metadata for action labels
     import json
+
     from huggingface_hub import hf_hub_download
 
     fps = 10

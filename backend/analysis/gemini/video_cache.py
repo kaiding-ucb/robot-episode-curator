@@ -10,8 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-
-from utils.video_slice import slice_remote_mp4, FfmpegError
+from utils.video_slice import FfmpegError, slice_remote_mp4
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +46,7 @@ def cache_path_for(repo_id: str, episode_idx: int) -> Path:
 def _find_episode_meta_row(repo_id: str, episode_idx: int) -> Optional[pd.Series]:
     """Find the meta/episodes row for `episode_idx` via the existing async cache."""
     import asyncio
+
     from api.routes.datasets import fetch_lerobot_episodes_meta
 
     try:

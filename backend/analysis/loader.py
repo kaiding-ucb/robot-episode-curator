@@ -57,6 +57,7 @@ async def _probe_columns(repo_id: str, first_file: str, branch: str, headers: di
     Needed because datasets differ: Libero has ['action', 'observation.state'];
     UMI has ['observation.state', 'gripper_width'] with no action column."""
     import io
+
     import pyarrow.parquet as pq_
     url = f"https://huggingface.co/datasets/{repo_id}/resolve/{branch}/{first_file}"
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:

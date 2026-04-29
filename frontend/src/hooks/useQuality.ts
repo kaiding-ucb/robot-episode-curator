@@ -158,14 +158,18 @@ export function useTaskQuality(
       setMetrics(null);
       return;
     }
+    // Capture non-null values; the closure below cannot rely on the outer
+    // narrowing carrying into the async scope.
+    const did = datasetId;
+    const tn = taskName;
 
     async function fetchTaskQuality() {
       setLoading(true);
       setError(null);
       try {
-        const encodedTaskName = encodeURIComponent(taskName);
+        const encodedTaskName = encodeURIComponent(tn);
         const res = await fetch(
-          `${API_BASE}/quality/task/${datasetId}/${encodedTaskName}?limit=${limit}`
+          `${API_BASE}/quality/task/${did}/${encodedTaskName}?limit=${limit}`
         );
         if (!res.ok) {
           const errorData = await res.json().catch(() => ({}));
@@ -207,15 +211,18 @@ export function useEpisodeDivergence(
       setDivergence(null);
       return;
     }
+    const did = datasetId;
+    const tn = taskName;
+    const eid = episodeId;
 
     async function fetchDivergence() {
       setLoading(true);
       setError(null);
       try {
-        const encodedTaskName = encodeURIComponent(taskName);
-        const encodedEpisodeId = encodeURIComponent(episodeId);
+        const encodedTaskName = encodeURIComponent(tn);
+        const encodedEpisodeId = encodeURIComponent(eid);
         const res = await fetch(
-          `${API_BASE}/quality/task/${datasetId}/${encodedTaskName}/divergence/${encodedEpisodeId}?limit=${limit}`
+          `${API_BASE}/quality/task/${did}/${encodedTaskName}/divergence/${encodedEpisodeId}?limit=${limit}`
         );
         if (!res.ok) {
           const errorData = await res.json().catch(() => ({}));

@@ -9,7 +9,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import StreamingAdapter, TaskRef, EpisodeRef, FrameResolution
+from .base import EpisodeRef, FrameResolution, StreamingAdapter, TaskRef
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,6 @@ class LeRobotAdapter(StreamingAdapter):
         from api.routes.datasets import (
             fetch_lerobot_tasks_meta,
             get_episode_task_map,
-            fetch_lerobot_info,
         )
 
         repo_id = self._effective_repo_id
@@ -115,10 +114,9 @@ class LeRobotAdapter(StreamingAdapter):
     ) -> Tuple[List[EpisodeRef], int]:
         """List episodes for a task with pagination."""
         from api.routes.datasets import (
-            fetch_lerobot_tasks_meta,
             fetch_lerobot_episodes_meta,
+            fetch_lerobot_tasks_meta,
             get_episode_task_map,
-            fetch_lerobot_info,
         )
 
         repo_id = self._effective_repo_id

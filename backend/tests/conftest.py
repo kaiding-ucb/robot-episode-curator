@@ -7,8 +7,9 @@ Uses real HuggingFace data from datasets specified in CLAUDE.md:
 - RealOmni: genrobot2025/10Kh-RealOmin-OpenData (MCAP, hierarchical)
 """
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 # HuggingFace token: read from environment or ~/.huggingface/token at test start.

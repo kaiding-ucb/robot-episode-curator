@@ -7,9 +7,9 @@ These metrics assess the visual quality of observations:
 - Exposure quality (histogram analysis)
 - Contrast quality
 """
-import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple
+
+import numpy as np
 
 
 @dataclass

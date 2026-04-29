@@ -11,7 +11,7 @@ LIBERO stores demonstrations in HDF5 files with the following structure:
 """
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import h5py
 import numpy as np

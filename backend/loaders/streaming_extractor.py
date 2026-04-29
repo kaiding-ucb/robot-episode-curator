@@ -14,7 +14,8 @@ import pickle
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -620,6 +621,7 @@ class StreamingFrameExtractor:
         Decode H.264 NAL units to frames using PyAV or ffmpeg.
         """
         import tempfile
+
         import cv2
 
         frames = []
@@ -713,7 +715,6 @@ class StreamingFrameExtractor:
 
             # If that fails, try protobuf decode
             try:
-                from mcap_protobuf.decoder import DecoderFactory
                 # The data might be protobuf-encoded CompressedImage
                 # Try to extract the image bytes
 
@@ -1925,8 +1926,9 @@ class StreamingFrameExtractor:
     def _decode_single_h264_nal(self, nal_data: bytes) -> Optional[np.ndarray]:
         """Decode a single H.264 NAL unit to an RGB frame using PyAV."""
         try:
-            import av
             import tempfile
+
+            import av
 
             with tempfile.NamedTemporaryFile(suffix=".h264", delete=False) as tmp:
                 tmp_path = tmp.name

@@ -18,28 +18,26 @@ import logging
 import os
 import re
 import tempfile
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
 
 import httpx
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, Request, Response
-from pydantic import BaseModel
-
+from adapters import FormatRegistry
 from downloaders.manager import (
     DownloadManager,
-    DATASET_REGISTRY,
     add_dynamic_dataset,
-    remove_dynamic_dataset,
     get_all_datasets,
     get_dynamic_datasets,
+    remove_dynamic_dataset,
 )
-from loaders import HDF5Loader, WebDatasetLoader, LeRobotLoader, RLDSLoader
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from loaders import HDF5Loader, LeRobotLoader, RLDSLoader, WebDatasetLoader
 from loaders.base import Modality
 from loaders.mcap_utils import detect_mcap_modalities
-from adapters import FormatRegistry
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +470,7 @@ async def fetch_episode_task_map_from_data_parquet(
     Returns dict mapping episode_index → task_index, or None on failure.
     """
     import asyncio
+
     import pyarrow.parquet as pq
     from huggingface_hub import HfFileSystem
 
@@ -922,7 +921,7 @@ async def list_episodes(
     if dataset_id not in all_datasets:
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_id}")
 
-    config = all_datasets[dataset_id]
+    all_datasets[dataset_id]
 
     data_root = get_data_root(request)
     loader = get_loader(dataset_id, data_root)
@@ -1041,8 +1040,8 @@ async def get_episodes_from_huggingface(
                         if relative_path.startswith(task_folder + "/"):
                             relative_path = relative_path[len(task_folder) + 1:]
 
-                        episode_id = Path(relative_path).stem
-                        size_bytes = item.get("size", 0)
+                        Path(relative_path).stem
+                        item.get("size", 0)
 
                         episodes.append(EpisodeInfo(
                             id=f"{task_folder}/{relative_path}",

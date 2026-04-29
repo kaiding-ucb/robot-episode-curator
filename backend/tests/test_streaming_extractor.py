@@ -9,11 +9,12 @@ Tests verify:
 
 Uses real HuggingFace data - no mocking.
 """
-import pytest
-import numpy as np
+import sys
 from pathlib import Path
 
-import sys
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from loaders.streaming_extractor import (

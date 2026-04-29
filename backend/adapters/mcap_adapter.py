@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .base import StreamingAdapter, TaskRef, EpisodeRef, FrameResolution
+from .base import EpisodeRef, FrameResolution, StreamingAdapter, TaskRef
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +144,7 @@ class MCAPAdapter(StreamingAdapter):
         Each .mcap file = 1 episode.
         """
         headers = _get_hf_headers()
-        encoded = urllib.parse.quote(task, safe="")
-        url = f"https://huggingface.co/api/datasets/{self.repo_id}/tree/main/{encoded}"
+        urllib.parse.quote(task, safe="")
 
         all_episodes: List[EpisodeRef] = []
         dirs_to_visit = [task]

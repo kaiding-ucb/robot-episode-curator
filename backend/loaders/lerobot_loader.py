@@ -8,9 +8,9 @@ LeRobot format (used by HuggingFace robotics datasets) stores data as:
 - episode_index, frame_index, timestamp
 """
 import logging
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -82,7 +82,7 @@ class LeRobotLoader(DatasetLoader):
         # Group by episode
         episode_col = "episode_index" if "episode_index" in df.columns else "episode_id"
         if episode_col not in df.columns:
-            logger.error(f"No episode column found in dataset")
+            logger.error("No episode column found in dataset")
             self._scan_complete = True
             return
 

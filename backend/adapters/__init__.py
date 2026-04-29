@@ -10,7 +10,7 @@ Usage:
         episodes, total = await adapter.list_episodes(task_name, limit=10)
         resolution = await adapter.resolve_episode(episode_id)
 """
-from .base import StreamingAdapter, TaskRef, EpisodeRef, FrameResolution
+from .base import EpisodeRef, FrameResolution, StreamingAdapter, TaskRef
 from .registry import FormatRegistry
 
 __all__ = [

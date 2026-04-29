@@ -73,7 +73,7 @@ class LiberoDownloader(Downloader):
             DownloadResult with success status
         """
         try:
-            from huggingface_hub import snapshot_download, hf_hub_download
+            from huggingface_hub import hf_hub_download, snapshot_download  # noqa: F401
 
             # Determine what to download
             if dataset:
@@ -81,7 +81,6 @@ class LiberoDownloader(Downloader):
             else:
                 suites_to_download = LIBERO_SUITES
 
-            total_downloaded = 0
 
             for suite in suites_to_download:
                 suite_dir = self.data_dir / suite

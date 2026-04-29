@@ -849,6 +849,7 @@ async def get_dataset_capabilities(dataset_id: str):
     Returns what types of analysis are supported based on format and file sizes.
     """
     from downloaders.manager import get_all_datasets
+
     from api.routes.datasets import is_lerobot_dataset
 
     all_datasets = get_all_datasets()
@@ -878,13 +879,14 @@ async def _lerobot_frame_counts_for_task(
 
     Returns None if metadata is unavailable (caller should fall back to file-size estimation).
     """
+    import re
+
     from api.routes.datasets import (
         fetch_lerobot_episodes_meta,
+        fetch_lerobot_info,
         fetch_lerobot_tasks_meta,
         get_episode_task_map,
-        fetch_lerobot_info,
     )
-    import re
 
     all_tasks = not task_name or task_name == "_all_"
 
@@ -983,15 +985,16 @@ async def _lerobot_frame_counts_from_api(
     This is the fallback when meta/episodes/ and meta/tasks.parquet are not available
     (e.g. LeRobot v2.1 datasets like umi_cup_in_the_wild).
     """
-    from api.routes.datasets import fetch_lerobot_info
     import re
+
+    from api.routes.datasets import fetch_lerobot_info
 
     info = await fetch_lerobot_info(repo_id)
     if not info:
         return None
 
     total_episodes = info.get("total_episodes", 0)
-    total_tasks = info.get("total_tasks", 1)
+    info.get("total_tasks", 1)
     fps = info.get("fps", 30)
 
     if total_episodes == 0:
@@ -1105,6 +1108,7 @@ async def get_frame_count_distribution(
     For other formats, uses HF tree API file sizes with format-specific heuristics.
     """
     from downloaders.manager import get_all_datasets
+
     from api.routes.datasets import is_lerobot_dataset
 
     all_datasets = get_all_datasets()
@@ -1264,14 +1268,15 @@ async def get_signals_comparison(
                 fmt = "lerobot"
 
                 # Get task's episode indices and metadata
+                import re as _re
+
                 from api.routes.datasets import (
-                    fetch_lerobot_tasks_meta,
                     derive_episode_task_map_from_meta,
+                    detect_lerobot_data_branch,
                     fetch_lerobot_episodes_meta,
                     fetch_lerobot_info,
-                    detect_lerobot_data_branch,
+                    fetch_lerobot_tasks_meta,
                 )
-                import re as _re
 
                 # Fetch metadata in parallel (no datasets-server calls needed)
                 info, tasks_df, episodes_meta_df, _data_branch = await asyncio.gather(
@@ -1724,6 +1729,7 @@ async def get_phase_aware(
     from analysis import analyze_task
     from analysis.loader import load_episodes_action_state
     from downloaders.manager import get_all_datasets
+
     from api.routes.datasets import is_lerobot_dataset
 
     all_tasks_mode = (task_name is None) or task_name == "" or task_name == "_all_"
@@ -1804,8 +1810,9 @@ async def get_phase_aware(
     # Pull FPS from info.json (falls back to 10 Hz)
     fps = 10.0
     try:
-        from huggingface_hub import hf_hub_download as _hf_dl
         import json as _json
+
+        from huggingface_hub import hf_hub_download as _hf_dl
         info_path = await asyncio.to_thread(_hf_dl, repo_id, "meta/info.json", repo_type="dataset")
         with open(info_path) as f:
             fps = float(_json.load(f).get("fps", 10.0))
@@ -1895,9 +1902,10 @@ async def stream_phase_aware(
     """
     # Resolve dataset/repo identically to the non-streaming endpoint
     from analysis import analyze_task
-    from analysis.loader import load_episodes_action_state
     from analysis.gemini import enrich_with_gemini
+    from analysis.loader import load_episodes_action_state
     from downloaders.manager import get_all_datasets
+
     from api.routes.datasets import is_lerobot_dataset, list_task_episodes
 
     queue: asyncio.Queue = asyncio.Queue()

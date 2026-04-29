@@ -6,13 +6,12 @@ Endpoints:
 """
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Dict, List
 
-from fastapi import APIRouter, HTTPException, Request, Query
-from pydantic import BaseModel
-
-from quality import compute_quality_score, compute_dataset_quality_stats
+from fastapi import APIRouter, HTTPException, Query, Request
 from loaders.hdf5_loader import HDF5Loader
+from pydantic import BaseModel
+from quality import compute_dataset_quality_stats, compute_quality_score
 
 logger = logging.getLogger(__name__)
 

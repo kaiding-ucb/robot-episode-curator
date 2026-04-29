@@ -24,7 +24,6 @@ from scipy.signal import find_peaks, medfilt
 from scipy.stats import chi2
 from sklearn.cluster import AgglomerativeClustering
 
-
 # ========================================================================
 # Algorithm constants (mirrored from prototype.py — see Phase 0 FINDINGS.md)
 # ========================================================================
