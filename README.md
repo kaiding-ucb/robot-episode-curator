@@ -1,6 +1,6 @@
 # Robot Episode Curator
 
-Easily curate outlier episodes in Lerobot datasets.
+Easily identify and curate outlier episodes in Lerobot datasets.
 
 Uses [LeRobot](https://github.com/huggingface/lerobot) for dataset format, [Rerun](https://rerun.io/) for native multi-modal playback, and [Gemini](https://aistudio.google.com/) for video analysis enrichment.
 
