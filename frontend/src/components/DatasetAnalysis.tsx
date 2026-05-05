@@ -10,6 +10,11 @@ import EdgeFramesPanel from "./EdgeFramesPanel";
 
 interface DatasetAnalysisProps {
   datasetId: string | null;
+  // True when the modal is currently open. The modal host keeps this
+  // component permanently mounted (CSS-hidden) to preserve state across
+  // open/close cycles, but that defeats useDatasets()'s mount-time fetch
+  // — without `visible` we'd never pick up datasets added while open.
+  visible?: boolean;
   onClose: () => void;
   onNavigateToEpisode?: (datasetId: string, episodeId: string, numFrames: number) => void;
   // Kept on the props interface for source compatibility with the modal host.
@@ -22,6 +27,7 @@ type AnalysisTab = "summary" | "frame-counts" | "edge-frames" | "signal-comparis
 
 export default function DatasetAnalysis({
   datasetId: initialDatasetId,
+  visible = true,
   onClose,
   onNavigateToEpisode,
 }: DatasetAnalysisProps) {
@@ -40,8 +46,12 @@ export default function DatasetAnalysis({
 
   const datasetId = chosenDatasetId;
 
-  // Dataset list for the picker
-  const { datasets } = useDatasets();
+  // Dataset list for the picker. Refetched on every open so newly-added
+  // datasets surface in the dropdown without requiring a page reload.
+  const { datasets, refetch: refetchDatasets } = useDatasets();
+  useEffect(() => {
+    if (visible) refetchDatasets?.();
+  }, [visible, refetchDatasets]);
 
   // Data hooks
   const { tasks, loading: tasksLoading, error: tasksError } = useTasks(datasetId);

@@ -71,6 +71,7 @@ export default function Modals({
         <div className="relative w-full max-w-5xl max-h-[85vh] overflow-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl">
           <DatasetAnalysis
             datasetId={selectedDataset}
+            visible={showDatasetAnalysis}
             onClose={onCloseDatasetAnalysis}
             onNavigateToEpisode={onNavigateToEpisode}
           />
