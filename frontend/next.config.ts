@@ -9,6 +9,14 @@ const nextConfig: NextConfig = {
   // Empty config silences warning about webpack config
   turbopack: {},
 
+  // Default Node proxy timeout is 30s. Analysis endpoints for huge datasets
+  // (e.g. droid_1.0.1 with ~95k episodes) routinely run 1–3 minutes while
+  // pulling parquet files from HuggingFace; without this they ECONNRESET
+  // and surface as HTTP 500 in the frontend even though the backend is fine.
+  experimental: {
+    proxyTimeout: 10 * 60 * 1000,
+  },
+
   // Same-origin proxy: browser hits /api/*, Next forwards to backend.
   // Removes cross-origin requests entirely, so CORS allowlists and the
   // backend port are no longer the frontend's concern.
