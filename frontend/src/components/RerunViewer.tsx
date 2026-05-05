@@ -272,7 +272,12 @@ export default function RerunViewer({ datasetId, episodeId, onClose, comparisonR
         const data = await response.json();
         if (controller.signal.aborted) return;
         if (!data.rrd_url) throw new Error("No RRD URL returned");
-        const baseUrl = apiBaseUrl.replace("/api", "");
+        // Rerun's WASM viewer doesn't resolve relative URLs against the page
+        // origin — it parses a leading `/api/…` as `http://api/…` and fails
+        // with ERR_NAME_NOT_RESOLVED. Always hand it an absolute URL.
+        const baseUrl = apiBaseUrl.startsWith("/")
+          ? window.location.origin
+          : apiBaseUrl.replace("/api", "");
         const sep = data.rrd_url.includes("?") ? "&" : "?";
         const fullRrdUrl = `${baseUrl}${data.rrd_url}${sep}v=${encodeURIComponent(episodeId)}_${Date.now()}`;
         setRrdUrl(fullRrdUrl);

@@ -44,7 +44,7 @@ export default function DatasetAnalysis({
   const { datasets } = useDatasets();
 
   // Data hooks
-  const { tasks, loading: tasksLoading } = useTasks(datasetId);
+  const { tasks, loading: tasksLoading, error: tasksError } = useTasks(datasetId);
   const {
     capabilities,
     fetchCapabilities,
@@ -199,7 +199,10 @@ export default function DatasetAnalysis({
           {tasksLoading && (
             <option value="">Loading tasks...</option>
           )}
-          {!tasksLoading && tasks.length === 0 && (
+          {!tasksLoading && tasks.length === 0 && tasksError && (
+            <option value="">Failed to load tasks: {tasksError}</option>
+          )}
+          {!tasksLoading && tasks.length === 0 && !tasksError && (
             <option value="">No tasks found</option>
           )}
           {tasks.map((task) => (
@@ -339,27 +342,38 @@ export default function DatasetAnalysis({
         )}
 
         {activeTab === "edge-frames" && (
-          <EdgeFramesPanel
-            datasetId={datasetId}
-            taskName={effectiveTask}
-            onNavigateToEpisode={onNavigateToEpisode}
-          />
+          datasetId && !allTasks && tasksLoading ? (
+            <div className="py-6 text-sm text-gray-500 text-center">
+              Loading tasks…
+            </div>
+          ) : (
+            <EdgeFramesPanel
+              key={`${datasetId ?? "_"}::${effectiveTask ?? "_all_"}`}
+              datasetId={datasetId}
+              taskName={effectiveTask}
+              onNavigateToEpisode={onNavigateToEpisode}
+            />
+          )
         )}
 
         {activeTab === "signal-comparison" && (
           <div>
-            {datasetId && (allTasks || selectedTask) ? (
+            {!datasetId || (!allTasks && !selectedTask) ? (
+              <div className="py-6 text-sm text-gray-500 text-center">
+                Select a task to run phase-aware analysis.
+              </div>
+            ) : !allTasks && tasksLoading ? (
+              <div className="py-6 text-sm text-gray-500 text-center">
+                Loading tasks…
+              </div>
+            ) : (
               <PhaseAwarePanel
+                key={`${datasetId}::${effectiveTask ?? "_all_"}`}
                 datasetId={datasetId}
                 taskName={effectiveTask}
                 onNavigateToEpisode={onNavigateToEpisode}
               />
-            ) : (
-              <div className="py-6 text-sm text-gray-500 text-center">
-                Select a task to run phase-aware analysis.
-              </div>
             )}
-
           </div>
         )}
       </div>
