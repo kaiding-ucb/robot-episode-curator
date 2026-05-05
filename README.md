@@ -28,11 +28,9 @@ cp .env.example .env    # paste HF_TOKEN; GEMINI_API_KEY only if you want AI ana
 make dev
 ```
 
-Backend → http://localhost:8000   ·   Frontend → http://localhost:3000
+Open the printed frontend URL in your browser. Defaults are `http://localhost:3000` (frontend) and `http://localhost:8000` (backend) — pass `PORT=<backend>` and/or `FRONTEND_PORT=<frontend>` to use any free pair, e.g. `PORT=8765 FRONTEND_PORT=3765 make dev`. The frontend proxies `/api/*` to whatever `PORT` you choose, so no other config changes are needed.
 
 Get tokens: [HuggingFace](https://huggingface.co/settings/tokens) (read scope is enough) · [Gemini](https://aistudio.google.com/apikey)
-
-> Ports already taken? Pass any free pair: `PORT=8765 FRONTEND_PORT=3765 make dev`. The frontend proxies `/api/*` to whatever `PORT` you choose, so no other config changes are needed.
 
 ## End-to-End Analysis Workflow
 
