@@ -27,8 +27,28 @@ _DYNAMIC_REGISTRY_PATH = Path(os.environ.get(
 _DYNAMIC_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
+# First-run seed. Only used when no dynamic_datasets.json exists yet, so the
+# user lands on a working example instead of an empty sidebar; once seeded it
+# behaves like any user-added entry (editable, removable).
+_FIRST_RUN_SEED: Dict[str, Dict[str, Any]] = {
+    "libero": {
+        "name": "Libero (Lerobot)",
+        "type": "video",
+        "description": "HuggingFace dataset: lerobot/libero",
+        "repo_id": "lerobot/libero",
+        "format": "lerobot",
+        "modalities": ["rgb"],
+        "modality_config": None,
+        "has_tasks": True,
+        "streaming_recommended": True,
+        "requires_auth": False,
+        "downloader_class": None,
+    },
+}
+
+
 def _load_dynamic_registry() -> None:
-    """Load dynamic datasets from persistent storage."""
+    """Load dynamic datasets from persistent storage, seeding on first run."""
     global _DYNAMIC_REGISTRY
     if _DYNAMIC_REGISTRY_PATH.exists():
         try:
@@ -38,6 +58,10 @@ def _load_dynamic_registry() -> None:
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Failed to load dynamic registry: {e}")
             _DYNAMIC_REGISTRY = {}
+    else:
+        _DYNAMIC_REGISTRY = {k: dict(v) for k, v in _FIRST_RUN_SEED.items()}
+        _save_dynamic_registry()
+        logger.info(f"Seeded dynamic registry with {len(_DYNAMIC_REGISTRY)} default dataset(s)")
 
 
 def _save_dynamic_registry() -> None:
