@@ -57,7 +57,7 @@ export default function EpisodeViewer({
     stream: activeStream,
   }), [activeStream]);
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
   // Trigger background caching when play is clicked
   const triggerBackgroundCaching = useCallback(async () => {

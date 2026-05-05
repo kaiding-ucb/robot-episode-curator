@@ -17,7 +17,7 @@ import type {
   DatasetOverview,
 } from "@/types/api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 /**
  * Fetch datasets from the API

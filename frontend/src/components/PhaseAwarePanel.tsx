@@ -96,7 +96,7 @@ interface PhaseAwarePanelProps {
 // fewer than N when the task is smaller, so this gives "all if ≤50, else 50".
 const COHORT_CAP = 50;
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 
 const CLUSTER_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#a855f7"];

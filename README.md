@@ -32,7 +32,7 @@ Backend → http://localhost:8000   ·   Frontend → http://localhost:3000
 
 Get tokens: [HuggingFace](https://huggingface.co/settings/tokens) (read scope is enough) · [Gemini](https://aistudio.google.com/apikey)
 
-> Port already taken? `PORT=8765 FRONTEND_PORT=3765 make dev`
+> Ports already taken? Pass any free pair: `PORT=8765 FRONTEND_PORT=3765 make dev`. The frontend proxies `/api/*` to whatever `PORT` you choose, so no other config changes are needed.
 
 ## End-to-End Analysis Workflow
 

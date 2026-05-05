@@ -14,7 +14,7 @@ import type {
 } from "@/types/analysis";
 import type { MetaSummaryResponse } from "@/types/api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 /**
  * Fetch dataset analysis capabilities (format, supported analyses).

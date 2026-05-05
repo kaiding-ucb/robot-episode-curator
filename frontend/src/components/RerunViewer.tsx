@@ -230,7 +230,7 @@ export default function RerunViewer({ datasetId, episodeId, onClose, comparisonR
   const [error, setError] = useState<string | null>(null);
   const [generationProgress, setGenerationProgress] = useState<string>("");
 
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
   const abortRef = useRef<AbortController | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
 

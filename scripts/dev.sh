@@ -56,7 +56,8 @@ BACKEND_PID=$!
 echo -e "${BLUE}Starting frontend (Next.js) on :${FRONTEND_PORT}...${NC}"
 (
     cd "$ROOT_DIR/frontend"
-    PORT="$FRONTEND_PORT" exec npm run dev
+    # BACKEND_PORT is read by next.config.ts to wire up the /api/* rewrite proxy.
+    PORT="$FRONTEND_PORT" BACKEND_PORT="$BACKEND_PORT" exec npm run dev
 ) &
 FRONTEND_PID=$!
 

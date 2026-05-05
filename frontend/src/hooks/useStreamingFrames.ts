@@ -12,7 +12,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Frame, StreamingOptions } from "@/types/api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 interface UseStreamingFramesOptions extends StreamingOptions {
   enabled?: boolean;

@@ -4,7 +4,7 @@
 import { useState, useCallback } from "react";
 import type { ComparisonResponse } from "@/types/compare";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 export function useCompare() {
   const [comparison, setComparison] = useState<ComparisonResponse | null>(null);
