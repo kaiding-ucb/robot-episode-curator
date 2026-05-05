@@ -1257,7 +1257,7 @@ async def list_task_episodes(
     dataset_id: str,
     task_name: str,
     request: Request,
-    response: Response,
+    response: Response = None,  # type: ignore[assignment]
     limit: int = 10,
     offset: int = 0,
 ):
@@ -1288,9 +1288,11 @@ async def list_task_episodes(
                 task_name, limit=limit, offset=offset
             )
             # Surface the total count via header so the frontend can paginate
-            # ("Page X of Y") without a second round-trip.
-            response.headers["X-Total-Count"] = str(total_count)
-            response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+            # ("Page X of Y") without a second round-trip. Skipped when called
+            # internally (no Response object) — the caller doesn't need it.
+            if response is not None:
+                response.headers["X-Total-Count"] = str(total_count)
+                response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
             return [
                 EpisodeInfo(
                     id=ep.id,

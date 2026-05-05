@@ -26,6 +26,12 @@ _DYNAMIC_REGISTRY_PATH = Path(os.environ.get(
 # Format: { "dataset_id": { ...config... } }
 _DYNAMIC_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
+# Last-seen mtime of the registry file. Used to refresh in-process state when
+# another worker (gunicorn fans out 4 workers by default) has written newer
+# data — without this, one worker's add_dynamic_dataset() is invisible to the
+# others and `/api/datasets` returns inconsistent results across requests.
+_DYNAMIC_REGISTRY_MTIME: float = 0.0
+
 
 # First-run seed. Only used when no dynamic_datasets.json exists yet, so the
 # user lands on a working example instead of an empty sidebar; once seeded it
@@ -49,27 +55,51 @@ _FIRST_RUN_SEED: Dict[str, Dict[str, Any]] = {
 
 def _load_dynamic_registry() -> None:
     """Load dynamic datasets from persistent storage, seeding on first run."""
-    global _DYNAMIC_REGISTRY
+    global _DYNAMIC_REGISTRY, _DYNAMIC_REGISTRY_MTIME
     if _DYNAMIC_REGISTRY_PATH.exists():
         try:
             with open(_DYNAMIC_REGISTRY_PATH, "r") as f:
                 _DYNAMIC_REGISTRY = json.load(f)
+            try:
+                _DYNAMIC_REGISTRY_MTIME = _DYNAMIC_REGISTRY_PATH.stat().st_mtime
+            except OSError:
+                _DYNAMIC_REGISTRY_MTIME = 0.0
             logger.info(f"Loaded {len(_DYNAMIC_REGISTRY)} dynamic datasets from {_DYNAMIC_REGISTRY_PATH}")
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Failed to load dynamic registry: {e}")
             _DYNAMIC_REGISTRY = {}
+            _DYNAMIC_REGISTRY_MTIME = 0.0
     else:
         _DYNAMIC_REGISTRY = {k: dict(v) for k, v in _FIRST_RUN_SEED.items()}
         _save_dynamic_registry()
         logger.info(f"Seeded dynamic registry with {len(_DYNAMIC_REGISTRY)} default dataset(s)")
 
 
+def _refresh_dynamic_registry_if_stale() -> None:
+    """Reload the registry if another worker has written a newer file.
+
+    Cheap stat() on every call; only re-reads JSON on mtime change.
+    """
+    global _DYNAMIC_REGISTRY_MTIME
+    try:
+        mtime = _DYNAMIC_REGISTRY_PATH.stat().st_mtime
+    except OSError:
+        return
+    if mtime > _DYNAMIC_REGISTRY_MTIME:
+        _load_dynamic_registry()
+
+
 def _save_dynamic_registry() -> None:
     """Save dynamic datasets to persistent storage."""
+    global _DYNAMIC_REGISTRY_MTIME
     try:
         _DYNAMIC_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_DYNAMIC_REGISTRY_PATH, "w") as f:
             json.dump(_DYNAMIC_REGISTRY, f, indent=2)
+        try:
+            _DYNAMIC_REGISTRY_MTIME = _DYNAMIC_REGISTRY_PATH.stat().st_mtime
+        except OSError:
+            pass
         logger.info(f"Saved {len(_DYNAMIC_REGISTRY)} dynamic datasets to {_DYNAMIC_REGISTRY_PATH}")
     except IOError as e:
         logger.error(f"Failed to save dynamic registry: {e}")
@@ -120,11 +150,13 @@ def remove_dynamic_dataset(dataset_id: str) -> bool:
 
 def get_dynamic_datasets() -> Dict[str, Dict[str, Any]]:
     """Get all dynamically registered datasets."""
+    _refresh_dynamic_registry_if_stale()
     return _DYNAMIC_REGISTRY.copy()
 
 
 def get_all_datasets() -> Dict[str, Dict[str, Any]]:
     """Get combined registry of static and dynamic datasets."""
+    _refresh_dynamic_registry_if_stale()
     combined = DATASET_REGISTRY.copy()
     combined.update(_DYNAMIC_REGISTRY)
     return combined
