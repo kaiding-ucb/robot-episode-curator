@@ -78,11 +78,24 @@ async def _probe_columns(repo_id: str, first_file: str, branch: str, headers: di
 
 async def _download_parquet(url: str, headers: dict, read_cols: list[str]) -> Optional[pd.DataFrame]:
     import io
+    # Retry once on transient network failures (DNS hiccups, dropped connections).
+    # Without this, large datasets like droid_1.0.1 — which fan out 8+ parallel
+    # parquet downloads through HuggingFace's redirect chain to cas-bridge.xethub
+    # — surface a single ConnectError to asyncio.gather and the whole analysis
+    # request 500s.
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-        resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return None
-        return pd.read_parquet(io.BytesIO(resp.content), columns=read_cols)
+        for attempt in range(2):
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    return None
+                return pd.read_parquet(io.BytesIO(resp.content), columns=read_cols)
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                if attempt == 0:
+                    await asyncio.sleep(0.1)
+                    continue
+                logger.warning(f"download_parquet failed after retry for {url}: {e}")
+                return None
 
 
 def _synthesize_action_from_state(
@@ -167,13 +180,22 @@ async def load_episodes_action_state(
             df = await _download_parquet(url, headers, read_cols)
             return path, df
 
-    # Download incrementally; stop once all targets found
+    # Download incrementally; stop once all targets found.
+    # return_exceptions=True so a single per-file failure doesn't kill the
+    # whole batch — _download_parquet already retries transient network errors,
+    # but keep this as a defense in depth.
     for batch_start in range(0, len(data_files), 8):
         if not targets:
             break
         batch = data_files[batch_start:batch_start + 8]
-        batch_results = await asyncio.gather(*[_probe(p) for p in batch])
-        for path, df in batch_results:
+        batch_results = await asyncio.gather(
+            *[_probe(p) for p in batch], return_exceptions=True
+        )
+        for result in batch_results:
+            if isinstance(result, BaseException):
+                logger.warning(f"loader: per-file failure: {result}")
+                continue
+            path, df = result
             if df is None:
                 continue
             present = set(int(x) for x in df["episode_index"].unique()) & targets
